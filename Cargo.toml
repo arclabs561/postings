@@ -6,6 +6,10 @@ rust-version = "1.80"
 license = "MIT OR Apache-2.0"
 authors = ["Arc <attobop@gmail.com>"]
 description = "Inverted-index postings lists with segment-style updates."
+repository = "https://github.com/arclabs561/postings"
+homepage = "https://github.com/arclabs561/postings"
+documentation = "https://docs.rs/postings"
+publish = false
 
 [dependencies]
 thiserror = "2.0"
@@ -23,4 +27,3 @@ proptest = "1.9"
 durability = { git = "https://github.com/arclabs561/durability" }
 serde = { version = "1.0", features = ["derive"] }
 tempfile = "3.10"
-

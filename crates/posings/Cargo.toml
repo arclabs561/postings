@@ -5,6 +5,9 @@ edition = "2021"
 rust-version = "1.80"
 license = "MIT OR Apache-2.0"
 description = "Positional postings (term -> doc -> positions) for phrase/proximity queries."
+repository = "https://github.com/arclabs561/postings"
+homepage = "https://github.com/arclabs561/postings"
+documentation = "https://docs.rs/posings"
 publish = true
 
 [features]
@@ -17,13 +20,10 @@ roc = ["dep:cnk"]
 compressed = ["ef", "roc"]
 
 [dependencies]
-thiserror = { workspace = true }
-postings-codec = { workspace = true, optional = true, features = ["sbits"] }
-cnk = { workspace = true, optional = true }
+thiserror = "2.0"
+postings-codec = { path = "../postings-codec", optional = true, features = ["sbits"] }
+cnk = { version = "0.1.0", optional = true }
 
 [dev-dependencies]
-proptest = { workspace = true }
-
-[lints]
-workspace = true
+proptest = "1.9"
 

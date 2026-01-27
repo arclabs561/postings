@@ -393,6 +393,8 @@ where
     where
         for<'de> Term: serde::Deserialize<'de>,
     {
+        use std::io::Read;
+
         let mut f = dir.open_file(path)?;
         let mut bytes = Vec::new();
         f.read_to_end(&mut bytes)?;
@@ -471,7 +473,7 @@ mod tests {
             use proptest::prelude::*;
             let mut idx: PostingsIndex<String> = PostingsIndex::new();
             for (i, doc) in docs.iter().enumerate() {
-                let terms: Vec<String> = doc.iter().cloned().collect();
+                let terms: Vec<String> = doc.to_vec();
                 idx.add_document(i as u32, &terms).unwrap();
             }
             let n = idx.num_docs();
@@ -493,11 +495,11 @@ mod tests {
         ) {
             let mut idx: PostingsIndex<String> = PostingsIndex::new();
             for (i, terms) in docs.iter().enumerate() {
-                let terms: Vec<String> = terms.iter().cloned().collect();
+                let terms: Vec<String> = terms.to_vec();
                 idx.add_document(i as DocId, &terms).unwrap();
             }
 
-            let q_terms: Vec<String> = query.iter().cloned().collect();
+            let q_terms: Vec<String> = query.to_vec();
             let cands = idx.candidates(&q_terms);
             let cand_set: std::collections::HashSet<DocId> = cands.into_iter().collect();
 
@@ -574,11 +576,11 @@ mod tests {
         ) {
             let mut idx: PostingsIndex<String> = PostingsIndex::new();
             for (i, doc) in docs.iter().enumerate() {
-                let terms: Vec<String> = doc.iter().cloned().collect();
+                let terms: Vec<String> = doc.to_vec();
                 idx.add_document(i as DocId, &terms).unwrap();
             }
 
-            let q_terms: Vec<String> = query.iter().cloned().collect();
+            let q_terms: Vec<String> = query.to_vec();
             let cfg = PlannerConfig { max_candidate_ratio: max_ratio, max_candidates: max_abs };
 
             let plan = idx.plan_candidates(&q_terms, cfg);
