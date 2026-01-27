@@ -10,7 +10,7 @@ description = "Inverted-index postings lists with segment-style updates."
 [dependencies]
 thiserror = "2.0"
 serde = { version = "1.0", features = ["derive"], optional = true }
-durability = { path = "../durability", optional = true }
+durability = { git = "https://github.com/arclabs561/durability", optional = true }
 postcard = { version = "1.0", optional = true }
 
 [features]
@@ -20,7 +20,7 @@ persistence = ["dep:durability", "dep:postcard", "serde"]
 
 [dev-dependencies]
 proptest = "1.9"
-durability = { path = "../durability" }
+durability = { git = "https://github.com/arclabs561/durability" }
 serde = { version = "1.0", features = ["derive"] }
 tempfile = "3.10"
 
