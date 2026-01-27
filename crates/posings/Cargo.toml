@@ -1,0 +1,29 @@
+[package]
+name = "posings"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT OR Apache-2.0"
+description = "Positional postings (term -> doc -> positions) for phrase/proximity queries."
+publish = true
+
+[features]
+default = []
+## Enable Elias–Fano candidate doc-id sets (via `postings-codec` + `sbits`).
+ef = ["dep:postings-codec"]
+## Enable ROC (delta+varint baseline) set compression for candidate doc-ids (via `cnk`).
+roc = ["dep:cnk"]
+## Convenience: enable all optional compressed-candidate helpers.
+compressed = ["ef", "roc"]
+
+[dependencies]
+thiserror = { workspace = true }
+postings-codec = { workspace = true, optional = true, features = ["sbits"] }
+cnk = { workspace = true, optional = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true
+

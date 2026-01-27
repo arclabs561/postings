@@ -1,0 +1,24 @@
+[package]
+name = "postings-codec"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT OR Apache-2.0"
+description = "Encoding/decoding primitives for postings lists (varint/gap), plus iterator contracts."
+publish = true
+
+[dependencies]
+thiserror = { workspace = true }
+sbits = { workspace = true, optional = true }
+
+[features]
+default = []
+## Enable succinct monotone sequences (Elias-Fano) via `sbits`.
+sbits = ["dep:sbits"]
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true
+
