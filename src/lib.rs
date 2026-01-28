@@ -16,9 +16,10 @@
 //! - On-disk persistence / compaction
 //! - Rich query language beyond "union of term postings"
 //!
-//! Related sibling crates (in the same repo/workspace):
+//! Related crates:
 //! - `posings`: positional postings for phrase/proximity evaluation (token positions).
-//! - `postings-codec`: low-level codecs (varint/gap) for postings payloads.
+//!   - Repo: <https://github.com/arclabs561/posings>
+//! - `postings-codec`: low-level codecs (varint/gap) for postings payloads (in this repo).
 
 use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
