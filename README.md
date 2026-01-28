@@ -2,11 +2,12 @@
 
 Postings-list primitives for inverted indices, packaged as a small Rust workspace.
 
-This repo contains three crates:
+This repo contains two crates:
 
 - `postings`: in-memory postings index with segment-style updates (candidate generation).
-- `posings`: positional postings for phrase/proximity evaluation.
 - `postings-codec`: low-level codecs (gap/varint; optional Elias–Fano via `sbits`).
+
+Related: `posings` (positional postings for phrase/proximity) lives in its own repo: <https://github.com/arclabs561/posings>
 
 ## Usage
 
