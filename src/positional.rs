@@ -23,6 +23,14 @@ pub enum Error {
     DuplicateDocId(DocId),
 }
 
+/// Preferred name for the positional postings index.
+///
+/// `PosingsIndex` is kept for continuity with the historical crate name (`posings`).
+pub type PositionalIndex = PosingsIndex;
+
+/// Preferred name for the positional postings error type.
+pub type PositionalError = Error;
+
 /// Feature-gated helpers for representing candidate doc-id sets with Elias–Fano (via `sbits`).
 ///
 /// This is intentionally a helper surface rather than a hard dependency of the main index.
@@ -84,6 +92,7 @@ pub mod roc_candidates {
 ///
 /// Stores per-term postings lists of (doc_id -> positions).
 #[derive(Debug, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct PosingsIndex {
     // term -> (doc_id -> positions)
     postings: HashMap<String, HashMap<DocId, Vec<TokenPos>>>,

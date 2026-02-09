@@ -28,7 +28,7 @@ serde = ["dep:serde"]
 persistence = ["dep:durability", "dep:postcard", "serde"]
 sbits = ["dep:sbits"]
 positional = []
-roc = ["dep:cnk"]
+roc = ["dep:cnk", "positional"]
 
 [dev-dependencies]
 proptest = "1.9"
