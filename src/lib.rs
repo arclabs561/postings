@@ -10,18 +10,25 @@
 //! - It uses a Lucene-style mental model: immutable "segments" (here: append-only
 //!   batches) and logical deletes.
 //!
+//! ## Optional modules
+//!
+//! - `postings::codec`: low-level codecs (varint/gap) for postings payloads (in this repo).
+//! - `postings::positional` (feature `positional`): positional postings for phrase/proximity evaluation.
+//!
+//! Compatibility:
+//! - The `posings` crate is a thin shim that re-exports `postings::positional`.
+//!
 //! ## Non-goals (for now)
 //!
-//! - Positional postings (phrase queries)
 //! - On-disk persistence / compaction
 //! - Rich query language beyond "union of term postings"
-//!
-//! Related crates:
-//! - `posings`: positional postings for phrase/proximity evaluation (token positions).
-//!   - Repo: <https://github.com/arclabs561/posings>
-//! - `postings::codec`: low-level codecs (varint/gap) for postings payloads (in this repo).
+
+#![forbid(unsafe_code)]
 
 pub mod codec;
+
+#[cfg(feature = "positional")]
+pub mod positional;
 
 use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};

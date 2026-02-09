@@ -58,6 +58,19 @@ assert!(matches!(plan, postings::CandidatePlan::Candidates(_)));
 - `postings/serde`: enable serde for the in-memory structures.
 - `postings/persistence`: enable save/load helpers via `durability` + `postcard`.
 - `postings/sbits`: enable succinct monotone sequences (Elias–Fano) under `postings::codec::ef`.
+- `postings/positional`: enable positional postings (`postings::positional::PosingsIndex`).
+- `postings/roc`: enable optional compressed-candidate helpers under `postings::positional::roc_candidates`.
+
+## Optional: positional postings
+
+Enable positional postings behind a feature flag:
+
+```toml
+[dependencies]
+postings = { git = "https://github.com/arclabs561/postings", features = ["positional"] }
+```
+
+Then use `postings::positional::PosingsIndex` for phrase/proximity evaluation.
 
 ## Development
 
