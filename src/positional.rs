@@ -227,7 +227,7 @@ impl PosingsIndex {
         // Pick the rarest term as the anchor.
         let mut anchor: Option<&str> = None;
         let mut anchor_df: usize = usize::MAX;
-        for (&t, _req) in required_counts {
+        for &t in required_counts.keys() {
             let df = self.postings.get(t).map(|m| m.len()).unwrap_or(0);
             if df < anchor_df {
                 anchor = Some(t);
@@ -388,7 +388,7 @@ impl PosingsIndex {
             while i < pa.len() && j < pb.len() {
                 let x = pa[i];
                 let y = pb[j];
-                let diff = if x >= y { x - y } else { y - x };
+                let diff = x.abs_diff(y);
                 if diff <= window {
                     hit = true;
                     break;
@@ -449,7 +449,7 @@ fn near_doc_unordered(
 ) -> bool {
     // Build occurrences (pos, term) for all required term strings.
     let mut occ: Vec<(TokenPos, &str)> = Vec::new();
-    for (&t, _req) in required {
+    for &t in required.keys() {
         for &p in ix.positions(t, doc_id) {
             occ.push((p, t));
         }
@@ -627,7 +627,7 @@ mod tests {
                 .unwrap();
         }
         let plan = ix.plan_candidates_near(
-            ["common", "u1"].into_iter(),
+            ["common", "u1"],
             PlannerConfig {
                 max_candidate_ratio: 0.2,
                 max_candidates: 10,

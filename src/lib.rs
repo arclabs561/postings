@@ -466,6 +466,26 @@ where
     }
 }
 
+fn intersect_sorted(a: &[DocId], b: &[DocId]) -> Vec<DocId> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    let mut j = 0usize;
+    while i < a.len() && j < b.len() {
+        let x = a[i];
+        let y = b[j];
+        if x == y {
+            out.push(x);
+            i += 1;
+            j += 1;
+        } else if x < y {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -739,24 +759,4 @@ mod tests {
             }
         }
     }
-}
-
-fn intersect_sorted(a: &[DocId], b: &[DocId]) -> Vec<DocId> {
-    let mut out = Vec::new();
-    let mut i = 0usize;
-    let mut j = 0usize;
-    while i < a.len() && j < b.len() {
-        let x = a[i];
-        let y = b[j];
-        if x == y {
-            out.push(x);
-            i += 1;
-            j += 1;
-        } else if x < y {
-            i += 1;
-        } else {
-            j += 1;
-        }
-    }
-    out
 }
