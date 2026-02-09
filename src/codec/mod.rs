@@ -1,14 +1,12 @@
-//! `postings-codec`: codecs + iterator contracts for postings lists.
+//! Low-level codecs and iterator contracts for postings payloads.
 //!
-//! This crate is meant to hold *mechanical* building blocks:
+//! This module holds *mechanical* building blocks:
 //! - integer encodings (varint, delta/gap)
 //! - decode iterators
-//! - skip/advance contracts (future)
+//! - succinct monotone sequences (optional, via `sbits`)
 //!
 //! It intentionally does **not** define an inverted index; it exists so multiple
 //! index structures can share the same low-level encoding/decoding logic.
-
-#![warn(missing_docs)]
 
 pub mod varint;
 
@@ -150,3 +148,4 @@ mod tests {
         }
     }
 }
+

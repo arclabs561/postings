@@ -1,6 +1,6 @@
 //! Elias-Fano helpers for monotone sequences.
 //!
-//! This module is feature-gated behind `postings-codec/sbits`.
+//! This module is feature-gated behind `postings/sbits`.
 //! It provides a compact representation for sorted `u32` ids.
 
 /// Re-export the underlying succinct structure.
@@ -48,3 +48,4 @@ mod tests {
         }
     }
 }
+

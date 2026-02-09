@@ -1,13 +1,26 @@
 # postings
 
-Postings-list primitives for inverted indices, packaged as a small Rust workspace.
+Postings-list primitives for inverted indices, packaged as a small Rust crate.
 
-This repo contains two crates:
+## Data Model & Invariants
 
-- `postings`: in-memory postings index with segment-style updates (candidate generation).
-- `postings-codec`: low-level codecs (gap/varint; optional Elias–Fano via `sbits`).
+- **Doc IDs**: `u32`. Must be dense/contiguous for optimal compression.
+- **Ordering**: Postings lists are always sorted by Doc ID.
+- **Updates**: Segment-based. Deletions are tombstones; updates are delete+add.
+- **Storage**: In-memory by default. Persistence via `durability` (optional).
 
-Related: `posings` (positional postings for phrase/proximity) lives in its own repo: <https://github.com/arclabs561/posings>
+## Stability & Publishing
+
+This crate is stable for internal use. Public API may change.
+Use `git` dependencies for now.
+
+## What it is
+
+`postings` is an in-memory, index-only inverted index meant for **candidate generation**:
+
+- it does not store document text
+- it supports “segment-style” updates
+- it provides **no-false-negative** candidate sets
 
 ## Usage
 
@@ -29,6 +42,12 @@ idx.add_document(0, &["the".to_string(), "quick".to_string(), "fox".to_string()]
 idx.add_document(1, &["quick".to_string(), "brown".to_string(), "dog".to_string()])
     .unwrap();
 
+// Conjunctive (AND) candidates.
+assert_eq!(
+    idx.candidates_all_terms(&["quick".to_string(), "dog".to_string()]),
+    vec![1]
+);
+
 let cfg = PlannerConfig::default();
 let plan = idx.plan_candidates(&["quick".to_string()], cfg);
 assert!(matches!(plan, postings::CandidatePlan::Candidates(_)));
@@ -38,6 +57,7 @@ assert!(matches!(plan, postings::CandidatePlan::Candidates(_)));
 
 - `postings/serde`: enable serde for the in-memory structures.
 - `postings/persistence`: enable save/load helpers via `durability` + `postcard`.
+- `postings/sbits`: enable succinct monotone sequences (Elias–Fano) under `postings::codec::ef`.
 
 ## Development
 

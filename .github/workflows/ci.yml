@@ -24,4 +24,3 @@ jobs:
       - name: test
         run: |
           cargo test --all-targets
-          cargo test --manifest-path crates/postings-codec/Cargo.toml --all-targets

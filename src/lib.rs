@@ -19,7 +19,9 @@
 //! Related crates:
 //! - `posings`: positional postings for phrase/proximity evaluation (token positions).
 //!   - Repo: <https://github.com/arclabs561/posings>
-//! - `postings-codec`: low-level codecs (varint/gap) for postings payloads (in this repo).
+//! - `postings::codec`: low-level codecs (varint/gap) for postings payloads (in this repo).
+
+pub mod codec;
 
 use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
@@ -292,7 +294,63 @@ where
                 }
             }
         }
+        // Deterministic output: stable ascending doc ids.
+        out.sort_unstable();
         out
+    }
+
+    /// Candidate documents that contain **all** query terms (conjunctive / AND).
+    ///
+    /// This is a common first step before:
+    /// - exact phrase/proximity verification (positional index), or
+    /// - scoring (BM25/TF-IDF) in a higher layer.
+    ///
+    /// Notes:
+    /// - Duplicate terms in `query_terms` are treated as a single requirement.
+    /// - Results are returned in sorted order.
+    pub fn candidates_all_terms<Q>(&self, query_terms: &[Q]) -> Vec<DocId>
+    where
+        Term: Borrow<Q>,
+        Q: Hash + Eq,
+    {
+        if query_terms.is_empty() {
+            return Vec::new();
+        }
+
+        // Deduplicate query terms.
+        let mut uniq: Vec<&Q> = Vec::new();
+        let mut seen: HashSet<&Q> = HashSet::new();
+        for t in query_terms {
+            if seen.insert(t) {
+                uniq.push(t);
+            }
+        }
+        if uniq.is_empty() {
+            return Vec::new();
+        }
+
+        // DAAT-style intersection over sorted doc-id lists.
+        // Anchor on the rarest term to minimize intermediate sets.
+        uniq.sort_by_key(|t| self.df(*t));
+        if self.df(uniq[0]) == 0 {
+            return Vec::new();
+        }
+
+        let mut acc: Vec<DocId> = self.postings_iter(uniq[0]).map(|(id, _)| id).collect();
+        acc.sort_unstable();
+
+        for &t in uniq.iter().skip(1) {
+            if self.df(t) == 0 {
+                return Vec::new();
+            }
+            let mut docs: Vec<DocId> = self.postings_iter(t).map(|(id, _)| id).collect();
+            docs.sort_unstable();
+            acc = intersect_sorted(&acc, &docs);
+            if acc.is_empty() {
+                break;
+            }
+        }
+        acc
     }
 
     /// Plan candidate generation, with a bailout option for broad queries.
@@ -564,6 +622,78 @@ mod tests {
         }
     }
 
+    #[test]
+    fn candidates_all_terms_intersects() {
+        let mut idx: PostingsIndex<String> = PostingsIndex::new();
+        idx.add_document(0, &["a".into(), "b".into(), "b".into()])
+            .unwrap();
+        idx.add_document(1, &["a".into(), "c".into()]).unwrap();
+        idx.add_document(2, &["b".into(), "c".into()]).unwrap();
+
+        assert_eq!(
+            idx.candidates_all_terms(&["a".to_string(), "b".to_string()]),
+            vec![0]
+        );
+        assert_eq!(
+            idx.candidates_all_terms(&["b".to_string(), "c".to_string()]),
+            vec![2]
+        );
+        assert!(idx
+            .candidates_all_terms(&["missing".to_string()])
+            .is_empty());
+    }
+
+    #[test]
+    fn candidates_are_sorted_and_unique() {
+        let mut idx: PostingsIndex<String> = PostingsIndex::new();
+        idx.add_document(2, &["a".into(), "b".into()]).unwrap();
+        idx.add_document(1, &["a".into()]).unwrap();
+        idx.add_document(3, &["b".into()]).unwrap();
+
+        let c = idx.candidates(&["b".to_string(), "a".to_string()]);
+        assert_eq!(c, vec![1, 2, 3]);
+    }
+
+    proptest! {
+        #[test]
+        fn candidates_all_terms_have_no_false_negatives(
+            docs in prop::collection::vec(
+                prop::collection::vec("[a-z]{1,6}", 0..20),
+                0..30
+            ),
+            query in prop::collection::vec("[a-z]{1,6}", 0..10),
+        ) {
+            let mut idx: PostingsIndex<String> = PostingsIndex::new();
+            for (i, terms) in docs.iter().enumerate() {
+                let terms: Vec<String> = terms.to_vec();
+                idx.add_document(i as DocId, &terms).unwrap();
+            }
+
+            let q_terms: Vec<String> = query.to_vec();
+            let cands = idx.candidates_all_terms(&q_terms);
+            let cand_set: std::collections::HashSet<DocId> = cands.into_iter().collect();
+
+            // For every live doc, if it contains *all* query terms (at least once), it must appear.
+            // (Duplicates in the query are treated as a single requirement.)
+            let mut uniq: std::collections::HashSet<&String> = std::collections::HashSet::new();
+            for t in &q_terms {
+                uniq.insert(t);
+            }
+            for doc_id in idx.document_ids() {
+                let mut ok = !uniq.is_empty();
+                for t in &uniq {
+                    if idx.term_frequency(doc_id, t.as_str()) == 0 {
+                        ok = false;
+                        break;
+                    }
+                }
+                if ok {
+                    prop_assert!(cand_set.contains(&doc_id));
+                }
+            }
+        }
+    }
+
     proptest! {
         #[test]
         fn plan_candidates_candidates_respects_thresholds(
@@ -605,4 +735,24 @@ mod tests {
             }
         }
     }
+}
+
+fn intersect_sorted(a: &[DocId], b: &[DocId]) -> Vec<DocId> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    let mut j = 0usize;
+    while i < a.len() && j < b.len() {
+        let x = a[i];
+        let y = b[j];
+        if x == y {
+            out.push(x);
+            i += 1;
+            j += 1;
+        } else if x < y {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    out
 }
