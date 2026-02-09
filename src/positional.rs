@@ -89,6 +89,8 @@ pub struct PosingsIndex {
     postings: HashMap<String, HashMap<DocId, Vec<TokenPos>>>,
     // doc_id -> length in tokens
     doc_len: HashMap<DocId, u32>,
+    // doc_id -> unique terms in that doc (for fast deletes without scanning |V|)
+    doc_terms: HashMap<DocId, Vec<String>>,
 }
 
 impl PosingsIndex {
@@ -105,15 +107,31 @@ impl PosingsIndex {
             return Err(Error::DuplicateDocId(doc_id));
         }
         self.doc_len.insert(doc_id, terms.len() as u32);
+
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut uniq_terms: Vec<String> = Vec::new();
         for (i, t) in terms.iter().enumerate() {
             let pos = i as u32;
-            self.postings
-                .entry(t.clone())
-                .or_default()
-                .entry(doc_id)
-                .or_default()
-                .push(pos);
+            if seen.insert(t.as_str()) {
+                uniq_terms.push(t.clone());
+            }
+
+            // Avoid cloning `t` on every token occurrence: clone only on first insertion
+            // of a new vocabulary term.
+            match self.postings.get_mut(t.as_str()) {
+                Some(docs) => {
+                    docs.entry(doc_id).or_default().push(pos);
+                }
+                None => {
+                    let mut docs: HashMap<DocId, Vec<TokenPos>> = HashMap::new();
+                    docs.insert(doc_id, vec![pos]);
+                    self.postings.insert(t.clone(), docs);
+                }
+            }
         }
+
+        uniq_terms.sort_unstable();
+        self.doc_terms.insert(doc_id, uniq_terms);
         Ok(())
     }
 
@@ -124,17 +142,21 @@ impl PosingsIndex {
         if self.doc_len.remove(&doc_id).is_none() {
             return false;
         }
-        // Remove doc entries from every term map; drop empty term maps.
-        // (This is O(|V|) in vocabulary size, which is fine for this in-memory MVP.)
-        let mut dead_terms: Vec<String> = Vec::new();
-        for (term, docs) in self.postings.iter_mut() {
-            docs.remove(&doc_id);
-            if docs.is_empty() {
-                dead_terms.push(term.clone());
+
+        // Fast path: only touch vocabulary entries that appeared in the deleted doc.
+        // (O(|unique_terms_in_doc|) rather than scanning O(|V|).)
+        let terms = self.doc_terms.remove(&doc_id).unwrap_or_default();
+        for term in terms {
+            let empty = match self.postings.get_mut(term.as_str()) {
+                Some(docs) => {
+                    docs.remove(&doc_id);
+                    docs.is_empty()
+                }
+                None => false,
+            };
+            if empty {
+                self.postings.remove(&term);
             }
-        }
-        for t in dead_terms {
-            self.postings.remove(&t);
         }
         true
     }
