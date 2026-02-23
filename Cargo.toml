@@ -17,7 +17,7 @@ categories = ["text-processing", "algorithms"]
 [dependencies]
 thiserror = "2.0"
 serde = { version = "1.0", features = ["derive"], optional = true }
-durability = { git = "https://github.com/arclabs561/durability", optional = true }
+durability = { version = "0.1.0", optional = true }
 postcard = { version = "1.0", optional = true }
 sbits = { version = "0.1.0", optional = true }
 cnk = { version = "0.1.0", optional = true }
@@ -32,6 +32,6 @@ roc = ["dep:cnk", "positional"]
 
 [dev-dependencies]
 proptest = "1.9"
-durability = { git = "https://github.com/arclabs561/durability" }
+durability = "0.1.0"
 serde = { version = "1.0", features = ["derive"] }
 tempfile = "3.10"
