@@ -11,7 +11,7 @@ homepage = "https://github.com/arclabs561/postings"
 documentation = "https://github.com/arclabs561/postings#readme"
 publish = true
 readme = "README.md"
-keywords = ["information-retrieval", "postings", "inverted-index", "search"]
+keywords = ["search", "postings", "inverted-index", "search"]
 categories = ["text-processing", "algorithms"]
 
 [dependencies]
