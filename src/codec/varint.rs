@@ -28,4 +28,3 @@ pub fn decode_u32(bytes: &[u8]) -> Option<(u32, usize)> {
     }
     None
 }
-
