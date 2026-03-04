@@ -1,5 +1,9 @@
 # postings
 
+[![crates.io](https://img.shields.io/crates/v/postings.svg)](https://crates.io/crates/postings)
+[![Documentation](https://docs.rs/postings/badge.svg)](https://docs.rs/postings)
+[![CI](https://github.com/arclabs561/postings/actions/workflows/ci.yml/badge.svg)](https://github.com/arclabs561/postings/actions/workflows/ci.yml)
+
 Postings-list primitives for inverted indices, packaged as a small Rust crate.
 
 ## Data Model & Invariants
