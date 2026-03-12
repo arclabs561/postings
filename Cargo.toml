@@ -20,7 +20,7 @@ serde = { version = "1.0", features = ["derive"], optional = true }
 durability = { version = "0.1.0", optional = true }
 postcard = { version = "1.0", optional = true }
 sbits = { version = "0.1.0", optional = true }
-cnk = { version = "0.1.0", optional = true }
+cnk = { version = "0.1.2", optional = true }
 
 [features]
 default = []
