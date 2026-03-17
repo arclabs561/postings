@@ -1,11 +1,11 @@
 [package]
 name = "postings"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 rust-version = "1.80"
 license = "MIT OR Apache-2.0"
 authors = ["Arc <attobop@gmail.com>"]
-description = "Inverted-index postings lists with segment-style updates."
+description = "Inverted-index postings lists with segment-style updates. Supports u32 TF (classical) and f32 weights (SPLADE/learned sparse)."
 repository = "https://github.com/arclabs561/postings"
 homepage = "https://github.com/arclabs561/postings"
 documentation = "https://github.com/arclabs561/postings#readme"
