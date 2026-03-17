@@ -34,6 +34,62 @@ use std::hash::Hash;
 /// Document identifier.
 pub type DocId = u32;
 
+/// Trait for term weight types in posting lists.
+///
+/// `u32` is the default for classical term frequency counts.
+/// `f32` enables learned sparse representations (SPLADE, SPLADE++, etc.)
+/// where terms carry continuous weights rather than integer frequencies.
+pub trait Weight: Copy + Default + std::fmt::Debug + 'static {
+    /// The zero/absent weight.
+    fn zero() -> Self;
+    /// Accumulate (add) a weight into self.
+    fn accumulate(&mut self, other: Self);
+    /// Convert to f32 for scoring.
+    fn to_f32(self) -> f32;
+    /// Convert to u64 for total doc length accumulation.
+    fn to_doc_len(self) -> u64;
+}
+
+impl Weight for u32 {
+    #[inline]
+    fn zero() -> Self {
+        0
+    }
+    #[inline]
+    fn accumulate(&mut self, other: Self) {
+        *self += other;
+    }
+    #[inline]
+    fn to_f32(self) -> f32 {
+        self as f32
+    }
+    #[inline]
+    fn to_doc_len(self) -> u64 {
+        self as u64
+    }
+}
+
+impl Weight for f32 {
+    #[inline]
+    fn zero() -> Self {
+        0.0
+    }
+    #[inline]
+    fn accumulate(&mut self, other: Self) {
+        *self += other;
+    }
+    #[inline]
+    fn to_f32(self) -> f32 {
+        self
+    }
+    #[inline]
+    fn to_doc_len(self) -> u64 {
+        // For float weights, doc length is the count of non-zero terms
+        // (not the sum of weights), keeping avg_doc_len meaningful for BM25
+        1
+    }
+}
+
 /// Errors returned by `postings`.
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
@@ -83,20 +139,20 @@ impl Default for PlannerConfig {
 #[cfg_attr(
     feature = "serde",
     serde(bound(
-        serialize = "Term: serde::Serialize",
-        deserialize = "Term: serde::Deserialize<'de> + Eq + std::hash::Hash"
+        serialize = "Term: serde::Serialize, W: serde::Serialize",
+        deserialize = "Term: serde::Deserialize<'de> + Eq + std::hash::Hash, W: serde::Deserialize<'de>"
     ))
 )]
-struct Segment<Term> {
-    /// term -> sorted postings list of (doc_id, tf)
-    postings: HashMap<Term, Vec<(DocId, u32)>>,
+struct Segment<Term, W: Weight = u32> {
+    /// term -> sorted postings list of (doc_id, weight)
+    postings: HashMap<Term, Vec<(DocId, W)>>,
     /// doc_id -> doc length in terms
     doc_len: HashMap<DocId, u32>,
     /// doc_id -> unique terms in that doc (for df adjustments on delete)
     doc_terms: HashMap<DocId, Vec<Term>>,
 }
 
-impl<Term> Default for Segment<Term> {
+impl<Term, W: Weight> Default for Segment<Term, W> {
     fn default() -> Self {
         Self {
             postings: HashMap::new(),
@@ -116,12 +172,12 @@ impl<Term> Default for Segment<Term> {
 #[cfg_attr(
     feature = "serde",
     serde(bound(
-        serialize = "Term: serde::Serialize",
-        deserialize = "Term: serde::Deserialize<'de> + Eq + std::hash::Hash"
+        serialize = "Term: serde::Serialize, W: serde::Serialize",
+        deserialize = "Term: serde::Deserialize<'de> + Eq + std::hash::Hash, W: serde::Deserialize<'de>"
     ))
 )]
-pub struct PostingsIndex<Term = String> {
-    segments: Vec<Segment<Term>>,
+pub struct PostingsIndex<Term = String, W: Weight = u32> {
+    segments: Vec<Segment<Term, W>>,
     /// live doc -> segment index
     doc_segment: HashMap<DocId, usize>,
     /// live doc -> length
@@ -131,7 +187,7 @@ pub struct PostingsIndex<Term = String> {
     total_doc_len: u64,
 }
 
-impl<Term> Default for PostingsIndex<Term> {
+impl<Term, W: Weight> Default for PostingsIndex<Term, W> {
     fn default() -> Self {
         Self {
             segments: Vec::new(),
@@ -143,7 +199,7 @@ impl<Term> Default for PostingsIndex<Term> {
     }
 }
 
-impl<Term> PostingsIndex<Term>
+impl<Term, W: Weight> PostingsIndex<Term, W>
 where
     Term: Clone + Eq + Hash + Ord,
 {
@@ -190,30 +246,44 @@ where
         self.df.keys()
     }
 
-    /// Add a document by doc id and term stream.
+    /// Add a document by doc id and weighted term pairs.
+    ///
+    /// Each `(term, weight)` pair represents a term and its weight in the document.
+    /// For classical indexing, weight is the term frequency (u32).
+    /// For learned sparse retrieval (SPLADE), weight is a continuous value (f32).
+    ///
+    /// Duplicate terms are accumulated (weights summed).
     ///
     /// If `doc_id` already exists, return an error. Call `delete_document` first
     /// to model updates as delete+add (segment-style).
-    pub fn add_document(&mut self, doc_id: DocId, terms: &[Term]) -> Result<(), Error> {
+    pub fn add_weighted_document(
+        &mut self,
+        doc_id: DocId,
+        weighted_terms: &[(Term, W)],
+    ) -> Result<(), Error> {
         if self.doc_segment.contains_key(&doc_id) {
             return Err(Error::DuplicateDocId(doc_id));
         }
 
-        let doc_length = terms.len() as u32;
-        let mut term_freqs: HashMap<Term, u32> = HashMap::new();
-        for t in terms {
-            *term_freqs.entry(t.clone()).or_insert(0) += 1;
+        let mut term_weights: HashMap<Term, W> = HashMap::new();
+        let mut doc_length: u64 = 0;
+        for (t, w) in weighted_terms {
+            term_weights
+                .entry(t.clone())
+                .and_modify(|existing| existing.accumulate(*w))
+                .or_insert(*w);
+            doc_length += w.to_doc_len();
         }
 
-        let mut doc_terms: Vec<Term> = term_freqs.keys().cloned().collect();
+        let mut doc_terms: Vec<Term> = term_weights.keys().cloned().collect();
         doc_terms.sort_unstable();
 
         // Build an immutable segment for this doc.
-        let mut seg = Segment::<Term>::default();
-        seg.doc_len.insert(doc_id, doc_length);
+        let mut seg = Segment::<Term, W>::default();
+        seg.doc_len.insert(doc_id, doc_length as u32);
         seg.doc_terms.insert(doc_id, doc_terms.clone());
-        for (term, tf) in term_freqs {
-            seg.postings.entry(term).or_default().push((doc_id, tf));
+        for (term, w) in term_weights {
+            seg.postings.entry(term).or_default().push((doc_id, w));
         }
         // Ensure postings lists are sorted (future-proof for multi-doc segments).
         for postings in seg.postings.values_mut() {
@@ -223,8 +293,8 @@ where
         let seg_idx = self.segments.len();
         self.segments.push(seg);
         self.doc_segment.insert(doc_id, seg_idx);
-        self.doc_len.insert(doc_id, doc_length);
-        self.total_doc_len += doc_length as u64;
+        self.doc_len.insert(doc_id, doc_length as u32);
+        self.total_doc_len += doc_length;
 
         // Update global df.
         for term in doc_terms {
@@ -233,7 +303,27 @@ where
 
         Ok(())
     }
+}
 
+/// Backward-compatible methods for integer-weighted (classical) postings.
+impl<Term> PostingsIndex<Term, u32>
+where
+    Term: Clone + Eq + Hash + Ord,
+{
+    /// Add a document by doc id and term stream (classical indexing).
+    ///
+    /// Terms are counted to produce integer term frequencies.
+    /// For weighted terms (SPLADE), use [`add_weighted_document`](PostingsIndex::add_weighted_document).
+    pub fn add_document(&mut self, doc_id: DocId, terms: &[Term]) -> Result<(), Error> {
+        let weighted: Vec<(Term, u32)> = terms.iter().map(|t| (t.clone(), 1u32)).collect();
+        self.add_weighted_document(doc_id, &weighted)
+    }
+}
+
+impl<Term, W: Weight> PostingsIndex<Term, W>
+where
+    Term: Clone + Eq + Hash + Ord,
+{
     /// Logically delete a document (if present).
     ///
     /// Returns true if the doc existed.
@@ -259,24 +349,28 @@ where
         true
     }
 
-    /// Term frequency of `term` in `doc_id`.
-    pub fn term_frequency<Q>(&self, doc_id: DocId, term: &Q) -> u32
+    /// Term weight (frequency) of `term` in `doc_id`.
+    ///
+    /// Returns `W::zero()` if the term is not present or the doc is unknown.
+    /// For classical indexes (`W = u32`), this is the term frequency count.
+    /// For learned sparse indexes (`W = f32`), this is the SPLADE weight.
+    pub fn term_frequency<Q>(&self, doc_id: DocId, term: &Q) -> W
     where
         Term: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
         let seg_idx = match self.doc_segment.get(&doc_id) {
             Some(i) => *i,
-            None => return 0,
+            None => return W::zero(),
         };
         let seg = &self.segments[seg_idx];
         let postings = match seg.postings.get(term) {
             Some(p) => p,
-            None => return 0,
+            None => return W::zero(),
         };
         match postings.binary_search_by_key(&doc_id, |(id, _)| *id) {
             Ok(i) => postings[i].1,
-            Err(_) => 0,
+            Err(_) => W::zero(),
         }
     }
 
@@ -398,7 +492,7 @@ where
     }
 
     /// Iterate postings for a term across all segments (live docs only).
-    pub fn postings_iter<'a, Q>(&'a self, term: &'a Q) -> impl Iterator<Item = (DocId, u32)> + 'a
+    pub fn postings_iter<'a, Q>(&'a self, term: &'a Q) -> impl Iterator<Item = (DocId, W)> + 'a
     where
         Term: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
@@ -421,6 +515,7 @@ where
     ) -> Result<(), Box<dyn std::error::Error>>
     where
         Term: serde::Serialize,
+        W: serde::Serialize,
     {
         let bytes = postcard::to_allocvec(self)?;
         dir.atomic_write(path, &bytes)?;
@@ -441,6 +536,7 @@ where
     ) -> Result<(), Box<dyn std::error::Error>>
     where
         Term: serde::Serialize,
+        W: serde::Serialize,
     {
         let bytes = postcard::to_allocvec(self)?;
         dir.atomic_write_durable(path, &bytes)?;
@@ -455,6 +551,7 @@ where
     ) -> Result<Self, Box<dyn std::error::Error>>
     where
         for<'de> Term: serde::Deserialize<'de>,
+        for<'de> W: serde::Deserialize<'de>,
     {
         use std::io::Read;
 
@@ -758,5 +855,90 @@ mod tests {
                 prop_assert!((df_sum as f32) / (n as f32) <= cfg.max_candidate_ratio);
             }
         }
+    }
+
+    // ── Float-weighted (SPLADE) tests ─────────────────────────────────
+
+    #[test]
+    fn float_weighted_index_basic() {
+        // SPLADE-style: terms with continuous weights
+        let mut idx: PostingsIndex<String, f32> = PostingsIndex::new();
+        idx.add_weighted_document(
+            0,
+            &[
+                (String::from("neural"), 0.42),
+                (String::from("network"), 0.87),
+                (String::from("deep"), 0.15),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(idx.num_docs(), 1);
+        assert!((idx.term_frequency(0, "neural") - 0.42).abs() < 1e-6);
+        assert!((idx.term_frequency(0, "network") - 0.87).abs() < 1e-6);
+        assert!((idx.term_frequency(0, "missing") - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn float_weighted_candidates() {
+        let mut idx: PostingsIndex<String, f32> = PostingsIndex::new();
+        idx.add_weighted_document(0, &[(String::from("cat"), 0.9), (String::from("dog"), 0.3)])
+            .unwrap();
+        idx.add_weighted_document(
+            1,
+            &[(String::from("dog"), 0.8), (String::from("fish"), 0.5)],
+        )
+        .unwrap();
+
+        // Query for "dog" -- both docs have it
+        let cands = idx.candidates(&[String::from("dog")]);
+        assert_eq!(cands.len(), 2);
+
+        // Query for "cat" -- only doc 0
+        let cands = idx.candidates(&[String::from("cat")]);
+        assert_eq!(cands, vec![0]);
+
+        // df
+        assert_eq!(idx.df("dog"), 2);
+        assert_eq!(idx.df("cat"), 1);
+    }
+
+    #[test]
+    fn float_weighted_delete() {
+        let mut idx: PostingsIndex<String, f32> = PostingsIndex::new();
+        idx.add_weighted_document(0, &[(String::from("a"), 0.5)])
+            .unwrap();
+        idx.add_weighted_document(1, &[(String::from("a"), 0.8)])
+            .unwrap();
+
+        assert_eq!(idx.df("a"), 2);
+        idx.delete_document(0);
+        assert_eq!(idx.df("a"), 1);
+        assert_eq!(idx.num_docs(), 1);
+    }
+
+    #[test]
+    fn float_weighted_accumulates_duplicates() {
+        // If same term appears twice, weights should accumulate
+        let mut idx: PostingsIndex<String, f32> = PostingsIndex::new();
+        idx.add_weighted_document(
+            0,
+            &[(String::from("term"), 0.3), (String::from("term"), 0.4)],
+        )
+        .unwrap();
+
+        // 0.3 + 0.4 = 0.7
+        assert!((idx.term_frequency(0, "term") - 0.7).abs() < 1e-6);
+    }
+
+    #[test]
+    fn classic_u32_still_works_unchanged() {
+        // Verify the default u32 path is backward compatible
+        let mut idx: PostingsIndex<String> = PostingsIndex::new();
+        idx.add_document(0, &[String::from("hello"), String::from("hello")])
+            .unwrap();
+        // "hello" appears twice -> tf=2
+        assert_eq!(idx.term_frequency(0, "hello"), 2);
+        assert_eq!(idx.document_len(0), 2); // 2 terms total
     }
 }
