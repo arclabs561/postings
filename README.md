@@ -4,7 +4,7 @@
 [![Documentation](https://docs.rs/postings/badge.svg)](https://docs.rs/postings)
 [![CI](https://github.com/arclabs561/postings/actions/workflows/ci.yml/badge.svg)](https://github.com/arclabs561/postings/actions/workflows/ci.yml)
 
-Postings-list primitives for inverted indices, packaged as a small Rust crate.
+Inverted index postings lists and codecs.
 
 ## Data Model & Invariants
 
