@@ -529,7 +529,7 @@ where
     ///
     /// For non-filesystem backends (e.g. `MemoryDirectory`) this returns `NotSupported`.
     #[cfg(feature = "persistence")]
-    pub fn save_durable<D: durability::DurableDirectory + ?Sized>(
+    pub fn save_durable<D: durability::Directory + ?Sized>(
         &self,
         dir: &D,
         path: &str,
