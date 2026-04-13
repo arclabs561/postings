@@ -34,6 +34,6 @@ cnk-compression = ["dep:cnk", "positional"]
 
 [dev-dependencies]
 proptest = "1.9"
-durability = "0.5.0"
+durability = "0.2.0"
 serde = { version = "1.0", features = ["derive"] }
 tempfile = "3.10"
