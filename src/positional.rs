@@ -54,13 +54,13 @@ pub mod ef_candidates {
 
 /// Feature-gated helpers for compressing candidate doc-id sets with `cnk`.
 ///
-/// Today `cnk::RocCompressor` is a delta+varint baseline (despite the name).
+/// `cnk::DeltaVarintCompressor` provides delta+varint ID set compression.
 /// We keep it behind a feature so higher layers can experiment with compressed
 /// candidate sets without imposing a dependency on all users.
-#[cfg(feature = "roc")]
-pub mod roc_candidates {
+#[cfg(feature = "cnk-compression")]
+pub mod cnk_candidates {
     use crate::DocId;
-    use cnk::{IdSetCompressor, RocCompressor};
+    use cnk::{DeltaVarintCompressor, IdSetCompressor};
 
     pub use cnk::CompressionError;
 
@@ -74,7 +74,7 @@ pub mod roc_candidates {
         ids: &[DocId],
         universe_size: u32,
     ) -> Result<Vec<u8>, CompressionError> {
-        RocCompressor::new().compress_set(ids, universe_size)
+        DeltaVarintCompressor::new().compress_set(ids, universe_size)
     }
 
     /// Decompress a compressed doc-id set.
@@ -84,7 +84,7 @@ pub mod roc_candidates {
         compressed: &[u8],
         universe_size: u32,
     ) -> Result<Vec<DocId>, CompressionError> {
-        RocCompressor::new().decompress_set(compressed, universe_size)
+        DeltaVarintCompressor::new().decompress_set(compressed, universe_size)
     }
 }
 
@@ -705,13 +705,13 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "roc")]
+    #[cfg(feature = "cnk-compression")]
     #[test]
-    fn roc_candidates_roundtrip() {
+    fn cnk_candidates_roundtrip() {
         let ids: Vec<DocId> = vec![1, 5, 10, 20, 50, 100];
         let universe_size = 1_000;
-        let compressed = roc_candidates::compress_sorted_doc_ids(&ids, universe_size).unwrap();
-        let back = roc_candidates::decompress_doc_ids(&compressed, universe_size).unwrap();
+        let compressed = cnk_candidates::compress_sorted_doc_ids(&ids, universe_size).unwrap();
+        let back = cnk_candidates::decompress_doc_ids(&compressed, universe_size).unwrap();
         assert_eq!(back, ids);
     }
 }

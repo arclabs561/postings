@@ -63,7 +63,7 @@ assert!(matches!(plan, postings::CandidatePlan::Candidates(_)));
 - `postings/persistence`: enable save/load helpers via `durability` + `postcard`.
 - `postings/sbits`: enable succinct monotone sequences (Elias–Fano) under `postings::codec::ef`.
 - `postings/positional`: enable positional postings (`postings::positional::PosingsIndex`).
-- `postings/roc`: enable optional compressed-candidate helpers under `postings::positional::roc_candidates`.
+- `postings/cnk-compression`: enable optional compressed-candidate helpers under `postings::positional::cnk_candidates`.
 
 ## Optional: positional postings
 
