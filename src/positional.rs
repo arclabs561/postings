@@ -48,7 +48,8 @@ pub mod ef_candidates {
     /// - `ids` must be **sorted** and **strictly increasing**
     /// - every id must satisfy `id < universe_size`
     pub fn elias_fano_from_sorted_doc_ids(ids: &[DocId], universe_size: u32) -> EliasFano {
-        EliasFano::new(ids, universe_size)
+        let ids64: Vec<u64> = ids.iter().map(|&x| x as u64).collect();
+        EliasFano::new(&ids64, universe_size as u64)
     }
 }
 
@@ -687,7 +688,7 @@ mod tests {
         let ef = ef_candidates::elias_fano_from_sorted_doc_ids(&ids, 1_000);
         assert_eq!(ef.len(), ids.len());
         for (i, &id) in ids.iter().enumerate() {
-            assert_eq!(ef.get(i).unwrap(), id);
+            assert_eq!(ef.get(i).unwrap(), id as u64);
         }
     }
 
@@ -700,7 +701,7 @@ mod tests {
             let ef = ef_candidates::elias_fano_from_sorted_doc_ids(&ids, 1_000_000);
             prop_assert_eq!(ef.len(), ids.len());
             for (i, &id) in ids.iter().enumerate() {
-                prop_assert_eq!(ef.get(i).unwrap(), id);
+                prop_assert_eq!(ef.get(i).unwrap(), id as u64);
             }
         }
     }

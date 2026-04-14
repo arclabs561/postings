@@ -1,8 +1,7 @@
 //! Durability integration test for `postings`.
 
 use durability::checkpoint::CheckpointFile;
-use durability::recordlog::RecordLogWriter;
-use durability::replay::replay_postcard_since;
+use durability::recordlog::{RecordLogReadMode, RecordLogReader, RecordLogWriter};
 use durability::storage::MemoryDirectory;
 use postings::{DocId, PostingsIndex};
 use std::collections::BTreeMap;
@@ -31,7 +30,7 @@ struct Snapshot {
 
 #[test]
 fn recovered_candidates_have_no_false_negatives() {
-    let dir: Arc<dyn durability::Directory> = Arc::new(MemoryDirectory::new());
+    let dir: Arc<dyn durability::storage::Directory> = Arc::new(MemoryDirectory::new());
     let log_path = "log.bin";
     let ckpt_path = "ckpt.bin";
 
@@ -122,7 +121,12 @@ fn recovered_candidates_have_no_false_negatives() {
     for (doc_id, terms) in s.docs {
         recovered_live.insert(doc_id, terms);
     }
-    replay_postcard_since(dir, log_path, since, |e: Event| {
+    let reader = RecordLogReader::new(dir, log_path);
+    let events: Vec<Event> = reader
+        .read_all_postcard(RecordLogReadMode::BestEffort)
+        .unwrap();
+    // Skip events up to the checkpoint's last_applied_id.
+    for e in events.into_iter().skip(since as usize) {
         match e {
             Event::AddDoc { doc_id, terms } => {
                 recovered_live.insert(doc_id, terms);
@@ -131,9 +135,7 @@ fn recovered_candidates_have_no_false_negatives() {
                 recovered_live.remove(&doc_id);
             }
         }
-        Ok(())
-    })
-    .unwrap();
+    }
 
     // Rebuild index.
     let mut idx: PostingsIndex<u64> = PostingsIndex::new();

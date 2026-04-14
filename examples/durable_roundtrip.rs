@@ -8,8 +8,7 @@
 //! `cargo run -p postings --example durable_roundtrip`
 
 use durability::checkpoint::CheckpointFile;
-use durability::recordlog::RecordLogWriter;
-use durability::replay::replay_postcard_since;
+use durability::recordlog::{RecordLogReadMode, RecordLogReader, RecordLogWriter};
 use durability::storage::FsDirectory;
 use postings::{CandidatePlan, PlannerConfig, PostingsIndex};
 use std::collections::{BTreeMap, BTreeSet};
@@ -39,7 +38,7 @@ struct Snapshot {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tmp = tempfile::tempdir()?;
-    let dir: Arc<dyn durability::Directory> = Arc::new(FsDirectory::new(tmp.path())?);
+    let dir: Arc<dyn durability::storage::Directory> = Arc::new(FsDirectory::new(tmp.path())?);
 
     let log_path = "log/updates.bin";
     let ckpt_path = "ckpt/snap.bin";
@@ -138,7 +137,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    replay_postcard_since(dir.clone(), log_path, since, |e: Event| {
+    let reader = RecordLogReader::new(dir.clone(), log_path);
+    let events: Vec<Event> = reader.read_all_postcard(RecordLogReadMode::BestEffort)?;
+    for e in events.into_iter().skip(since as usize) {
         match e {
             Event::AddDoc { doc_id, terms } => {
                 recovered_live.insert(doc_id, terms);
@@ -147,8 +148,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 recovered_live.remove(&doc_id);
             }
         }
-        Ok(())
-    })?;
+    }
 
     // Rebuild postings index from recovered live docs.
     let mut idx: PostingsIndex<u64> = PostingsIndex::new();
