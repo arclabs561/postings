@@ -19,9 +19,9 @@ categories = ["text-processing", "algorithms"]
 [dependencies]
 thiserror = "2.0"
 serde = { version = "1.0", features = ["derive"], optional = true }
-durability = { version = "0.5.0", optional = true }
+durability = { version = "0.6", optional = true }
 postcard = { version = "1.0", optional = true }
-sbits = { version = "0.1.0", optional = true }
+sbits = { version = "0.2", optional = true }
 cnk = { version = "0.2.0", optional = true }
 
 [features]
@@ -34,6 +34,6 @@ cnk-compression = ["dep:cnk", "positional"]
 
 [dev-dependencies]
 proptest = "1.9"
-durability = "0.2.0"
+durability = "0.6"
 serde = { version = "1.0", features = ["derive"] }
 tempfile = "3.10"
