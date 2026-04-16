@@ -282,6 +282,19 @@ where
             doc_length += w.to_doc_len();
         }
 
+        self.index_document_inner(doc_id, term_weights, doc_length);
+        Ok(())
+    }
+
+    /// Core indexing logic shared by `add_weighted_document` and `add_document`.
+    ///
+    /// Caller must check for duplicate doc_id before calling.
+    fn index_document_inner(
+        &mut self,
+        doc_id: DocId,
+        term_weights: HashMap<Term, W>,
+        doc_length: u64,
+    ) {
         let mut doc_terms: Vec<Term> = term_weights.keys().cloned().collect();
         doc_terms.sort_unstable();
 
@@ -298,22 +311,20 @@ where
                 .push((doc_id, *w));
         }
 
+        // Update global df before moving doc_terms into the segment.
+        for term in &doc_terms {
+            *self.df.entry(term.clone()).or_insert(0) += 1;
+        }
+
         // Build a lightweight segment (doc_terms only, for delete support).
         let mut seg = Segment::<Term, W>::default();
-        seg.doc_terms.insert(doc_id, doc_terms.clone());
+        seg.doc_terms.insert(doc_id, doc_terms); // move, not clone
 
         let seg_idx = self.segments.len();
         self.segments.push(seg);
         self.doc_segment.insert(doc_id, seg_idx);
         self.doc_len.insert(doc_id, doc_length as u32);
         self.total_doc_len += doc_length;
-
-        // Update global df.
-        for term in doc_terms {
-            *self.df.entry(term).or_insert(0) += 1;
-        }
-
-        Ok(())
     }
 }
 
@@ -327,8 +338,16 @@ where
     /// Terms are counted to produce integer term frequencies.
     /// For weighted terms (SPLADE), use [`add_weighted_document`](PostingsIndex::add_weighted_document).
     pub fn add_document(&mut self, doc_id: DocId, terms: &[Term]) -> Result<(), Error> {
-        let weighted: Vec<(Term, u32)> = terms.iter().map(|t| (t.clone(), 1u32)).collect();
-        self.add_weighted_document(doc_id, &weighted)
+        if self.doc_segment.contains_key(&doc_id) {
+            return Err(Error::DuplicateDocId(doc_id));
+        }
+        let mut term_counts: HashMap<Term, u32> = HashMap::new();
+        for t in terms {
+            *term_counts.entry(t.clone()).or_insert(0) += 1;
+        }
+        let doc_length = terms.len() as u64;
+        self.index_document_inner(doc_id, term_counts, doc_length);
+        Ok(())
     }
 }
 
@@ -458,6 +477,7 @@ where
             v
         };
 
+        let mut buf: Vec<DocId> = Vec::new();
         for &t in uniq.iter().skip(1) {
             if self.df(t) == 0 {
                 return Vec::new();
@@ -465,12 +485,13 @@ where
             // Build a sorted list of ALL (including deleted) doc ids for this term,
             // then intersect with the live-only `acc`. Deleted docs are pruned
             // transitively: if a doc_id is deleted it's not in `acc`.
-            let mut docs: Vec<DocId> = match self.global_postings.get(t) {
-                Some(list) => list.iter().map(|(id, _)| *id).collect(),
+            buf.clear();
+            match self.global_postings.get(t) {
+                Some(list) => buf.extend(list.iter().map(|(id, _)| *id)),
                 None => return Vec::new(),
-            };
-            docs.sort_unstable();
-            acc = intersect_sorted(&acc, &docs);
+            }
+            buf.sort_unstable();
+            acc = intersect_sorted(&acc, &buf);
             if acc.is_empty() {
                 break;
             }
