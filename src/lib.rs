@@ -535,6 +535,10 @@ where
     }
 
     /// Save the index to a directory using `durability`.
+    ///
+    /// **Format note**: the on-disk layout changed in 0.2.0 when the internal
+    /// `global_postings` field was added for query performance.  Data written
+    /// by 0.1.x cannot be read by 0.2.0+ and vice-versa.
     #[cfg(feature = "persistence")]
     pub fn save<D: durability::Directory + ?Sized>(
         &self,
