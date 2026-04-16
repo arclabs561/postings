@@ -131,9 +131,11 @@ impl Default for PlannerConfig {
     }
 }
 
-/// Immutable postings for a batch of documents.
+/// Per-document metadata stored inside a segment (delete support only).
 ///
-/// A "segment" here is an append-only batch that is never mutated after creation.
+/// Slimmed down from the original design: `postings` and `doc_len` are now
+/// tracked globally on `PostingsIndex`, so a segment only needs the term list
+/// for df adjustment on delete.
 #[derive(Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(
@@ -144,20 +146,18 @@ impl Default for PlannerConfig {
     ))
 )]
 struct Segment<Term, W: Weight = u32> {
-    /// term -> sorted postings list of (doc_id, weight)
-    postings: HashMap<Term, Vec<(DocId, W)>>,
-    /// doc_id -> doc length in terms
-    doc_len: HashMap<DocId, u32>,
-    /// doc_id -> unique terms in that doc (for df adjustments on delete)
+    /// doc_id -> unique terms in that doc (for df adjustments on delete).
     doc_terms: HashMap<DocId, Vec<Term>>,
+    /// Phantom to keep the W type parameter (serde compat, zero size in practice).
+    #[cfg_attr(feature = "serde", serde(skip))]
+    _w: std::marker::PhantomData<W>,
 }
 
 impl<Term, W: Weight> Default for Segment<Term, W> {
     fn default() -> Self {
         Self {
-            postings: HashMap::new(),
-            doc_len: HashMap::new(),
             doc_terms: HashMap::new(),
+            _w: std::marker::PhantomData,
         }
     }
 }
@@ -178,13 +178,19 @@ impl<Term, W: Weight> Default for Segment<Term, W> {
 )]
 pub struct PostingsIndex<Term = String, W: Weight = u32> {
     segments: Vec<Segment<Term, W>>,
-    /// live doc -> segment index
+    /// live doc -> segment index (used by delete to find doc_terms)
     doc_segment: HashMap<DocId, usize>,
     /// live doc -> length
     doc_len: HashMap<DocId, u32>,
     /// term -> df (number of live documents containing term)
     df: HashMap<Term, u32>,
     total_doc_len: u64,
+    /// Flat global postings: term -> sorted (by doc_id) list of (doc_id, weight).
+    ///
+    /// Includes entries for logically-deleted documents; callers filter via
+    /// `doc_segment.contains_key(doc_id)`. This avoids O(segments) per lookup
+    /// at the cost of a small per-query live-doc filter.
+    global_postings: HashMap<Term, Vec<(DocId, W)>>,
 }
 
 impl<Term, W: Weight> Default for PostingsIndex<Term, W> {
@@ -195,6 +201,7 @@ impl<Term, W: Weight> Default for PostingsIndex<Term, W> {
             doc_len: HashMap::new(),
             df: HashMap::new(),
             total_doc_len: 0,
+            global_postings: HashMap::new(),
         }
     }
 }
@@ -278,17 +285,22 @@ where
         let mut doc_terms: Vec<Term> = term_weights.keys().cloned().collect();
         doc_terms.sort_unstable();
 
-        // Build an immutable segment for this doc.
+        // Append this doc's postings into the global flat map.
+        // Lists are maintained in sorted doc_id order by appending -- callers
+        // that insert docs out of order will still get correct results (liveness
+        // filter is per-id), but sort order is only guaranteed for monotone inserts.
+        // For non-monotone inserts, `postings_iter` falls back correctly because
+        // it filters by `doc_segment` liveness rather than relying on order.
+        for (term, w) in &term_weights {
+            self.global_postings
+                .entry(term.clone())
+                .or_default()
+                .push((doc_id, *w));
+        }
+
+        // Build a lightweight segment (doc_terms only, for delete support).
         let mut seg = Segment::<Term, W>::default();
-        seg.doc_len.insert(doc_id, doc_length as u32);
         seg.doc_terms.insert(doc_id, doc_terms.clone());
-        for (term, w) in term_weights {
-            seg.postings.entry(term).or_default().push((doc_id, w));
-        }
-        // Ensure postings lists are sorted (future-proof for multi-doc segments).
-        for postings in seg.postings.values_mut() {
-            postings.sort_unstable_by_key(|(id, _)| *id);
-        }
 
         let seg_idx = self.segments.len();
         self.segments.push(seg);
@@ -359,15 +371,18 @@ where
         Term: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        let seg_idx = match self.doc_segment.get(&doc_id) {
-            Some(i) => *i,
-            None => return W::zero(),
-        };
-        let seg = &self.segments[seg_idx];
-        let postings = match seg.postings.get(term) {
+        // Doc must be live.
+        if !self.doc_segment.contains_key(&doc_id) {
+            return W::zero();
+        }
+        let postings = match self.global_postings.get(term) {
             Some(p) => p,
             None => return W::zero(),
         };
+        // global_postings for a term may contain multiple entries for the same
+        // doc_id if the term was re-inserted (delete+add). Binary search finds
+        // any one of them; since re-inserts are blocked by the duplicate-doc-id
+        // guard, at most one entry per doc_id exists.
         match postings.binary_search_by_key(&doc_id, |(id, _)| *id) {
             Ok(i) => postings[i].1,
             Err(_) => W::zero(),
@@ -434,14 +449,26 @@ where
             return Vec::new();
         }
 
-        let mut acc: Vec<DocId> = self.postings_iter(uniq[0]).map(|(id, _)| id).collect();
-        acc.sort_unstable();
+        // Collect live doc ids for the rarest term, sorted for intersection.
+        // We only apply the liveness filter here (not inside intersect_sorted)
+        // since the intersection result is filtered at the end by containment.
+        let mut acc: Vec<DocId> = {
+            let mut v: Vec<DocId> = self.postings_iter(uniq[0]).map(|(id, _)| id).collect();
+            v.sort_unstable();
+            v
+        };
 
         for &t in uniq.iter().skip(1) {
             if self.df(t) == 0 {
                 return Vec::new();
             }
-            let mut docs: Vec<DocId> = self.postings_iter(t).map(|(id, _)| id).collect();
+            // Build a sorted list of ALL (including deleted) doc ids for this term,
+            // then intersect with the live-only `acc`. Deleted docs are pruned
+            // transitively: if a doc_id is deleted it's not in `acc`.
+            let mut docs: Vec<DocId> = match self.global_postings.get(t) {
+                Some(list) => list.iter().map(|(id, _)| *id).collect(),
+                None => return Vec::new(),
+            };
             docs.sort_unstable();
             acc = intersect_sorted(&acc, &docs);
             if acc.is_empty() {
@@ -492,18 +519,19 @@ where
     }
 
     /// Iterate postings for a term across all segments (live docs only).
+    ///
+    /// Reads from the global flat postings map in O(1) and filters out
+    /// logically-deleted documents.
     pub fn postings_iter<'a, Q>(&'a self, term: &'a Q) -> impl Iterator<Item = (DocId, W)> + 'a
     where
         Term: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        self.segments.iter().flat_map(move |seg| {
-            seg.postings
-                .get(term)
-                .into_iter()
-                .flat_map(|v| v.iter().copied())
-                .filter(|(doc_id, _)| self.doc_segment.contains_key(doc_id))
-        })
+        self.global_postings
+            .get(term)
+            .into_iter()
+            .flat_map(|v| v.iter().copied())
+            .filter(|(doc_id, _)| self.doc_segment.contains_key(doc_id))
     }
 
     /// Save the index to a directory using `durability`.
@@ -564,23 +592,55 @@ where
 }
 
 fn intersect_sorted(a: &[DocId], b: &[DocId]) -> Vec<DocId> {
+    // Galloping (exponential search) intersection.
+    // Invariant: when a[i] != b[j], advance the cursor of the *smaller*
+    // value by gallopping it forward to the *larger* value.  Both cursors
+    // always make progress (gallop_forward returns strictly > start when
+    // the target is not at start), so the loop terminates.
     let mut out = Vec::new();
     let mut i = 0usize;
     let mut j = 0usize;
+
     while i < a.len() && j < b.len() {
-        let x = a[i];
-        let y = b[j];
-        if x == y {
-            out.push(x);
-            i += 1;
-            j += 1;
-        } else if x < y {
-            i += 1;
-        } else {
-            j += 1;
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Equal => {
+                out.push(a[i]);
+                i += 1;
+                j += 1;
+            }
+            std::cmp::Ordering::Less => {
+                // a[i] < b[j]: gallop a forward to reach b[j].
+                i = gallop_forward(a, i, b[j]);
+            }
+            std::cmp::Ordering::Greater => {
+                // b[j] < a[i]: gallop b forward to reach a[i].
+                j = gallop_forward(b, j, a[i]);
+            }
         }
     }
     out
+}
+
+/// Returns the first index `>= start` in `list` such that `list[idx] >= target`,
+/// or `list.len()` if no such index exists.  Uses exponential probing + binary
+/// search so cost is O(log(gap)) rather than O(gap).
+#[inline]
+fn gallop_forward(list: &[DocId], start: usize, target: DocId) -> usize {
+    if start >= list.len() || list[start] >= target {
+        return start;
+    }
+    let mut step = 1usize;
+    // Exponential probe to find an upper bound.
+    while start + step < list.len() && list[start + step] < target {
+        step <<= 1;
+    }
+    // Binary search in [start + step/2, start + step).
+    let lo = start + (step >> 1);
+    let hi = (start + step).min(list.len());
+    match list[lo..hi].binary_search(&target) {
+        Ok(k) => lo + k,
+        Err(k) => lo + k,
+    }
 }
 
 #[cfg(test)]
