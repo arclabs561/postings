@@ -13,26 +13,11 @@ Inverted index postings lists and codecs.
 - **Updates**: Segment-based. Deletions are tombstones; updates are delete+add.
 - **Storage**: In-memory by default. Persistence via `durability` (optional).
 
-## Stability & Publishing
-
-This crate is stable for internal use. Public API may change.
-Use `git` dependencies for now.
-
-## What it is
-
-`postings` is an in-memory, index-only inverted index meant for **candidate generation**:
-
-- it does not store document text
-- it supports “segment-style” updates
-- it provides **no-false-negative** candidate sets
-
 ## Usage
-
-Add `postings` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-postings = { git = "https://github.com/arclabs561/postings" }
+postings = “0.1”
 ```
 
 Example (index + candidates):
@@ -71,7 +56,7 @@ Enable positional postings behind a feature flag:
 
 ```toml
 [dependencies]
-postings = { git = "https://github.com/arclabs561/postings", features = ["positional"] }
+postings = { version = "0.1", features = ["positional"] }
 ```
 
 Then use `postings::positional::PosingsIndex` for phrase/proximity evaluation.
