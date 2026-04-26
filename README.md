@@ -4,7 +4,7 @@
 [![Documentation](https://docs.rs/postings/badge.svg)](https://docs.rs/postings)
 [![CI](https://github.com/arclabs561/postings/actions/workflows/ci.yml/badge.svg)](https://github.com/arclabs561/postings/actions/workflows/ci.yml)
 
-Inverted-index postings lists in Rust with segment-style updates.
+Inverted-index postings lists with segment-style updates.
 Supports `u32` term frequencies (classical IR) and `f32` weights
 (SPLADE / learned-sparse retrieval).
 
