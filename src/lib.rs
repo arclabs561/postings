@@ -21,6 +21,7 @@
 //! - Rich query language beyond "union of term postings"
 
 #![forbid(unsafe_code)]
+#![warn(missing_docs)]
 
 pub mod codec;
 
