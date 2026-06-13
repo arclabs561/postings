@@ -19,7 +19,7 @@ Supports `u32` term frequencies (classical IR) and `f32` weights
 
 ```toml
 [dependencies]
-postings = “0.1”
+postings = "0.1"
 ```
 
 Example (index + candidates):
