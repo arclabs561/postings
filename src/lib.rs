@@ -299,17 +299,15 @@ where
         let mut doc_terms: Vec<Term> = term_weights.keys().cloned().collect();
         doc_terms.sort_unstable();
 
-        // Append this doc's postings into the global flat map.
-        // Lists are maintained in sorted doc_id order by appending -- callers
-        // that insert docs out of order will still get correct results (liveness
-        // filter is per-id), but sort order is only guaranteed for monotone inserts.
-        // For non-monotone inserts, `postings_iter` falls back correctly because
-        // it filters by `doc_segment` liveness rather than relying on order.
+        // Keep global postings sorted so lookup and intersection paths can use
+        // binary search and galloping search even when callers insert doc ids
+        // out of order.
         for (term, w) in &term_weights {
-            self.global_postings
-                .entry(term.clone())
-                .or_default()
-                .push((doc_id, *w));
+            let postings = self.global_postings.entry(term.clone()).or_default();
+            match postings.binary_search_by_key(&doc_id, |(id, _)| *id) {
+                Ok(i) => postings[i].1 = *w,
+                Err(i) => postings.insert(i, (doc_id, *w)),
+            }
         }
 
         // Update global df before moving doc_terms into the segment.
@@ -376,6 +374,12 @@ where
                         self.df.remove(term);
                     }
                 }
+                if let Some(postings) = self.global_postings.get_mut(term) {
+                    postings.retain(|(id, _)| *id != doc_id);
+                    if postings.is_empty() {
+                        self.global_postings.remove(term);
+                    }
+                }
             }
         }
         true
@@ -399,10 +403,6 @@ where
             Some(p) => p,
             None => return W::zero(),
         };
-        // global_postings for a term may contain multiple entries for the same
-        // doc_id if the term was re-inserted (delete+add). Binary search finds
-        // any one of them; since re-inserts are blocked by the duplicate-doc-id
-        // guard, at most one entry per doc_id exists.
         match postings.binary_search_by_key(&doc_id, |(id, _)| *id) {
             Ok(i) => postings[i].1,
             Err(_) => W::zero(),
@@ -706,6 +706,30 @@ mod tests {
         assert_eq!(idx.df("a"), 0);
         assert_eq!(idx.term_frequency(0, "b"), 0);
         assert_eq!(idx.term_frequency(1, "b"), 1);
+    }
+
+    #[test]
+    fn term_frequency_handles_out_of_order_doc_ids() {
+        let mut idx: PostingsIndex<String> = PostingsIndex::new();
+        idx.add_document(2, &[String::from("a")]).unwrap();
+        idx.add_document(1, &[String::from("a")]).unwrap();
+
+        assert_eq!(idx.candidates(&[String::from("a")]), vec![1, 2]);
+        assert_eq!(idx.term_frequency(1, "a"), 1);
+        assert_eq!(idx.term_frequency(2, "a"), 1);
+    }
+
+    #[test]
+    fn delete_then_readd_does_not_revive_stale_postings() {
+        let mut idx: PostingsIndex<String> = PostingsIndex::new();
+        idx.add_document(7, &[String::from("old")]).unwrap();
+        assert!(idx.delete_document(7));
+        idx.add_document(7, &[String::from("new")]).unwrap();
+
+        assert!(idx.candidates(&[String::from("old")]).is_empty());
+        assert_eq!(idx.candidates(&[String::from("new")]), vec![7]);
+        assert_eq!(idx.term_frequency(7, "old"), 0);
+        assert_eq!(idx.term_frequency(7, "new"), 1);
     }
 
     #[test]
