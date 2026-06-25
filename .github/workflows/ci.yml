@@ -42,6 +42,8 @@ jobs:
           tool: cargo-nextest
       - name: nextest (default)
         run: cargo nextest run --all-targets
+      - name: run example assertions
+        run: cargo run --example durable_roundtrip
       - name: nextest (all features)
         run: cargo nextest run --all-targets --all-features
       - name: doc tests (all features)
