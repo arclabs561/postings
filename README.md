@@ -44,6 +44,12 @@ let plan = idx.plan_candidates(&["quick".to_string()], cfg);
 assert!(matches!(plan, postings::CandidatePlan::Candidates(_)));
 ```
 
+## Examples
+
+Runnable examples live in [`examples/`](examples/):
+
+- `durable_roundtrip` pairs `postings` with `durability`: it logs update events in a record log, snapshots the index in a checkpoint, and rebuilds from both.
+
 ## Features
 
 - `postings/serde`: enable serde for the in-memory structures.
