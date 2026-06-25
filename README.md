@@ -48,7 +48,7 @@ assert!(matches!(plan, postings::CandidatePlan::Candidates(_)));
 
 Runnable examples live in [`examples/`](examples/):
 
-- `durable_roundtrip` pairs `postings` with `durability`: it logs update events in a record log, snapshots the index in a checkpoint, and rebuilds from both.
+- `durable_roundtrip` pairs `postings` with `durability` to build a crash-recoverable inverted index: update events go to a record log, snapshots to a checkpoint, and the index rebuilds from both, the persistence pattern a search engine needs to survive restarts.
 
 ## Features
 
