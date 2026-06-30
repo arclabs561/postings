@@ -618,6 +618,43 @@ where
             return ranked;
         }
 
+        let dense_slots = lists
+            .iter()
+            .filter_map(|(postings, _)| {
+                let (last_doc_id, _) = postings.last()?;
+                usize::try_from(*last_doc_id).ok()?.checked_add(1)
+            })
+            .max()
+            .unwrap_or(0);
+        let dense_limit = self.doc_len.len().saturating_mul(4).max(1024);
+        if dense_slots <= dense_limit {
+            let mut scores = vec![0.0; dense_slots];
+            let mut seen = vec![false; dense_slots];
+            let mut touched = Vec::with_capacity(total_postings.min(self.doc_len.len()));
+
+            for (postings, query_weight) in lists {
+                for &(doc_id, doc_weight) in postings {
+                    let contribution = query_weight * doc_weight.to_f32();
+                    if contribution == 0.0 {
+                        continue;
+                    }
+                    let slot = doc_id as usize;
+                    if !seen[slot] {
+                        seen[slot] = true;
+                        touched.push(doc_id);
+                    }
+                    scores[slot] += contribution;
+                }
+            }
+
+            let mut ranked: Vec<(DocId, f32)> = touched
+                .into_iter()
+                .map(|doc_id| (doc_id, scores[doc_id as usize]))
+                .collect();
+            keep_top_k(&mut ranked, k);
+            return ranked;
+        }
+
         let mut scores: HashMap<DocId, f32> =
             HashMap::with_capacity(total_postings.min(self.doc_len.len()));
         for (postings, query_weight) in lists {
@@ -1296,6 +1333,40 @@ mod tests {
         let ranked = idx.top_k_weighted(&[("term", 1.0)], 10);
 
         assert_eq!(ranked, vec![(1, 1.0)]);
+    }
+
+    #[test]
+    fn top_k_weighted_handles_score_cancellation_without_duplicate_docs() {
+        let mut idx: PostingsIndex<String, f32> = PostingsIndex::new();
+        idx.add_weighted_document(
+            0,
+            &[
+                (String::from("positive"), 1.0),
+                (String::from("negative"), 1.0),
+                (String::from("late"), 1.0),
+            ],
+        )
+        .unwrap();
+        idx.add_weighted_document(1, &[(String::from("late"), 1.0)])
+            .unwrap();
+
+        let ranked =
+            idx.top_k_weighted(&[("positive", 1.0), ("negative", -1.0), ("late", 2.0)], 10);
+
+        assert_eq!(ranked, vec![(0, 2.0), (1, 2.0)]);
+    }
+
+    #[test]
+    fn top_k_weighted_handles_sparse_doc_ids() {
+        let mut idx: PostingsIndex<String, f32> = PostingsIndex::new();
+        idx.add_weighted_document(7, &[(String::from("term"), 1.0)])
+            .unwrap();
+        idx.add_weighted_document(1_000_000, &[(String::from("term"), 2.0)])
+            .unwrap();
+
+        let ranked = idx.top_k_weighted(&[("term", 1.0)], 10);
+
+        assert_eq!(ranked, vec![(1_000_000, 2.0), (7, 1.0)]);
     }
 
     #[test]
