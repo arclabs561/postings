@@ -186,11 +186,10 @@ pub struct PostingsIndex<Term = String, W: Weight = u32> {
     /// term -> df (number of live documents containing term)
     df: HashMap<Term, u32>,
     total_doc_len: u64,
-    /// Flat global postings: term -> sorted (by doc_id) list of (doc_id, weight).
+    /// Flat global postings: term -> sorted live (doc_id, weight) list.
     ///
-    /// Includes entries for logically-deleted documents; callers filter via
-    /// `doc_segment.contains_key(doc_id)`. This avoids O(segments) per lookup
-    /// at the cost of a small per-query live-doc filter.
+    /// Deletes remove postings eagerly; query hot paths rely on that private
+    /// invariant to avoid a per-posting live-doc check.
     global_postings: HashMap<Term, Vec<(DocId, W)>>,
 }
 
@@ -418,17 +417,31 @@ where
         if query_terms.is_empty() {
             return Vec::new();
         }
-        let mut out: Vec<DocId> = Vec::new();
-        let mut seen: HashSet<DocId> = HashSet::new();
+        let mut lists: Vec<&[(DocId, W)]> = Vec::new();
+        let mut seen_terms: HashSet<&Q> = HashSet::new();
         for term in query_terms {
-            for (doc_id, _) in self.postings_iter(term) {
-                if seen.insert(doc_id) {
-                    out.push(doc_id);
+            if !seen_terms.insert(term) {
+                continue;
+            }
+            if let Some(postings) = self.global_postings.get(term) {
+                if !postings.is_empty() {
+                    lists.push(postings);
                 }
             }
         }
-        // Deterministic output: stable ascending doc ids.
-        out.sort_unstable();
+        if lists.is_empty() {
+            return Vec::new();
+        }
+
+        lists.sort_by_key(|postings| postings.len());
+        let mut lists = lists.into_iter();
+        let mut out: Vec<DocId> = lists
+            .next()
+            .map(|postings| postings.iter().map(|(id, _)| *id).collect())
+            .unwrap_or_default();
+        for docs in lists {
+            out = union_sorted_postings(&out, docs);
+        }
         out
     }
 
@@ -469,30 +482,25 @@ where
             return Vec::new();
         }
 
-        // Collect live doc ids for the rarest term, sorted for intersection.
-        // We only apply the liveness filter here (not inside intersect_sorted)
-        // since the intersection result is filtered at the end by containment.
+        // Collect doc ids for the rarest term; global postings are sorted and
+        // delete removes stale entries eagerly.
         let mut acc: Vec<DocId> = {
-            let mut v: Vec<DocId> = self.postings_iter(uniq[0]).map(|(id, _)| id).collect();
-            v.sort_unstable();
-            v
+            let Some(list) = self.global_postings.get(uniq[0]) else {
+                return Vec::new();
+            };
+            list.iter().map(|(id, _)| *id).collect()
         };
 
-        let mut buf: Vec<DocId> = Vec::new();
         for &t in uniq.iter().skip(1) {
             if self.df(t) == 0 {
                 return Vec::new();
             }
-            // Build a sorted list of ALL (including deleted) doc ids for this term,
-            // then intersect with the live-only `acc`. Deleted docs are pruned
-            // transitively: if a doc_id is deleted it's not in `acc`.
-            buf.clear();
             match self.global_postings.get(t) {
-                Some(list) => buf.extend(list.iter().map(|(id, _)| *id)),
+                Some(list) => {
+                    acc = intersect_sorted_postings(&acc, list);
+                }
                 None => return Vec::new(),
             }
-            buf.sort_unstable();
-            acc = intersect_sorted(&acc, &buf);
             if acc.is_empty() {
                 break;
             }
@@ -617,7 +625,47 @@ where
     }
 }
 
-fn intersect_sorted(a: &[DocId], b: &[DocId]) -> Vec<DocId> {
+fn union_sorted_postings<W>(a: &[DocId], b: &[(DocId, W)]) -> Vec<DocId> {
+    let mut out = Vec::with_capacity(a.len().saturating_add(b.len()));
+    let mut i = 0usize;
+    let mut j = 0usize;
+
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j].0) {
+            std::cmp::Ordering::Equal => {
+                push_unique(&mut out, a[i]);
+                i += 1;
+                j += 1;
+            }
+            std::cmp::Ordering::Less => {
+                push_unique(&mut out, a[i]);
+                i += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                push_unique(&mut out, b[j].0);
+                j += 1;
+            }
+        }
+    }
+    while i < a.len() {
+        push_unique(&mut out, a[i]);
+        i += 1;
+    }
+    while j < b.len() {
+        push_unique(&mut out, b[j].0);
+        j += 1;
+    }
+    out
+}
+
+#[inline]
+fn push_unique(out: &mut Vec<DocId>, doc_id: DocId) {
+    if out.last().copied() != Some(doc_id) {
+        out.push(doc_id);
+    }
+}
+
+fn intersect_sorted_postings<W>(a: &[DocId], b: &[(DocId, W)]) -> Vec<DocId> {
     // Galloping (exponential search) intersection.
     // Invariant: when a[i] != b[j], advance the cursor of the *smaller*
     // value by gallopping it forward to the *larger* value.  Both cursors
@@ -628,7 +676,7 @@ fn intersect_sorted(a: &[DocId], b: &[DocId]) -> Vec<DocId> {
     let mut j = 0usize;
 
     while i < a.len() && j < b.len() {
-        match a[i].cmp(&b[j]) {
+        match a[i].cmp(&b[j].0) {
             std::cmp::Ordering::Equal => {
                 out.push(a[i]);
                 i += 1;
@@ -636,11 +684,11 @@ fn intersect_sorted(a: &[DocId], b: &[DocId]) -> Vec<DocId> {
             }
             std::cmp::Ordering::Less => {
                 // a[i] < b[j]: gallop a forward to reach b[j].
-                i = gallop_forward(a, i, b[j]);
+                i = gallop_forward(a, i, b[j].0);
             }
             std::cmp::Ordering::Greater => {
                 // b[j] < a[i]: gallop b forward to reach a[i].
-                j = gallop_forward(b, j, a[i]);
+                j = gallop_forward_postings(b, j, a[i]);
             }
         }
     }
@@ -664,6 +712,24 @@ fn gallop_forward(list: &[DocId], start: usize, target: DocId) -> usize {
     let lo = start + (step >> 1);
     let hi = (start + step).min(list.len());
     match list[lo..hi].binary_search(&target) {
+        Ok(k) => lo + k,
+        Err(k) => lo + k,
+    }
+}
+
+/// Postings-list equivalent of `gallop_forward`.
+#[inline]
+fn gallop_forward_postings<W>(list: &[(DocId, W)], start: usize, target: DocId) -> usize {
+    if start >= list.len() || list[start].0 >= target {
+        return start;
+    }
+    let mut step = 1usize;
+    while start + step < list.len() && list[start + step].0 < target {
+        step <<= 1;
+    }
+    let lo = start + (step >> 1);
+    let hi = (start + step).min(list.len());
+    match list[lo..hi].binary_search_by_key(&target, |(id, _)| *id) {
         Ok(k) => lo + k,
         Err(k) => lo + k,
     }
@@ -730,6 +796,19 @@ mod tests {
         assert_eq!(idx.candidates(&[String::from("new")]), vec![7]);
         assert_eq!(idx.term_frequency(7, "old"), 0);
         assert_eq!(idx.term_frequency(7, "new"), 1);
+    }
+
+    #[test]
+    fn candidates_skip_deleted_docs() {
+        let mut idx: PostingsIndex<String> = PostingsIndex::new();
+        idx.add_document(1, &[String::from("shared")]).unwrap();
+        idx.add_document(2, &[String::from("shared")]).unwrap();
+
+        assert!(idx.delete_document(1));
+
+        let query = [String::from("shared")];
+        assert_eq!(idx.candidates(&query), vec![2]);
+        assert_eq!(idx.candidates_all_terms(&query), vec![2]);
     }
 
     #[test]
