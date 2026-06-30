@@ -44,6 +44,33 @@ let plan = idx.plan_candidates(&["quick".to_string()], cfg);
 assert!(matches!(plan, postings::CandidatePlan::Candidates(_)));
 ```
 
+Example (learned-sparse top-k):
+
+```rust
+use postings::PostingsIndex;
+
+let mut idx: PostingsIndex<String, f32> = PostingsIndex::new();
+idx.add_weighted_document(
+    0,
+    &[
+        ("neural".to_string(), 1.8),
+        ("retrieval".to_string(), 0.4),
+    ],
+)
+.unwrap();
+idx.add_weighted_document(
+    1,
+    &[
+        ("retrieval".to_string(), 2.6),
+        ("search".to_string(), 2.2),
+    ],
+)
+.unwrap();
+
+let ranking = idx.top_k_weighted(&[("neural", 1.5), ("retrieval", 2.0)], 10);
+assert_eq!(ranking[0].0, 1);
+```
+
 ## Examples
 
 Runnable examples live in [`examples/`](examples/):

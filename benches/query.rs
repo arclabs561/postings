@@ -51,6 +51,23 @@ fn build_index() -> PostingsIndex<String> {
     idx
 }
 
+fn build_weighted_index() -> PostingsIndex<String, f32> {
+    let mut idx: PostingsIndex<String, f32> = PostingsIndex::new();
+    let mut rng: u64 = 0xdeadbeef_cafebabe;
+
+    for doc_id in 0..N_DOCS as u32 {
+        let weighted: Vec<(String, f32)> = (0..TERMS_PER_DOC)
+            .map(|position| {
+                let term_id = zipf_sample(&mut rng, VOCAB_SIZE, 1.0);
+                let weight = 1.0 + ((term_id % 17) as f32 * 0.01) + ((position % 5) as f32 * 0.001);
+                (term_str(term_id), weight)
+            })
+            .collect();
+        idx.add_weighted_document(doc_id, &weighted).unwrap();
+    }
+    idx
+}
+
 /// Choose terms that are guaranteed to exist with a given minimum df.
 /// Scans the vocabulary from the most-common end (low term ids = high Zipf rank = high df).
 fn query_terms(idx: &PostingsIndex<String>, count: usize, min_df: u32) -> Vec<String> {
@@ -58,6 +75,20 @@ fn query_terms(idx: &PostingsIndex<String>, count: usize, min_df: u32) -> Vec<St
         .map(term_str)
         .filter(|t| idx.df(t.as_str()) >= min_df)
         .take(count)
+        .collect()
+}
+
+fn weighted_query_terms(
+    idx: &PostingsIndex<String, f32>,
+    count: usize,
+    min_df: u32,
+) -> Vec<(String, f32)> {
+    (0..VOCAB_SIZE)
+        .map(term_str)
+        .filter(|t| idx.df(t.as_str()) >= min_df)
+        .take(count)
+        .enumerate()
+        .map(|(i, t)| (t, 1.0 + (i as f32 * 0.1)))
         .collect()
 }
 
@@ -104,10 +135,30 @@ fn bench_disjunctive(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_weighted_top_k(c: &mut Criterion) {
+    let idx = build_weighted_index();
+    let mut group = c.benchmark_group("weighted_top_k");
+
+    for n in [2usize, 5] {
+        let terms = weighted_query_terms(&idx, n, 10);
+        let query: Vec<(&str, f32)> = terms
+            .iter()
+            .map(|(term, weight)| (term.as_str(), *weight))
+            .collect();
+        group.bench_with_input(BenchmarkId::new("terms", n), &query, |b, query| {
+            b.iter(|| {
+                black_box(idx.top_k_weighted(black_box(query.as_slice()), 10));
+            });
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_insert_50k,
     bench_conjunctive,
-    bench_disjunctive
+    bench_disjunctive,
+    bench_weighted_top_k
 );
 criterion_main!(benches);

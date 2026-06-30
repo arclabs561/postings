@@ -18,7 +18,7 @@
 //! ## Non-goals (for now)
 //!
 //! - On-disk persistence / compaction
-//! - Rich query language beyond "union of term postings"
+//! - Rich query language beyond candidate generation and sparse top-k scoring
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -564,6 +564,76 @@ where
             .filter(|(doc_id, _)| self.doc_segment.contains_key(doc_id))
     }
 
+    /// Return the top `k` documents by sparse inner product.
+    ///
+    /// Query terms are borrowed so a `PostingsIndex<String, f32>` can be queried
+    /// with `&str` terms without allocating. Duplicate query terms are
+    /// accumulated before scoring. Ties are broken by ascending doc id.
+    pub fn top_k_weighted<Q>(&self, query_terms: &[(&Q, f32)], k: usize) -> Vec<(DocId, f32)>
+    where
+        Term: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        if k == 0 || query_terms.is_empty() {
+            return Vec::new();
+        }
+
+        let mut query_weights: HashMap<&Q, f32> = HashMap::new();
+        for &(term, weight) in query_terms {
+            if weight == 0.0 {
+                continue;
+            }
+            *query_weights.entry(term).or_insert(0.0) += weight;
+        }
+        if query_weights.is_empty() {
+            return Vec::new();
+        }
+
+        let mut lists = Vec::with_capacity(query_weights.len());
+        let mut total_postings = 0usize;
+        for (term, query_weight) in query_weights {
+            if query_weight == 0.0 {
+                continue;
+            }
+            let Some(postings) = self.global_postings.get(term) else {
+                continue;
+            };
+            total_postings = total_postings.saturating_add(postings.len());
+            lists.push((postings.as_slice(), query_weight));
+        }
+        if lists.is_empty() {
+            return Vec::new();
+        }
+
+        if lists.len() == 1 {
+            let (postings, query_weight) = lists[0];
+            let mut ranked: Vec<(DocId, f32)> = postings
+                .iter()
+                .filter_map(|&(doc_id, doc_weight)| {
+                    let score = query_weight * doc_weight.to_f32();
+                    (score != 0.0).then_some((doc_id, score))
+                })
+                .collect();
+            keep_top_k(&mut ranked, k);
+            return ranked;
+        }
+
+        let mut scores: HashMap<DocId, f32> =
+            HashMap::with_capacity(total_postings.min(self.doc_len.len()));
+        for (postings, query_weight) in lists {
+            for &(doc_id, doc_weight) in postings {
+                let contribution = query_weight * doc_weight.to_f32();
+                if contribution != 0.0 {
+                    *scores.entry(doc_id).or_insert(0.0) += contribution;
+                }
+            }
+        }
+
+        let mut ranked: Vec<(DocId, f32)> = scores.into_iter().collect();
+        keep_top_k(&mut ranked, k);
+        ranked
+    }
+
     /// Save the index to a directory using `durability`.
     ///
     /// **Format note**: the on-disk layout changed in 0.2.0 when the internal
@@ -733,6 +803,20 @@ fn gallop_forward_postings<W>(list: &[(DocId, W)], start: usize, target: DocId) 
         Ok(k) => lo + k,
         Err(k) => lo + k,
     }
+}
+
+#[inline]
+fn cmp_doc_scores(a: &(DocId, f32), b: &(DocId, f32)) -> std::cmp::Ordering {
+    b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0))
+}
+
+#[inline]
+fn keep_top_k(ranked: &mut Vec<(DocId, f32)>, k: usize) {
+    if ranked.len() > k {
+        ranked.select_nth_unstable_by(k, cmp_doc_scores);
+        ranked.truncate(k);
+    }
+    ranked.sort_by(cmp_doc_scores);
 }
 
 #[cfg(test)]
@@ -1118,6 +1202,109 @@ mod tests {
 
         // 0.3 + 0.4 = 0.7
         assert!((idx.term_frequency(0, "term") - 0.7).abs() < 1e-6);
+    }
+
+    #[test]
+    fn top_k_weighted_scores_sparse_inner_product() {
+        let mut idx: PostingsIndex<String, f32> = PostingsIndex::new();
+        idx.add_weighted_document(
+            0,
+            &[
+                (String::from("neural"), 1.8),
+                (String::from("network"), 2.1),
+                (String::from("deep"), 0.9),
+                (String::from("learning"), 1.2),
+            ],
+        )
+        .unwrap();
+        idx.add_weighted_document(
+            1,
+            &[
+                (String::from("graph"), 2.4),
+                (String::from("network"), 1.1),
+                (String::from("node"), 1.7),
+            ],
+        )
+        .unwrap();
+        idx.add_weighted_document(
+            2,
+            &[
+                (String::from("neural"), 0.7),
+                (String::from("search"), 2.2),
+                (String::from("retrieval"), 2.6),
+                (String::from("learning"), 0.5),
+            ],
+        )
+        .unwrap();
+        idx.add_weighted_document(
+            3,
+            &[
+                (String::from("retrieval"), 1.9),
+                (String::from("sparse"), 2.8),
+                (String::from("index"), 1.3),
+                (String::from("search"), 1.0),
+            ],
+        )
+        .unwrap();
+
+        let ranked = idx.top_k_weighted(&[("neural", 1.5), ("retrieval", 2.0), ("search", 1.0)], 3);
+
+        assert_eq!(ranked.len(), 3);
+        assert_eq!(ranked[0].0, 2);
+        assert!((ranked[0].1 - 8.45).abs() < 1e-6);
+        assert_eq!(ranked[1].0, 3);
+        assert!((ranked[1].1 - 4.8).abs() < 1e-6);
+        assert_eq!(ranked[2].0, 0);
+        assert!((ranked[2].1 - 2.7).abs() < 1e-6);
+    }
+
+    #[test]
+    fn top_k_weighted_truncates_and_ties_by_doc_id() {
+        let mut idx: PostingsIndex<String, f32> = PostingsIndex::new();
+        idx.add_weighted_document(4, &[(String::from("term"), 1.0)])
+            .unwrap();
+        idx.add_weighted_document(2, &[(String::from("term"), 1.0)])
+            .unwrap();
+        idx.add_weighted_document(3, &[(String::from("term"), 1.0)])
+            .unwrap();
+
+        let ranked = idx.top_k_weighted(&[("term", 1.0)], 2);
+
+        assert_eq!(ranked, vec![(2, 1.0), (3, 1.0)]);
+    }
+
+    #[test]
+    fn top_k_weighted_accumulates_duplicate_query_terms() {
+        let mut idx: PostingsIndex<String, f32> = PostingsIndex::new();
+        idx.add_weighted_document(0, &[(String::from("term"), 2.0)])
+            .unwrap();
+
+        let ranked = idx.top_k_weighted(&[("term", 1.0), ("term", 0.5)], 1);
+
+        assert_eq!(ranked, vec![(0, 3.0)]);
+    }
+
+    #[test]
+    fn top_k_weighted_ignores_deleted_docs() {
+        let mut idx: PostingsIndex<String, f32> = PostingsIndex::new();
+        idx.add_weighted_document(0, &[(String::from("term"), 10.0)])
+            .unwrap();
+        idx.add_weighted_document(1, &[(String::from("term"), 1.0)])
+            .unwrap();
+        assert!(idx.delete_document(0));
+
+        let ranked = idx.top_k_weighted(&[("term", 1.0)], 10);
+
+        assert_eq!(ranked, vec![(1, 1.0)]);
+    }
+
+    #[test]
+    fn top_k_weighted_zero_k_is_empty() {
+        let mut idx: PostingsIndex<String, f32> = PostingsIndex::new();
+        idx.add_weighted_document(0, &[(String::from("term"), 1.0)])
+            .unwrap();
+
+        assert!(idx.top_k_weighted(&[("term", 1.0)], 0).is_empty());
     }
 
     #[test]

@@ -12,7 +12,6 @@
 //! `cargo run -p postings --example splade_weighted`
 
 use postings::PostingsIndex;
-use std::collections::HashMap;
 
 fn main() {
     // A tiny corpus of "documents", each already encoded by a learned sparse model
@@ -69,20 +68,9 @@ fn main() {
     let candidates = index.candidates(&query_terms);
     println!("candidates for query: {candidates:?}");
 
-    // Score each candidate by the sparse inner product:
-    //   score(d) = sum_t  query_weight(t) * doc_weight(t, d)
-    // Accumulate term-at-a-time by scanning each query term's postings list, which
-    // yields (doc_id, weight) for live documents only.
-    let mut scores: HashMap<u32, f32> = HashMap::new();
-    for &(term, q_weight) in query {
-        for (doc_id, doc_weight) in index.postings_iter(term) {
-            *scores.entry(doc_id).or_insert(0.0) += q_weight * doc_weight;
-        }
-    }
-
-    // Rank by descending score, breaking ties by doc id for determinism.
-    let mut ranked: Vec<(u32, f32)> = scores.into_iter().collect();
-    ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    // Score by sparse inner product:
+    //   score(d) = sum_t query_weight(t) * doc_weight(t, d)
+    let ranked = index.top_k_weighted(query, 10);
 
     println!("\nranking (sparse inner product):");
     for &(doc_id, score) in &ranked {

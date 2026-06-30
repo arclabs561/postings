@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `PostingsIndex::top_k_weighted` for sparse inner-product ranking over
+  weighted postings.
+
 ### Fixed
 
 - Removed stale postings on delete and kept global postings sorted for
