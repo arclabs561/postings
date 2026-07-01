@@ -1370,6 +1370,27 @@ mod tests {
     }
 
     #[test]
+    fn top_k_weighted_accumulates_sparse_doc_id_fallback() {
+        let mut idx: PostingsIndex<String, f32> = PostingsIndex::new();
+        idx.add_weighted_document(
+            7,
+            &[
+                (String::from("positive"), 1.0),
+                (String::from("negative"), 1.0),
+                (String::from("late"), 1.0),
+            ],
+        )
+        .unwrap();
+        idx.add_weighted_document(1_000_000, &[(String::from("late"), 2.0)])
+            .unwrap();
+
+        let ranked =
+            idx.top_k_weighted(&[("positive", 1.0), ("negative", -1.0), ("late", 2.0)], 10);
+
+        assert_eq!(ranked, vec![(1_000_000, 4.0), (7, 2.0)]);
+    }
+
+    #[test]
     fn top_k_weighted_zero_k_is_empty() {
         let mut idx: PostingsIndex<String, f32> = PostingsIndex::new();
         idx.add_weighted_document(0, &[(String::from("term"), 1.0)])
