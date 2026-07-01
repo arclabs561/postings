@@ -59,6 +59,11 @@
   the positional benchmark, `near_unordered_3_terms_window_16` moved from
   `[1.0238 ms 1.0314 ms 1.0412 ms]` to
   `[709.45 us 712.45 us 715.86 us]`.
+- Sped up three-term exact phrase matching by anchoring directly on the rarest
+  of the three terms instead of building the generic required-term candidate
+  set. In focused runs, `phrase_3_terms` moved from
+  `[932.04 us 935.40 us 939.11 us]` to
+  `[478.68 us 479.73 us 480.77 us]`.
 - Sped up two-term positional proximity queries with skewed term frequencies
   by anchoring on the rarer term. On the positional benchmark,
   `near_pair_skewed_window_4` moved from

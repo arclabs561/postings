@@ -316,6 +316,12 @@ impl PosingsIndex {
             let t0 = &phrase[0];
             return self.docs_with_term(t0).collect();
         }
+        if let [a, b, c] = phrase {
+            let terms = [a.as_str(), b.as_str(), c.as_str()];
+            if terms[0] != terms[1] && terms[0] != terms[2] && terms[1] != terms[2] {
+                return self.phrase_match_three_unique(terms);
+            }
+        }
 
         // Prefilter docs to those that contain all required terms (including multiplicity).
         let mut required: HashMap<&str, usize> = HashMap::new();
@@ -360,6 +366,55 @@ impl PosingsIndex {
                 continue 'doc;
             }
         }
+        out
+    }
+
+    fn phrase_match_three_unique(&self, terms: [&str; 3]) -> Vec<DocId> {
+        let mut anchor_i = 0usize;
+        let mut anchor_df = self.df(terms[0]);
+        for (i, term) in terms.iter().enumerate().skip(1) {
+            let df = self.df(term);
+            if df < anchor_df {
+                anchor_i = i;
+                anchor_df = df;
+            }
+        }
+
+        let Some(anchor_map) = self.postings.get(terms[anchor_i]) else {
+            return Vec::new();
+        };
+
+        let mut out = Vec::new();
+        'doc: for &doc_id in anchor_map.keys() {
+            let positions = [
+                self.positions(terms[0], doc_id),
+                self.positions(terms[1], doc_id),
+                self.positions(terms[2], doc_id),
+            ];
+            if positions.iter().any(|ps| ps.is_empty()) {
+                continue;
+            }
+
+            'start: for &anchor_pos in positions[anchor_i] {
+                let Some(start) = anchor_pos.checked_sub(anchor_i as u32) else {
+                    continue;
+                };
+                for (i, ps) in positions.iter().enumerate() {
+                    if i == anchor_i {
+                        continue;
+                    }
+                    let Some(target) = start.checked_add(i as u32) else {
+                        continue 'start;
+                    };
+                    if ps.binary_search(&target).is_err() {
+                        continue 'start;
+                    }
+                }
+                out.push(doc_id);
+                continue 'doc;
+            }
+        }
+        out.sort_unstable();
         out
     }
 
