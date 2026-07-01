@@ -835,12 +835,34 @@ fn push_unique(out: &mut Vec<DocId>, doc_id: DocId) {
 }
 
 fn intersect_sorted_postings<W>(a: &[DocId], b: &[(DocId, W)]) -> Vec<DocId> {
+    let mut out = Vec::with_capacity(a.len().min(b.len()));
+    if a.is_empty() || b.is_empty() {
+        return out;
+    }
+    let min_len = a.len().min(b.len());
+    let max_len = a.len().max(b.len());
+    if max_len <= min_len.saturating_mul(8) {
+        let mut i = 0usize;
+        let mut j = 0usize;
+        while i < a.len() && j < b.len() {
+            match a[i].cmp(&b[j].0) {
+                std::cmp::Ordering::Equal => {
+                    out.push(a[i]);
+                    i += 1;
+                    j += 1;
+                }
+                std::cmp::Ordering::Less => i += 1,
+                std::cmp::Ordering::Greater => j += 1,
+            }
+        }
+        return out;
+    }
+
     // Galloping (exponential search) intersection.
     // Invariant: when a[i] != b[j], advance the cursor of the *smaller*
     // value by gallopping it forward to the *larger* value.  Both cursors
     // always make progress (gallop_forward returns strictly > start when
     // the target is not at start), so the loop terminates.
-    let mut out = Vec::new();
     let mut i = 0usize;
     let mut j = 0usize;
 

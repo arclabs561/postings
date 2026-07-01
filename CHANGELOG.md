@@ -63,6 +63,13 @@
   close A/B runs, `disjunctive/terms/5` moved from
   `[297.42 us 298.42 us 300.25 us]` to
   `[98.885 us 99.443 us 100.39 us]`.
+- Sped up conjunctive candidate generation by using a linear two-pointer
+  intersection for similarly sized postings lists while keeping galloping
+  search for skewed lists. In the focused benchmark,
+  `conjunctive/terms/2` moved from `[68.089 us 68.321 us 68.584 us]` to
+  `[51.512 us 51.877 us 52.065 us]`, and `conjunctive/terms/5` moved from
+  `[498.44 us 501.95 us 503.96 us]` to
+  `[394.70 us 399.13 us 401.53 us]`.
 
 ### Fixed
 
