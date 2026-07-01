@@ -46,6 +46,14 @@
   `weighted_top_k/expanded_terms/32` moved from
   `[741.00 us 742.18 us 743.25 us]` to
   `[592.20 us 593.69 us 595.36 us]`.
+- Sped up sparse-doc-id `top_k_weighted` queries by feeding accumulated scores
+  directly into bounded top-`k` selection instead of collecting every score
+  first. In focused runs, `weighted_top_k_sparse_doc_ids/terms/5` moved from
+  `[792.09 us 794.14 us 796.18 us]` to
+  `[747.24 us 748.95 us 750.79 us]`, and
+  `weighted_top_k_sparse_doc_ids/terms/16` moved from
+  `[1.8250 ms 1.8285 ms 1.8321 ms]` to
+  `[1.7442 ms 1.7477 ms 1.7516 ms]`.
 - Sped up two-term positional proximity queries with skewed term frequencies
   by anchoring on the rarer term. On the positional benchmark,
   `near_pair_skewed_window_4` moved from

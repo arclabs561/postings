@@ -728,9 +728,7 @@ where
             }
         }
 
-        let mut ranked: Vec<(DocId, f32)> = scores.into_iter().collect();
-        keep_top_k(&mut ranked, k);
-        ranked
+        top_k_scored_docs(scores, k)
     }
 
     /// Save the index to a directory using `durability`.
