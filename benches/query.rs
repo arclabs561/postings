@@ -233,6 +233,30 @@ fn bench_weighted_top_k(c: &mut Criterion) {
     let idx = build_weighted_index();
     let mut group = c.benchmark_group("weighted_top_k");
 
+    let common_term = weighted_query_terms(&idx, 1, 10);
+    let common_query = query_from_weighted_terms(&common_term);
+    group.bench_with_input(
+        BenchmarkId::new("single_common_term", 1),
+        &common_query,
+        |b, query| {
+            b.iter(|| {
+                black_box(idx.top_k_weighted(black_box(query.as_slice()), 10));
+            });
+        },
+    );
+
+    let rare_single_term = weighted_query_terms_in_df_range(&idx, 1, 1, 64);
+    let rare_single_query = query_from_weighted_terms(&rare_single_term);
+    group.bench_with_input(
+        BenchmarkId::new("single_rare_term", 1),
+        &rare_single_query,
+        |b, query| {
+            b.iter(|| {
+                black_box(idx.top_k_weighted(black_box(query.as_slice()), 10));
+            });
+        },
+    );
+
     for n in [2usize, 5] {
         let terms = weighted_query_terms(&idx, n, 10);
         let query = query_from_weighted_terms(&terms);

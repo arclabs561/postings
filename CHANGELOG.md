@@ -22,6 +22,14 @@
   `near_unordered_3_terms_window_16` moved from
   `[1.6475 ms 1.6708 ms 1.7120 ms]` to
   `[1.2588 ms 1.2643 ms 1.2719 ms]`.
+- Added explicit weighted single-term benchmark coverage and skipped query
+  weight aggregation for one-term `top_k_weighted` queries. On the learned
+  sparse benchmark, `weighted_top_k/single_common_term/1` moved from
+  `[88.215 us 90.264 us 91.174 us]` to
+  `[87.472 us 88.244 us 89.375 us]`, and
+  `weighted_top_k/single_rare_term/1` moved from
+  `[324.98 ns 326.51 ns 328.00 ns]` to
+  `[136.33 ns 136.67 ns 137.22 ns]`.
 
 ### Fixed
 

@@ -577,6 +577,16 @@ where
         if k == 0 || query_terms.is_empty() {
             return Vec::new();
         }
+        if query_terms.len() == 1 {
+            let (term, query_weight) = query_terms[0];
+            if query_weight == 0.0 {
+                return Vec::new();
+            }
+            let Some(postings) = self.global_postings.get(term) else {
+                return Vec::new();
+            };
+            return top_k_single_postings(postings, query_weight, k);
+        }
 
         let mut query_weights: HashMap<&Q, f32> = HashMap::new();
         for &(term, weight) in query_terms {
@@ -607,15 +617,7 @@ where
 
         if lists.len() == 1 {
             let (postings, query_weight) = lists[0];
-            let mut ranked: Vec<(DocId, f32)> = postings
-                .iter()
-                .filter_map(|&(doc_id, doc_weight)| {
-                    let score = query_weight * doc_weight.to_f32();
-                    (score != 0.0).then_some((doc_id, score))
-                })
-                .collect();
-            keep_top_k(&mut ranked, k);
-            return ranked;
+            return top_k_single_postings(postings, query_weight, k);
         }
 
         let dense_slots = lists
@@ -854,6 +856,22 @@ fn keep_top_k(ranked: &mut Vec<(DocId, f32)>, k: usize) {
         ranked.truncate(k);
     }
     ranked.sort_by(cmp_doc_scores);
+}
+
+fn top_k_single_postings<W: Weight>(
+    postings: &[(DocId, W)],
+    query_weight: f32,
+    k: usize,
+) -> Vec<(DocId, f32)> {
+    let mut ranked = Vec::with_capacity(postings.len());
+    for &(doc_id, doc_weight) in postings {
+        let score = query_weight * doc_weight.to_f32();
+        if score != 0.0 {
+            ranked.push((doc_id, score));
+        }
+    }
+    keep_top_k(&mut ranked, k);
+    ranked
 }
 
 #[cfg(test)]
@@ -1319,6 +1337,16 @@ mod tests {
         let ranked = idx.top_k_weighted(&[("term", 1.0), ("term", 0.5)], 1);
 
         assert_eq!(ranked, vec![(0, 3.0)]);
+    }
+
+    #[test]
+    fn top_k_weighted_single_term_zero_weight_and_missing_term_are_empty() {
+        let mut idx: PostingsIndex<String, f32> = PostingsIndex::new();
+        idx.add_weighted_document(0, &[(String::from("term"), 2.0)])
+            .unwrap();
+
+        assert!(idx.top_k_weighted(&[("term", 0.0)], 10).is_empty());
+        assert!(idx.top_k_weighted(&[("missing", 1.0)], 10).is_empty());
     }
 
     #[test]
