@@ -42,6 +42,11 @@
   `near_ordered_3_terms_window_16` moved from
   `[969.81 us 973.69 us 979.73 us]` to
   `[762.03 us 794.17 us 819.46 us]`.
+- Added an ordered-proximity cutoff once a candidate span already exceeds the
+  requested window. In the focused ordered benchmark,
+  `near_ordered_3_terms_window_16` moved from
+  `[738.30 us 740.00 us 743.38 us]` to
+  `[722.66 us 727.38 us 732.83 us]`.
 
 ### Fixed
 

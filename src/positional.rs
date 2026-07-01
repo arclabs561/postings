@@ -515,6 +515,9 @@ fn near_doc_ordered(ix: &PosingsIndex, doc_id: DocId, terms: &[String], window: 
                 continue 'start;
             };
             prev = pn;
+            if prev.saturating_sub(start) > window {
+                continue 'start;
+            }
         }
         if prev.saturating_sub(start) <= window {
             return true;
