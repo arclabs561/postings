@@ -945,6 +945,42 @@ fn top_k_single_postings<W: Weight>(
     query_weight: f32,
     k: usize,
 ) -> Vec<(DocId, f32)> {
+    if k == 0 {
+        return Vec::new();
+    }
+    if postings.len() > k {
+        let mut ranked: Vec<(DocId, f32)> = Vec::with_capacity(k);
+        let mut sorted = false;
+        for &(doc_id, doc_weight) in postings {
+            let score = query_weight * doc_weight.to_f32();
+            if score == 0.0 {
+                continue;
+            }
+            if ranked.len() < k {
+                ranked.push((doc_id, score));
+                continue;
+            }
+            if !sorted {
+                ranked.sort_by(cmp_doc_scores);
+                sorted = true;
+            }
+            let candidate = (doc_id, score);
+            if cmp_doc_scores(&candidate, ranked.last().expect("top-k buffer is full")).is_lt() {
+                let last = ranked.len() - 1;
+                ranked[last] = candidate;
+                let mut i = last;
+                while i > 0 && cmp_doc_scores(&ranked[i], &ranked[i - 1]).is_lt() {
+                    ranked.swap(i, i - 1);
+                    i -= 1;
+                }
+            }
+        }
+        if !sorted {
+            ranked.sort_by(cmp_doc_scores);
+        }
+        return ranked;
+    }
+
     let mut ranked = Vec::with_capacity(postings.len());
     for &(doc_id, doc_weight) in postings {
         let score = query_weight * doc_weight.to_f32();

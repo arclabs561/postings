@@ -30,6 +30,12 @@
   `weighted_top_k/single_rare_term/1` moved from
   `[324.98 ns 326.51 ns 328.00 ns]` to
   `[136.33 ns 136.67 ns 137.22 ns]`.
+- Sped up common single-term `top_k_weighted` queries by keeping only the
+  current top `k` postings instead of materializing every scored posting. In
+  the focused benchmark, `weighted_top_k/single_common_term/1` moved from
+  `[87.704 us 89.188 us 91.114 us]` to
+  `[71.472 us 71.688 us 71.913 us]`, while
+  `weighted_top_k/single_rare_term/1` stayed flat.
 - Sped up two-term positional proximity queries with skewed term frequencies
   by anchoring on the rarer term. On the positional benchmark,
   `near_pair_skewed_window_4` moved from
