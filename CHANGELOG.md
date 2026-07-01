@@ -47,6 +47,17 @@
   `near_ordered_3_terms_window_16` moved from
   `[738.30 us 740.00 us 743.38 us]` to
   `[722.66 us 727.38 us 732.83 us]`.
+- Sped up short learned-sparse `top_k_weighted` queries by aggregating query
+  weights in a small vector before falling back to a hash map for longer
+  queries. In close A/B runs, `weighted_top_k/expanded_terms/16` moved from
+  `[599.63 us 600.82 us 601.88 us]` to
+  `[526.99 us 527.78 us 529.40 us]`,
+  `weighted_top_k/expanded_terms/32` moved from
+  `[853.28 us 856.27 us 858.58 us]` to
+  `[739.77 us 742.00 us 744.42 us]`, and
+  `weighted_top_k/rare_terms/8` moved from
+  `[6.3326 us 6.3638 us 6.3793 us]` to
+  `[5.9865 us 6.0191 us 6.0414 us]`.
 
 ### Fixed
 

@@ -588,28 +588,58 @@ where
             return top_k_single_postings(postings, query_weight, k);
         }
 
-        let mut query_weights: HashMap<&Q, f32> = HashMap::new();
-        for &(term, weight) in query_terms {
-            if weight == 0.0 {
-                continue;
-            }
-            *query_weights.entry(term).or_insert(0.0) += weight;
-        }
-        if query_weights.is_empty() {
-            return Vec::new();
-        }
-
-        let mut lists = Vec::with_capacity(query_weights.len());
+        let mut lists = Vec::with_capacity(query_terms.len());
         let mut total_postings = 0usize;
-        for (term, query_weight) in query_weights {
-            if query_weight == 0.0 {
-                continue;
+        // Short learned-sparse query expansions are cheaper to dedupe linearly
+        // than through a hash table; longer queries keep the bounded hash path.
+        if query_terms.len() <= 32 {
+            let mut query_weights: Vec<(&Q, f32)> = Vec::with_capacity(query_terms.len());
+            'term: for &(term, weight) in query_terms {
+                if weight == 0.0 {
+                    continue;
+                }
+                for (existing_term, existing_weight) in &mut query_weights {
+                    if *existing_term == term {
+                        *existing_weight += weight;
+                        continue 'term;
+                    }
+                }
+                query_weights.push((term, weight));
             }
-            let Some(postings) = self.global_postings.get(term) else {
-                continue;
-            };
-            total_postings = total_postings.saturating_add(postings.len());
-            lists.push((postings.as_slice(), query_weight));
+            if query_weights.is_empty() {
+                return Vec::new();
+            }
+            for (term, query_weight) in query_weights {
+                if query_weight == 0.0 {
+                    continue;
+                }
+                let Some(postings) = self.global_postings.get(term) else {
+                    continue;
+                };
+                total_postings = total_postings.saturating_add(postings.len());
+                lists.push((postings.as_slice(), query_weight));
+            }
+        } else {
+            let mut query_weights: HashMap<&Q, f32> = HashMap::new();
+            for &(term, weight) in query_terms {
+                if weight == 0.0 {
+                    continue;
+                }
+                *query_weights.entry(term).or_insert(0.0) += weight;
+            }
+            if query_weights.is_empty() {
+                return Vec::new();
+            }
+            for (term, query_weight) in query_weights {
+                if query_weight == 0.0 {
+                    continue;
+                }
+                let Some(postings) = self.global_postings.get(term) else {
+                    continue;
+                };
+                total_postings = total_postings.saturating_add(postings.len());
+                lists.push((postings.as_slice(), query_weight));
+            }
         }
         if lists.is_empty() {
             return Vec::new();
