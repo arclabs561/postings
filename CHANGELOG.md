@@ -36,6 +36,16 @@
   `[87.704 us 89.188 us 91.114 us]` to
   `[71.472 us 71.688 us 71.913 us]`, while
   `weighted_top_k/single_rare_term/1` stayed flat.
+- Sped up dense-doc-id multi-term `top_k_weighted` queries by keeping only the
+  current top `k` scored documents instead of materializing every touched
+  document before selection. In focused runs, `weighted_top_k/terms/2` moved
+  from `[171.76 us 171.99 us 172.21 us]` to
+  `[147.67 us 147.93 us 148.21 us]`, `weighted_top_k/terms/5` moved from
+  `[288.46 us 288.98 us 289.53 us]` to
+  `[224.35 us 224.83 us 225.32 us]`, and
+  `weighted_top_k/expanded_terms/32` moved from
+  `[741.00 us 742.18 us 743.25 us]` to
+  `[592.20 us 593.69 us 595.36 us]`.
 - Sped up two-term positional proximity queries with skewed term frequencies
   by anchoring on the rarer term. On the positional benchmark,
   `near_pair_skewed_window_4` moved from

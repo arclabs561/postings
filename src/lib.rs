@@ -709,12 +709,12 @@ where
                 }
             }
 
-            let mut ranked: Vec<(DocId, f32)> = touched
-                .into_iter()
-                .map(|doc_id| (doc_id, scores[doc_id as usize]))
-                .collect();
-            keep_top_k(&mut ranked, k);
-            return ranked;
+            return top_k_scored_docs(
+                touched
+                    .into_iter()
+                    .map(|doc_id| (doc_id, scores[doc_id as usize])),
+                k,
+            );
         }
 
         let mut scores: HashMap<DocId, f32> =
@@ -938,6 +938,41 @@ fn keep_top_k(ranked: &mut Vec<(DocId, f32)>, k: usize) {
         ranked.truncate(k);
     }
     ranked.sort_by(cmp_doc_scores);
+}
+
+fn top_k_scored_docs<I>(docs: I, k: usize) -> Vec<(DocId, f32)>
+where
+    I: IntoIterator<Item = (DocId, f32)>,
+{
+    if k == 0 {
+        return Vec::new();
+    }
+
+    let mut ranked: Vec<(DocId, f32)> = Vec::with_capacity(k);
+    let mut sorted = false;
+    for doc in docs {
+        if ranked.len() < k {
+            ranked.push(doc);
+            continue;
+        }
+        if !sorted {
+            ranked.sort_by(cmp_doc_scores);
+            sorted = true;
+        }
+        if cmp_doc_scores(&doc, ranked.last().expect("top-k buffer is full")).is_lt() {
+            let last = ranked.len() - 1;
+            ranked[last] = doc;
+            let mut i = last;
+            while i > 0 && cmp_doc_scores(&ranked[i], &ranked[i - 1]).is_lt() {
+                ranked.swap(i, i - 1);
+                i -= 1;
+            }
+        }
+    }
+    if !sorted {
+        ranked.sort_by(cmp_doc_scores);
+    }
+    ranked
 }
 
 fn top_k_single_postings<W: Weight>(
