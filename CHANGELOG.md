@@ -54,6 +54,11 @@
   `weighted_top_k_sparse_doc_ids/terms/16` moved from
   `[1.8250 ms 1.8285 ms 1.8321 ms]` to
   `[1.7442 ms 1.7477 ms 1.7516 ms]`.
+- Sped up three-term unordered proximity by scanning the three sorted position
+  lists directly instead of allocating and sorting per-document occurrences. In
+  the positional benchmark, `near_unordered_3_terms_window_16` moved from
+  `[1.0238 ms 1.0314 ms 1.0412 ms]` to
+  `[709.45 us 712.45 us 715.86 us]`.
 - Sped up two-term positional proximity queries with skewed term frequencies
   by anchoring on the rarer term. On the positional benchmark,
   `near_pair_skewed_window_4` moved from

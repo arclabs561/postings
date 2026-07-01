@@ -454,6 +454,10 @@ fn near_doc_unordered(
     required: &[(&str, usize)],
     window: u32,
 ) -> bool {
+    if let [(a, 1), (b, 1), (c, 1)] = required {
+        return near_doc_unordered_three(ix, doc_id, [*a, *b, *c], window);
+    }
+
     // Build occurrences (pos, term) for all required term strings.
     let mut occ: Vec<(TokenPos, usize)> = Vec::new();
     for (term_i, &(term, _)) in required.iter().enumerate() {
@@ -490,6 +494,42 @@ fn near_doc_unordered(
             }
             have[term_l] -= 1;
             l += 1;
+        }
+    }
+    false
+}
+
+fn near_doc_unordered_three(
+    ix: &PosingsIndex,
+    doc_id: DocId,
+    terms: [&str; 3],
+    window: u32,
+) -> bool {
+    let a = ix.positions(terms[0], doc_id);
+    let b = ix.positions(terms[1], doc_id);
+    let c = ix.positions(terms[2], doc_id);
+    if a.is_empty() || b.is_empty() || c.is_empty() {
+        return false;
+    }
+
+    let mut i = 0usize;
+    let mut j = 0usize;
+    let mut k = 0usize;
+    while i < a.len() && j < b.len() && k < c.len() {
+        let pa = a[i];
+        let pb = b[j];
+        let pc = c[k];
+        let min_pos = pa.min(pb).min(pc);
+        let max_pos = pa.max(pb).max(pc);
+        if max_pos - min_pos <= window {
+            return true;
+        }
+        if pa == min_pos {
+            i += 1;
+        } else if pb == min_pos {
+            j += 1;
+        } else {
+            k += 1;
         }
     }
     false
