@@ -318,49 +318,40 @@ impl PosingsIndex {
         }
         let candidates = self.candidates_all_terms(&required);
 
-        // Standard phrase evaluation: intersect "shifted" position lists.
-        //
-        // For each term at offset i, the phrase starts at positions (pos(term) - i).
-        // The phrase exists iff the intersection across all offsets is non-empty.
+        // For each possible start implied by the rarest position list, verify
+        // the exact shifted target in the other sorted position lists.
         let mut out = Vec::new();
         'doc: for doc_id in candidates {
-            let mut shifted: Vec<Vec<TokenPos>> = Vec::with_capacity(phrase.len());
+            let mut anchor_i = 0usize;
+            let mut anchor_positions: &[TokenPos] = &[];
             for (i, term) in phrase.iter().enumerate() {
                 let ps = self.positions(term, doc_id);
                 if ps.is_empty() {
                     continue 'doc;
                 }
-                let off = i as u32;
-                let mut v: Vec<TokenPos> = Vec::new();
-                for &p in ps {
-                    if p >= off {
-                        v.push(p - off);
-                    }
+                if anchor_positions.is_empty() || ps.len() < anchor_positions.len() {
+                    anchor_i = i;
+                    anchor_positions = ps;
                 }
-                if v.is_empty() {
-                    continue 'doc;
-                }
-                shifted.push(v);
             }
 
-            // Start from the smallest list to minimize work.
-            let mut min_i = 0usize;
-            for i in 1..shifted.len() {
-                if shifted[i].len() < shifted[min_i].len() {
-                    min_i = i;
+            'start: for &anchor_pos in anchor_positions {
+                let Some(start) = anchor_pos.checked_sub(anchor_i as u32) else {
+                    continue;
+                };
+                for (i, term) in phrase.iter().enumerate() {
+                    if i == anchor_i {
+                        continue;
+                    }
+                    let Some(target) = start.checked_add(i as u32) else {
+                        continue 'start;
+                    };
+                    if self.positions(term, doc_id).binary_search(&target).is_err() {
+                        continue 'start;
+                    }
                 }
-            }
-            let mut acc = shifted.swap_remove(min_i);
-            acc.sort_unstable();
-            for mut v in shifted {
-                v.sort_unstable();
-                acc = intersect_sorted(&acc, &v);
-                if acc.is_empty() {
-                    continue 'doc;
-                }
-            }
-            if !acc.is_empty() {
                 out.push(doc_id);
+                continue 'doc;
             }
         }
         out
@@ -426,12 +417,16 @@ impl PosingsIndex {
         }
 
         let candidates = self.candidates_all_terms(&required);
+        let required_terms: Vec<(&str, usize)> = required
+            .iter()
+            .map(|(&term, &count)| (term, count))
+            .collect();
         let mut out = Vec::new();
         for doc_id in candidates {
             let hit = if ordered {
                 near_doc_ordered(self, doc_id, terms, window)
             } else {
-                near_doc_unordered(self, doc_id, &required, window)
+                near_doc_unordered(self, doc_id, &required_terms, window)
             };
             if hit {
                 out.push(doc_id);
@@ -445,14 +440,14 @@ impl PosingsIndex {
 fn near_doc_unordered(
     ix: &PosingsIndex,
     doc_id: DocId,
-    required: &HashMap<&str, usize>,
+    required: &[(&str, usize)],
     window: u32,
 ) -> bool {
     // Build occurrences (pos, term) for all required term strings.
-    let mut occ: Vec<(TokenPos, &str)> = Vec::new();
-    for &t in required.keys() {
-        for &p in ix.positions(t, doc_id) {
-            occ.push((p, t));
+    let mut occ: Vec<(TokenPos, usize)> = Vec::new();
+    for (term_i, &(term, _)) in required.iter().enumerate() {
+        for &p in ix.positions(term, doc_id) {
+            occ.push((p, term_i));
         }
     }
     occ.sort_unstable_by_key(|(p, _)| *p);
@@ -461,30 +456,28 @@ fn near_doc_unordered(
     }
 
     // Sliding window over occurrences; maintain counts.
-    let mut have: HashMap<&str, usize> = HashMap::new();
+    let mut have = vec![0usize; required.len()];
     let mut satisfied = 0usize;
     let need = required.len();
 
     let mut l = 0usize;
     for r in 0..occ.len() {
-        let (pos_r, t_r) = occ[r];
-        let c = have.entry(t_r).or_insert(0);
-        *c += 1;
-        if *c == *required.get(t_r).unwrap_or(&1) {
+        let (pos_r, term_r) = occ[r];
+        have[term_r] += 1;
+        if have[term_r] == required[term_r].1 {
             satisfied += 1;
         }
 
         while satisfied == need {
-            let (pos_l, t_l) = occ[l];
+            let (pos_l, term_l) = occ[l];
             if pos_r.saturating_sub(pos_l) <= window {
                 return true;
             }
             // Shrink from left.
-            let c = have.get_mut(t_l).unwrap();
-            if *c == *required.get(t_l).unwrap_or(&1) {
+            if have[term_l] == required[term_l].1 {
                 satisfied -= 1;
             }
-            *c -= 1;
+            have[term_l] -= 1;
             l += 1;
         }
     }
@@ -517,26 +510,6 @@ fn near_doc_ordered(ix: &PosingsIndex, doc_id: DocId, terms: &[String], window: 
         }
     }
     false
-}
-
-fn intersect_sorted(a: &[TokenPos], b: &[TokenPos]) -> Vec<TokenPos> {
-    let mut out = Vec::new();
-    let mut i = 0usize;
-    let mut j = 0usize;
-    while i < a.len() && j < b.len() {
-        let x = a[i];
-        let y = b[j];
-        if x == y {
-            out.push(x);
-            i += 1;
-            j += 1;
-        } else if x < y {
-            i += 1;
-        } else {
-            j += 1;
-        }
-    }
-    out
 }
 
 #[cfg(test)]

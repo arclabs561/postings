@@ -4,6 +4,8 @@
 /// (Zipf-distributed term frequencies so common terms appear in many docs,
 /// rare terms in only a few -- realistic IR workload).
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+#[cfg(feature = "positional")]
+use postings::positional::PosingsIndex;
 use postings::PostingsIndex;
 
 // ---------------------------------------------------------------------------
@@ -33,6 +35,12 @@ fn zipf_sample(rng: &mut u64, vocab_size: usize, _s: f64) -> usize {
 const N_DOCS: usize = 50_000;
 const VOCAB_SIZE: usize = 10_000;
 const TERMS_PER_DOC: usize = 100;
+#[cfg(feature = "positional")]
+const POSITIONAL_DOCS: usize = 25_000;
+#[cfg(feature = "positional")]
+const POSITIONAL_TERMS_PER_DOC: usize = 128;
+const SPARSE_DOCS: usize = 20_000;
+const SPARSE_DOC_ID_STRIDE: u32 = 100;
 
 fn term_str(id: usize) -> String {
     format!("t{id:05}")
@@ -68,6 +76,49 @@ fn build_weighted_index() -> PostingsIndex<String, f32> {
     idx
 }
 
+fn build_sparse_doc_id_weighted_index() -> PostingsIndex<String, f32> {
+    let mut idx: PostingsIndex<String, f32> = PostingsIndex::new();
+    let mut rng: u64 = 0xdeadbeef_cafebabe;
+
+    for logical_doc_id in 0..SPARSE_DOCS as u32 {
+        let weighted: Vec<(String, f32)> = (0..TERMS_PER_DOC)
+            .map(|position| {
+                let term_id = zipf_sample(&mut rng, VOCAB_SIZE, 1.0);
+                let weight = 1.0 + ((term_id % 17) as f32 * 0.01) + ((position % 5) as f32 * 0.001);
+                (term_str(term_id), weight)
+            })
+            .collect();
+        idx.add_weighted_document(logical_doc_id * SPARSE_DOC_ID_STRIDE, &weighted)
+            .unwrap();
+    }
+    idx
+}
+
+#[cfg(feature = "positional")]
+fn build_positional_index() -> PosingsIndex {
+    let mut idx = PosingsIndex::new();
+    let mut rng: u64 = 0xdeadbeef_cafebabe;
+
+    for doc_id in 0..POSITIONAL_DOCS as u32 {
+        let mut terms: Vec<String> = (0..POSITIONAL_TERMS_PER_DOC)
+            .map(|_| term_str(zipf_sample(&mut rng, VOCAB_SIZE, 1.0)))
+            .collect();
+
+        if doc_id % 10 == 0 {
+            terms[16] = "anchor_alpha".to_string();
+            terms[17] = "anchor_beta".to_string();
+            terms[18] = "anchor_gamma".to_string();
+        } else if doc_id % 10 == 1 {
+            terms[16] = "anchor_alpha".to_string();
+            terms[20] = "anchor_beta".to_string();
+            terms[30] = "anchor_gamma".to_string();
+        }
+
+        idx.add_document(doc_id, &terms).unwrap();
+    }
+    idx
+}
+
 /// Choose terms that are guaranteed to exist with a given minimum df.
 /// Scans the vocabulary from the most-common end (low term ids = high Zipf rank = high df).
 fn query_terms(idx: &PostingsIndex<String>, count: usize, min_df: u32) -> Vec<String> {
@@ -90,6 +141,49 @@ fn weighted_query_terms(
         .enumerate()
         .map(|(i, t)| (t, 1.0 + (i as f32 * 0.1)))
         .collect()
+}
+
+fn weighted_query_terms_in_df_range(
+    idx: &PostingsIndex<String, f32>,
+    count: usize,
+    min_df: u32,
+    max_df: u32,
+) -> Vec<(String, f32)> {
+    let terms: Vec<_> = (0..VOCAB_SIZE)
+        .rev()
+        .map(term_str)
+        .filter(|t| {
+            let df = idx.df(t.as_str());
+            df >= min_df && df <= max_df
+        })
+        .take(count)
+        .enumerate()
+        .map(|(i, t)| (t, 1.0 + (i as f32 * 0.1)))
+        .collect();
+    assert_eq!(
+        terms.len(),
+        count,
+        "benchmark fixture did not find {count} terms with df in [{min_df}, {max_df}]"
+    );
+    terms
+}
+
+fn query_from_weighted_terms(terms: &[(String, f32)]) -> Vec<(&str, f32)> {
+    terms
+        .iter()
+        .map(|(term, weight)| (term.as_str(), *weight))
+        .collect()
+}
+
+fn top_weighted_terms(terms: &[(String, f32)], keep: usize) -> Vec<(String, f32)> {
+    let mut terms = terms.to_vec();
+    terms.sort_by(|(left_term, left_weight), (right_term, right_weight)| {
+        right_weight
+            .total_cmp(left_weight)
+            .then_with(|| left_term.cmp(right_term))
+    });
+    terms.truncate(keep);
+    terms
 }
 
 // ---------------------------------------------------------------------------
@@ -141,10 +235,59 @@ fn bench_weighted_top_k(c: &mut Criterion) {
 
     for n in [2usize, 5] {
         let terms = weighted_query_terms(&idx, n, 10);
-        let query: Vec<(&str, f32)> = terms
-            .iter()
-            .map(|(term, weight)| (term.as_str(), *weight))
-            .collect();
+        let query = query_from_weighted_terms(&terms);
+        group.bench_with_input(BenchmarkId::new("terms", n), &query, |b, query| {
+            b.iter(|| {
+                black_box(idx.top_k_weighted(black_box(query.as_slice()), 10));
+            });
+        });
+    }
+
+    // Learned-sparse retrievers produce longer expanded queries than classical BM25.
+    for n in [8usize, 16, 32] {
+        let terms = weighted_query_terms(&idx, n, 10);
+        let query = query_from_weighted_terms(&terms);
+        group.bench_with_input(BenchmarkId::new("expanded_terms", n), &query, |b, query| {
+            b.iter(|| {
+                black_box(idx.top_k_weighted(black_box(query.as_slice()), 10));
+            });
+        });
+    }
+
+    let expanded_terms = weighted_query_terms(&idx, 32, 10);
+    let masked_terms = top_weighted_terms(&expanded_terms, 8);
+    let masked_query = query_from_weighted_terms(&masked_terms);
+    group.bench_with_input(
+        BenchmarkId::new("top_weight_terms_from_32", 8),
+        &masked_query,
+        |b, query| {
+            b.iter(|| {
+                black_box(idx.top_k_weighted(black_box(query.as_slice()), 10));
+            });
+        },
+    );
+
+    let rare_terms = weighted_query_terms_in_df_range(&idx, 8, 1, 64);
+    let rare_query = query_from_weighted_terms(&rare_terms);
+    group.bench_with_input(
+        BenchmarkId::new("rare_terms", 8),
+        &rare_query,
+        |b, query| {
+            b.iter(|| {
+                black_box(idx.top_k_weighted(black_box(query.as_slice()), 10));
+            });
+        },
+    );
+    group.finish();
+}
+
+fn bench_weighted_top_k_sparse_doc_ids(c: &mut Criterion) {
+    let idx = build_sparse_doc_id_weighted_index();
+    let mut group = c.benchmark_group("weighted_top_k_sparse_doc_ids");
+
+    for n in [5usize, 16] {
+        let terms = weighted_query_terms(&idx, n, 10);
+        let query = query_from_weighted_terms(&terms);
         group.bench_with_input(BenchmarkId::new("terms", n), &query, |b, query| {
             b.iter(|| {
                 black_box(idx.top_k_weighted(black_box(query.as_slice()), 10));
@@ -154,11 +297,61 @@ fn bench_weighted_top_k(c: &mut Criterion) {
     group.finish();
 }
 
+#[cfg(feature = "positional")]
+fn bench_positional_queries(c: &mut Criterion) {
+    let idx = build_positional_index();
+    let phrase = vec![
+        "anchor_alpha".to_string(),
+        "anchor_beta".to_string(),
+        "anchor_gamma".to_string(),
+    ];
+    let mut group = c.benchmark_group("positional_queries");
+
+    group.bench_function("phrase_3_terms", |b| {
+        b.iter(|| {
+            black_box(idx.phrase_match(black_box(phrase.as_slice())));
+        });
+    });
+    group.bench_function("near_pair_window_4", |b| {
+        b.iter(|| {
+            black_box(idx.near_match(
+                black_box("anchor_alpha"),
+                black_box("anchor_beta"),
+                black_box(4),
+            ));
+        });
+    });
+    group.bench_function("near_unordered_3_terms_window_16", |b| {
+        b.iter(|| {
+            black_box(idx.near_match_terms(
+                black_box(phrase.as_slice()),
+                black_box(16),
+                black_box(false),
+            ));
+        });
+    });
+    group.bench_function("near_ordered_3_terms_window_16", |b| {
+        b.iter(|| {
+            black_box(idx.near_match_terms(
+                black_box(phrase.as_slice()),
+                black_box(16),
+                black_box(true),
+            ));
+        });
+    });
+    group.finish();
+}
+
+#[cfg(not(feature = "positional"))]
+fn bench_positional_queries(_c: &mut Criterion) {}
+
 criterion_group!(
     benches,
     bench_insert_50k,
     bench_conjunctive,
     bench_disjunctive,
-    bench_weighted_top_k
+    bench_weighted_top_k,
+    bench_weighted_top_k_sparse_doc_ids,
+    bench_positional_queries
 );
 criterion_main!(benches);
