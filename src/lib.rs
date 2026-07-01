@@ -432,6 +432,36 @@ where
         if lists.is_empty() {
             return Vec::new();
         }
+        if lists.len() == 1 {
+            return lists[0].iter().map(|(id, _)| *id).collect();
+        }
+
+        // For three or more dense doc-id lists, one mark pass avoids repeated
+        // pairwise union allocation. Sparse doc-id spaces keep the sorted merge path.
+        if lists.len() >= 3 {
+            let dense_slots = lists
+                .iter()
+                .filter_map(|postings| {
+                    let (last_doc_id, _) = postings.last()?;
+                    usize::try_from(*last_doc_id).ok()?.checked_add(1)
+                })
+                .max()
+                .unwrap_or(0);
+            let dense_limit = self.doc_len.len().saturating_mul(4).max(1024);
+            if dense_slots <= dense_limit {
+                let mut seen = vec![false; dense_slots];
+                for postings in lists {
+                    for &(doc_id, _) in postings {
+                        seen[doc_id as usize] = true;
+                    }
+                }
+                return seen
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(doc_id, hit)| hit.then_some(doc_id as DocId))
+                    .collect();
+            }
+        }
 
         lists.sort_by_key(|postings| postings.len());
         let mut lists = lists.into_iter();

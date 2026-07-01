@@ -58,6 +58,11 @@
   `weighted_top_k/rare_terms/8` moved from
   `[6.3326 us 6.3638 us 6.3793 us]` to
   `[5.9865 us 6.0191 us 6.0414 us]`.
+- Sped up dense disjunctive candidate generation for three or more terms by
+  marking doc-id slots once instead of building repeated pairwise unions. In
+  close A/B runs, `disjunctive/terms/5` moved from
+  `[297.42 us 298.42 us 300.25 us]` to
+  `[98.885 us 99.443 us 100.39 us]`.
 
 ### Fixed
 
