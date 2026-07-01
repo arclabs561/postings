@@ -241,14 +241,20 @@ impl PosingsIndex {
         let Some(anchor_map) = self.postings.get(anchor) else {
             return Vec::new();
         };
+        let req_anchor = *required_counts.get(anchor).unwrap_or(&1);
+        let mut required_rest = Vec::with_capacity(required_counts.len().saturating_sub(1));
+        for (&term, &count) in required_counts {
+            if term != anchor {
+                required_rest.push((term, count));
+            }
+        }
 
         let mut out: Vec<DocId> = Vec::new();
         'doc: for (&doc_id, pos_anchor) in anchor_map.iter() {
-            let req_anchor = *required_counts.get(anchor).unwrap_or(&1);
             if pos_anchor.len() < req_anchor {
                 continue;
             }
-            for (&t, &req) in required_counts {
+            for &(t, req) in &required_rest {
                 let Some(m) = self.postings.get(t) else {
                     continue 'doc;
                 };

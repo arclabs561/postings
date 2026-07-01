@@ -35,6 +35,13 @@
   `near_pair_skewed_window_4` moved from
   `[1.4829 ms 1.5023 ms 1.5174 ms]` to
   `[85.559 us 85.795 us 85.945 us]`.
+- Sped up positional candidate filtering by avoiding a redundant re-check of
+  the already-matched rarest anchor term. On the positional benchmark,
+  `phrase_3_terms` moved from `[1.1363 ms 1.1387 ms 1.1408 ms]` to
+  `[931.30 us 935.12 us 940.58 us]`, and
+  `near_ordered_3_terms_window_16` moved from
+  `[969.81 us 973.69 us 979.73 us]` to
+  `[762.03 us 794.17 us 819.46 us]`.
 
 ### Fixed
 
