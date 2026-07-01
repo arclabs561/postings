@@ -366,10 +366,15 @@ impl PosingsIndex {
             // window=0 means the same position, which can't happen for two distinct terms.
             return Vec::new();
         }
+        let (anchor, other) = if self.df(a) <= self.df(b) {
+            (a, b)
+        } else {
+            (b, a)
+        };
         let mut out = Vec::new();
-        for doc_id in self.docs_with_term(a) {
-            let pa = self.positions(a, doc_id);
-            let pb = self.positions(b, doc_id);
+        for doc_id in self.docs_with_term(anchor) {
+            let pa = self.positions(anchor, doc_id);
+            let pb = self.positions(other, doc_id);
             if pa.is_empty() || pb.is_empty() {
                 continue;
             }
@@ -558,6 +563,20 @@ mod tests {
         // window=1 excludes doc 2 (distance 2), includes doc 1 (distance 1)
         let hits = ix.near_match("new", "york", 1);
         assert_eq!(hits, vec![1]);
+    }
+
+    #[test]
+    fn near_match_is_symmetric_for_skewed_terms() {
+        let mut ix = PosingsIndex::new();
+        ix.add_document(1, &["common".into(), "x".into(), "rare".into()])
+            .unwrap();
+        ix.add_document(2, &["common".into(), "x".into(), "x".into()])
+            .unwrap();
+        ix.add_document(3, &["common".into(), "rare".into(), "x".into()])
+            .unwrap();
+
+        assert_eq!(ix.near_match("common", "rare", 2), vec![1, 3]);
+        assert_eq!(ix.near_match("rare", "common", 2), vec![1, 3]);
     }
 
     #[test]

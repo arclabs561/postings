@@ -30,6 +30,11 @@
   `weighted_top_k/single_rare_term/1` moved from
   `[324.98 ns 326.51 ns 328.00 ns]` to
   `[136.33 ns 136.67 ns 137.22 ns]`.
+- Sped up two-term positional proximity queries with skewed term frequencies
+  by anchoring on the rarer term. On the positional benchmark,
+  `near_pair_skewed_window_4` moved from
+  `[1.4829 ms 1.5023 ms 1.5174 ms]` to
+  `[85.559 us 85.795 us 85.945 us]`.
 
 ### Fixed
 

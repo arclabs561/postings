@@ -113,6 +113,10 @@ fn build_positional_index() -> PosingsIndex {
             terms[20] = "anchor_beta".to_string();
             terms[30] = "anchor_gamma".to_string();
         }
+        terms[48] = "near_common".to_string();
+        if doc_id % 20 == 0 {
+            terms[50] = "near_rare".to_string();
+        }
 
         idx.add_document(doc_id, &terms).unwrap();
     }
@@ -341,6 +345,15 @@ fn bench_positional_queries(c: &mut Criterion) {
             black_box(idx.near_match(
                 black_box("anchor_alpha"),
                 black_box("anchor_beta"),
+                black_box(4),
+            ));
+        });
+    });
+    group.bench_function("near_pair_skewed_window_4", |b| {
+        b.iter(|| {
+            black_box(idx.near_match(
+                black_box("near_common"),
+                black_box("near_rare"),
                 black_box(4),
             ));
         });
