@@ -33,6 +33,8 @@
 - Added file-backed raw-segment candidate generation and planning with
   `RawSegmentFile::candidates_all_terms`, `candidates_any_terms`, and
   `plan_candidates`.
+- Added `RawSegment::term_ids` and `RawSegmentFile::term_ids` for enumerating
+  numeric term ids present in a raw segment.
 - Added `RawSegment::top_k_weighted_u32` for exact sparse inner-product scoring
   directly from byte-backed numeric raw segments.
 - Added raw-segment benchmark coverage for file-backed open, posting-block

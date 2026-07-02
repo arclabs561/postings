@@ -368,6 +368,15 @@ impl<'a> RawSegment<'a> {
             .map_or(0, |entry| entry.max_weight))
     }
 
+    /// Numeric term ids present in this segment, in ascending order.
+    pub fn term_ids(&self) -> Result<Vec<RawTermId>, Error> {
+        let mut terms = Vec::with_capacity(self.meta.term_count as usize);
+        for index in 0..self.meta.term_count {
+            terms.push(self.term_entry_at(index)?.term_id);
+        }
+        Ok(terms)
+    }
+
     /// Return a lazy posting iterator for a term id.
     pub fn postings(&self, term_id: RawTermId) -> Result<RawPostings<'a>, Error> {
         let Some(entry) = self.term_entry(term_id)? else {
@@ -1093,6 +1102,15 @@ impl RawSegmentFile {
         Ok(self
             .term_entry(term_id)?
             .map_or(0, |entry| entry.max_weight))
+    }
+
+    /// Numeric term ids present in this segment, in ascending order.
+    pub fn term_ids(&self) -> Result<Vec<RawTermId>, Error> {
+        let mut terms = Vec::with_capacity(self.meta.term_count as usize);
+        for index in 0..self.meta.term_count {
+            terms.push(self.term_entry_at(index)?.term_id);
+        }
+        Ok(terms)
     }
 
     /// Return decoded postings for a term id, range-reading only that term's payload.
@@ -2512,6 +2530,7 @@ mod tests {
         assert_eq!(segment.df(10).unwrap(), 2);
         assert_eq!(segment.total_weight(10).unwrap(), 5);
         assert_eq!(segment.max_weight(10).unwrap(), 4);
+        assert_eq!(segment.term_ids().unwrap(), vec![10, 20, 30]);
         assert_eq!(collect_postings(&segment, 10), vec![(2, 1), (5, 4)]);
         assert_eq!(collect_postings(&segment, 20), vec![(5, 2), (9, 1)]);
         assert_eq!(
@@ -2637,6 +2656,7 @@ mod tests {
         assert_eq!(segment.df(10).unwrap(), 2);
         assert_eq!(segment.total_weight(10).unwrap(), 5);
         assert_eq!(segment.max_weight(10).unwrap(), 4);
+        assert_eq!(segment.term_ids().unwrap(), vec![10, 20]);
         assert_eq!(segment.postings(10).unwrap(), vec![(2, 1), (5, 4)]);
         assert!(segment.postings(999).unwrap().is_empty());
 
@@ -3026,6 +3046,10 @@ mod tests {
                 segment.plan_candidates(&query_terms, PlannerConfig::default()).unwrap()
             );
             prop_assert_eq!(
+                file_segment.term_ids().unwrap(),
+                segment.term_ids().unwrap()
+            );
+            prop_assert_eq!(
                 file_segment.top_k_weighted_u32(&raw_weighted_query, 5).unwrap(),
                 segment.top_k_weighted_u32(&raw_weighted_query, 5).unwrap()
             );
@@ -3035,6 +3059,9 @@ mod tests {
                 let memory_postings: Vec<(DocId, u32)> = idx.postings_iter(&term_id).collect();
                 prop_assert_eq!(raw_postings, memory_postings);
             }
+            let mut memory_terms: Vec<_> = idx.terms().copied().collect();
+            memory_terms.sort_unstable();
+            prop_assert_eq!(segment.term_ids().unwrap(), memory_terms);
             for doc_id in idx.document_ids() {
                 prop_assert_eq!(segment.document_len(doc_id).unwrap(), Some(idx.document_len(doc_id)));
             }
