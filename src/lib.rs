@@ -1610,6 +1610,101 @@ mod tests {
         assert_eq!(ranked, vec![(1_000_000, 4.0), (7, 2.0)]);
     }
 
+    fn exact_sparse_top_k(
+        docs: &[(DocId, std::collections::HashMap<u8, f32>)],
+        query_terms: &[(u8, f32)],
+        k: usize,
+    ) -> Vec<(DocId, f32)> {
+        if k == 0 || query_terms.is_empty() {
+            return Vec::new();
+        }
+
+        let mut query_weights: std::collections::HashMap<u8, f32> =
+            std::collections::HashMap::new();
+        for &(term, weight) in query_terms {
+            if weight != 0.0 {
+                *query_weights.entry(term).or_insert(0.0) += weight;
+            }
+        }
+
+        let mut scored = Vec::new();
+        for &(doc_id, ref doc_weights) in docs {
+            let mut score = 0.0;
+            for (&term, &query_weight) in &query_weights {
+                if let Some(&doc_weight) = doc_weights.get(&term) {
+                    let contribution = query_weight * doc_weight;
+                    if contribution != 0.0 {
+                        score += contribution;
+                    }
+                }
+            }
+            if score != 0.0 {
+                scored.push((doc_id, score));
+            }
+        }
+        scored.sort_by(|left, right| {
+            right
+                .1
+                .total_cmp(&left.1)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        scored.truncate(k);
+        scored
+    }
+
+    fn quarter_weight(raw: u8) -> f32 {
+        (raw as f32) * 0.25
+    }
+
+    proptest! {
+        #[test]
+        fn top_k_weighted_matches_exact_sparse_dot_product(
+            docs in prop::collection::vec(
+                prop::collection::vec((0u8..20, 0u8..8), 0..16),
+                0..40
+            ),
+            query in prop::collection::vec((0u8..20, 0u8..8), 0..12),
+            k in 0usize..12,
+            stride in prop::sample::select(vec![1u32, 97u32]),
+        ) {
+            let mut idx: PostingsIndex<String, f32> = PostingsIndex::new();
+            let mut oracle_docs = Vec::new();
+
+            for (i, doc_terms) in docs.iter().enumerate() {
+                let doc_id = (i as DocId) * stride;
+                let weighted_terms: Vec<(String, f32)> = doc_terms
+                    .iter()
+                    .map(|&(term, weight)| (format!("t{term:02}"), quarter_weight(weight)))
+                    .collect();
+                idx.add_weighted_document(doc_id, &weighted_terms).unwrap();
+
+                let mut oracle_doc = std::collections::HashMap::new();
+                for &(term, weight) in doc_terms {
+                    *oracle_doc.entry(term).or_insert(0.0) += quarter_weight(weight);
+                }
+                oracle_docs.push((doc_id, oracle_doc));
+            }
+
+            let query_owned: Vec<(String, f32)> = query
+                .iter()
+                .map(|&(term, weight)| (format!("t{term:02}"), quarter_weight(weight)))
+                .collect();
+            let query_refs: Vec<(&str, f32)> = query_owned
+                .iter()
+                .map(|(term, weight)| (term.as_str(), *weight))
+                .collect();
+            let oracle_query: Vec<(u8, f32)> = query
+                .iter()
+                .map(|&(term, weight)| (term, quarter_weight(weight)))
+                .collect();
+
+            let ranked = idx.top_k_weighted(&query_refs, k);
+            let expected = exact_sparse_top_k(&oracle_docs, &oracle_query, k);
+
+            prop_assert_eq!(ranked, expected);
+        }
+    }
+
     #[test]
     fn top_k_weighted_zero_k_is_empty() {
         let mut idx: PostingsIndex<String, f32> = PostingsIndex::new();

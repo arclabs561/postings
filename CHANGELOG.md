@@ -6,6 +6,9 @@
 
 - Added `PostingsIndex::top_k_weighted` for sparse inner-product ranking over
   weighted postings.
+- Added a property-test quality gate that checks `top_k_weighted` against a
+  brute-force sparse dot-product oracle across duplicate query terms and
+  dense/sparse document id layouts.
 
 ### Changed
 
