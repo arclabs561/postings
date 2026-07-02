@@ -12,6 +12,12 @@
 
 ### Changed
 
+- Sped up deleting documents that appear in long common-term posting lists by
+  removing the sorted posting entry with binary search instead of scanning the
+  full list. In the delete benchmark, `delete/common_terms_20k` moved from
+  `[3.2583 ms 3.3284 ms 3.4373 ms]` to
+  `[3.0940 ms 3.1817 ms 3.2701 ms]`; `delete/common_terms_5k` stayed within
+  noise.
 - Sped up multi-term `top_k_weighted` scoring for dense doc ids by using a dense
   accumulator with sparse-id fallback. On the benchmark query workload,
   `weighted_top_k/terms/2` moved from `[1.0914 ms 1.0979 ms 1.1059 ms]` to

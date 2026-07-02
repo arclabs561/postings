@@ -94,6 +94,18 @@ fn build_sparse_doc_id_weighted_index() -> PostingsIndex<String, f32> {
     idx
 }
 
+fn build_delete_index(n_docs: u32, common_terms: usize) -> PostingsIndex<String> {
+    let mut idx: PostingsIndex<String> = PostingsIndex::new();
+    for doc_id in 0..n_docs {
+        let mut terms: Vec<String> = (0..common_terms)
+            .map(|term| format!("delete_common_{term}"))
+            .collect();
+        terms.push(format!("delete_unique_{doc_id}"));
+        idx.add_document(doc_id, &terms).unwrap();
+    }
+    idx
+}
+
 #[cfg(feature = "positional")]
 fn build_positional_index() -> PosingsIndex {
     let mut idx = PosingsIndex::new();
@@ -347,6 +359,25 @@ fn bench_weighted_top_k_sparse_doc_ids(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_delete(c: &mut Criterion) {
+    let mut group = c.benchmark_group("delete");
+    for &(label, n_docs, common_terms, target_doc) in &[
+        ("common_terms_5k", 5_000u32, 8usize, 2_500u32),
+        ("common_terms_20k", 20_000u32, 8usize, 10_000u32),
+    ] {
+        group.bench_function(label, |b| {
+            b.iter_batched(
+                || build_delete_index(n_docs, common_terms),
+                |mut idx| {
+                    black_box(idx.delete_document(black_box(target_doc)));
+                },
+                criterion::BatchSize::SmallInput,
+            );
+        });
+    }
+    group.finish();
+}
+
 #[cfg(feature = "positional")]
 fn bench_positional_queries(c: &mut Criterion) {
     let idx = build_positional_index();
@@ -412,6 +443,7 @@ criterion_group!(
     bench_plan_candidates,
     bench_weighted_top_k,
     bench_weighted_top_k_sparse_doc_ids,
+    bench_delete,
     bench_positional_queries
 );
 criterion_main!(benches);

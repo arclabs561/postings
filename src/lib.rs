@@ -374,7 +374,9 @@ where
                     }
                 }
                 if let Some(postings) = self.global_postings.get_mut(term) {
-                    postings.retain(|(id, _)| *id != doc_id);
+                    if let Ok(i) = postings.binary_search_by_key(&doc_id, |(id, _)| *id) {
+                        postings.remove(i);
+                    }
                     if postings.is_empty() {
                         self.global_postings.remove(term);
                     }
@@ -1117,6 +1119,21 @@ mod tests {
         assert_eq!(idx.candidates(&[String::from("a")]), vec![1, 2]);
         assert_eq!(idx.term_frequency(1, "a"), 1);
         assert_eq!(idx.term_frequency(2, "a"), 1);
+    }
+
+    #[test]
+    fn delete_preserves_sorted_postings_after_out_of_order_doc_ids() {
+        let mut idx: PostingsIndex<String> = PostingsIndex::new();
+        idx.add_document(4, &[String::from("a")]).unwrap();
+        idx.add_document(1, &[String::from("a")]).unwrap();
+        idx.add_document(7, &[String::from("a")]).unwrap();
+
+        assert!(idx.delete_document(4));
+
+        assert_eq!(idx.candidates(&[String::from("a")]), vec![1, 7]);
+        assert_eq!(idx.term_frequency(1, "a"), 1);
+        assert_eq!(idx.term_frequency(4, "a"), 0);
+        assert_eq!(idx.term_frequency(7, "a"), 1);
     }
 
     #[test]
