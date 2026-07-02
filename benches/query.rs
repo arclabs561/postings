@@ -316,6 +316,23 @@ fn bench_weighted_top_k(c: &mut Criterion) {
         });
     }
 
+    let mut mixed_terms = weighted_query_terms(&idx, 16, 10);
+    for (i, (_, weight)) in mixed_terms.iter_mut().enumerate() {
+        if i % 4 == 0 {
+            *weight = -*weight;
+        }
+    }
+    let mixed_query = query_from_weighted_terms(&mixed_terms);
+    group.bench_with_input(
+        BenchmarkId::new("mixed_sign_terms", 16),
+        &mixed_query,
+        |b, query| {
+            b.iter(|| {
+                black_box(idx.top_k_weighted(black_box(query.as_slice()), 10));
+            });
+        },
+    );
+
     let expanded_terms = weighted_query_terms(&idx, 32, 10);
     let masked_terms = top_weighted_terms(&expanded_terms, 8);
     let masked_query = query_from_weighted_terms(&masked_terms);

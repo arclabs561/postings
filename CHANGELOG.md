@@ -9,6 +9,8 @@
 - Added a property-test quality gate that checks `top_k_weighted` against a
   brute-force sparse dot-product oracle across duplicate query terms and
   dense/sparse document id layouts.
+- Added mixed-sign `top_k_weighted` benchmark coverage to keep the exact scorer
+  fallback visible while positive-query fast paths improve.
 
 ### Changed
 
