@@ -418,14 +418,31 @@ where
             return Vec::new();
         }
         let mut lists: Vec<&[(DocId, W)]> = Vec::new();
-        let mut seen_terms: HashSet<&Q> = HashSet::new();
-        for term in query_terms {
-            if !seen_terms.insert(term) {
-                continue;
+        if query_terms.len() <= 32 {
+            let mut seen_terms: Vec<&Q> = Vec::with_capacity(query_terms.len());
+            'term: for term in query_terms {
+                for seen in &seen_terms {
+                    if *seen == term {
+                        continue 'term;
+                    }
+                }
+                seen_terms.push(term);
+                if let Some(postings) = self.global_postings.get(term) {
+                    if !postings.is_empty() {
+                        lists.push(postings);
+                    }
+                }
             }
-            if let Some(postings) = self.global_postings.get(term) {
-                if !postings.is_empty() {
-                    lists.push(postings);
+        } else {
+            let mut seen_terms: HashSet<&Q> = HashSet::new();
+            for term in query_terms {
+                if !seen_terms.insert(term) {
+                    continue;
+                }
+                if let Some(postings) = self.global_postings.get(term) {
+                    if !postings.is_empty() {
+                        lists.push(postings);
+                    }
                 }
             }
         }
@@ -493,12 +510,22 @@ where
             return Vec::new();
         }
 
-        // Deduplicate query terms.
         let mut uniq: Vec<&Q> = Vec::new();
-        let mut seen: HashSet<&Q> = HashSet::new();
-        for t in query_terms {
-            if seen.insert(t) {
-                uniq.push(t);
+        if query_terms.len() <= 32 {
+            'term: for term in query_terms {
+                for seen in &uniq {
+                    if *seen == term {
+                        continue 'term;
+                    }
+                }
+                uniq.push(term);
+            }
+        } else {
+            let mut seen: HashSet<&Q> = HashSet::new();
+            for t in query_terms {
+                if seen.insert(t) {
+                    uniq.push(t);
+                }
             }
         }
         if uniq.is_empty() {
@@ -558,15 +585,31 @@ where
         }
 
         // Upper bound on candidate count: sum df(t) over unique terms.
-        let mut seen_terms: HashSet<&Q> = HashSet::new();
         let mut df_sum: u64 = 0;
-        for t in query_terms {
-            if !seen_terms.insert(t) {
-                continue;
+        if query_terms.len() <= 32 {
+            let mut seen_terms: Vec<&Q> = Vec::with_capacity(query_terms.len());
+            'term: for term in query_terms {
+                for seen in &seen_terms {
+                    if *seen == term {
+                        continue 'term;
+                    }
+                }
+                seen_terms.push(term);
+                df_sum = df_sum.saturating_add(self.df(term) as u64);
+                if df_sum >= cfg.max_candidates as u64 {
+                    return CandidatePlan::ScanAll;
+                }
             }
-            df_sum = df_sum.saturating_add(self.df(t) as u64);
-            if df_sum >= cfg.max_candidates as u64 {
-                return CandidatePlan::ScanAll;
+        } else {
+            let mut seen_terms: HashSet<&Q> = HashSet::new();
+            for t in query_terms {
+                if !seen_terms.insert(t) {
+                    continue;
+                }
+                df_sum = df_sum.saturating_add(self.df(t) as u64);
+                if df_sum >= cfg.max_candidates as u64 {
+                    return CandidatePlan::ScanAll;
+                }
             }
         }
 

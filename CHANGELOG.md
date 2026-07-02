@@ -104,6 +104,12 @@
   `[51.512 us 51.877 us 52.065 us]`, and `conjunctive/terms/5` moved from
   `[498.44 us 501.95 us 503.96 us]` to
   `[394.70 us 399.13 us 401.53 us]`.
+- Sped up short candidate queries by deduplicating query terms in a small vector
+  before falling back to a `HashSet` for longer queries. In focused runs,
+  `disjunctive/terms/5` moved from `[100.75 us 101.13 us 101.49 us]` to
+  `[97.965 us 98.222 us 98.472 us]`, and `conjunctive/terms/5` moved from
+  `[466.91 us 467.79 us 468.69 us]` to
+  `[392.37 us 395.10 us 397.89 us]`.
 
 ### Fixed
 
