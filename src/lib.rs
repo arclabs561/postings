@@ -453,9 +453,9 @@ where
             return lists[0].iter().map(|(id, _)| *id).collect();
         }
 
-        // For three or more dense doc-id lists, one mark pass avoids repeated
+        // For dense doc-id lists, one mark pass avoids repeated
         // pairwise union allocation. Sparse doc-id spaces keep the sorted merge path.
-        if lists.len() >= 3 {
+        if lists.len() >= 2 {
             let dense_slots = lists
                 .iter()
                 .filter_map(|postings| {

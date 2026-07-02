@@ -117,6 +117,14 @@
   `[50.780 us 50.847 us 50.915 us]`, and `conjunctive/terms/5` moved from
   `[390.82 us 395.33 us 400.03 us]` to
   `[330.26 us 334.30 us 338.50 us]`.
+- Sped up two-term disjunctive candidate generation by using the dense
+  mark-pass union for two dense posting lists, not only for three or more. In
+  close A/B runs, `disjunctive/terms/2` moved from
+  `[65.849 us 66.063 us 66.272 us]` to
+  `[62.431 us 62.552 us 62.675 us]`; `disjunctive/terms/5` stayed within noise.
+  The candidate-returning `plan_candidates/terms/2` benchmark moved from
+  `[64.801 us 64.939 us 65.092 us]` to
+  `[60.962 us 61.259 us 61.584 us]`.
 
 ### Fixed
 

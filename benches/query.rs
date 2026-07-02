@@ -6,7 +6,7 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 #[cfg(feature = "positional")]
 use postings::positional::PosingsIndex;
-use postings::PostingsIndex;
+use postings::{CandidatePlan, PlannerConfig, PostingsIndex};
 
 // ---------------------------------------------------------------------------
 // Zipf generator
@@ -233,6 +233,28 @@ fn bench_disjunctive(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_plan_candidates(c: &mut Criterion) {
+    let idx = build_index();
+    let cfg = PlannerConfig {
+        max_candidate_ratio: f32::INFINITY,
+        max_candidates: u32::MAX,
+    };
+    let mut group = c.benchmark_group("plan_candidates");
+
+    for n in [2usize, 5] {
+        let terms = query_terms(&idx, n, 10);
+        group.bench_with_input(BenchmarkId::new("terms", n), &terms, |b, terms| {
+            b.iter(
+                || match idx.plan_candidates(black_box(terms.as_slice()), cfg) {
+                    CandidatePlan::Candidates(candidates) => black_box(candidates.len()),
+                    CandidatePlan::ScanAll => black_box(idx.num_docs() as usize),
+                },
+            );
+        });
+    }
+    group.finish();
+}
+
 fn bench_weighted_top_k(c: &mut Criterion) {
     let idx = build_weighted_index();
     let mut group = c.benchmark_group("weighted_top_k");
@@ -387,6 +409,7 @@ criterion_group!(
     bench_insert_50k,
     bench_conjunctive,
     bench_disjunctive,
+    bench_plan_candidates,
     bench_weighted_top_k,
     bench_weighted_top_k_sparse_doc_ids,
     bench_positional_queries
