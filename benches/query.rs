@@ -7,7 +7,7 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 #[cfg(feature = "positional")]
 use postings::positional::PosingsIndex;
 #[cfg(feature = "raw-segment")]
-use postings::raw::{write_u64_u32_segment, RawDocument, RawSegment};
+use postings::raw::{write_u64_u32_segment, RawDocument, RawSegment, RawSegmentFile};
 use postings::{CandidatePlan, PlannerConfig, PostingsIndex};
 
 // ---------------------------------------------------------------------------
@@ -459,6 +459,10 @@ fn bench_delete(c: &mut Criterion) {
 fn bench_raw_segment_queries(c: &mut Criterion) {
     let (idx, bytes) = build_raw_numeric_fixture();
     let segment = RawSegment::open(&bytes).unwrap();
+    let raw_dir = tempfile::tempdir().unwrap();
+    let raw_path = raw_dir.path().join("numeric.raw");
+    std::fs::write(&raw_path, &bytes).unwrap();
+    let mut file_segment = RawSegmentFile::open(&raw_path).unwrap();
     let terms = numeric_query_terms(&idx, 5, 10);
     let weighted_terms: Vec<(u64, f32)> = terms
         .iter()
@@ -476,6 +480,16 @@ fn bench_raw_segment_queries(c: &mut Criterion) {
         b.iter(|| {
             black_box(
                 RawSegment::open(black_box(bytes.as_slice()))
+                    .unwrap()
+                    .num_docs(),
+            );
+        });
+    });
+
+    group.bench_function("file_open", |b| {
+        b.iter(|| {
+            black_box(
+                RawSegmentFile::open(black_box(&raw_path))
                     .unwrap()
                     .num_docs(),
             );
@@ -523,6 +537,22 @@ fn bench_raw_segment_queries(c: &mut Criterion) {
         });
     });
 
+    group.bench_function("file_postings_decode_common", |b| {
+        b.iter(|| {
+            let postings = file_segment.postings(black_box(common_term)).unwrap();
+            black_box(postings.len());
+        });
+    });
+
+    group.bench_function("file_postings_decode_common_block_0", |b| {
+        b.iter(|| {
+            let postings = file_segment
+                .posting_block_postings(black_box(common_term), black_box(0))
+                .unwrap();
+            black_box(postings.len());
+        });
+    });
+
     group.bench_function("raw_candidates_all_terms_5", |b| {
         b.iter(|| {
             black_box(
@@ -547,6 +577,16 @@ fn bench_raw_segment_queries(c: &mut Criterion) {
         b.iter(|| {
             black_box(
                 segment
+                    .top_k_weighted_u32(black_box(weighted_terms.as_slice()), black_box(10))
+                    .unwrap(),
+            );
+        });
+    });
+
+    group.bench_function("file_top_k_weighted_5", |b| {
+        b.iter(|| {
+            black_box(
+                file_segment
                     .top_k_weighted_u32(black_box(weighted_terms.as_slice()), black_box(10))
                     .unwrap(),
             );

@@ -27,8 +27,13 @@
 - Added `RawSegmentFile`, a file-backed raw-segment reader that keeps fixed
   directories in memory and range-reads requested posting lists or posting
   blocks from the segment file.
+- Added `RawSegmentFile::top_k_weighted_u32` for exact sparse inner-product
+  scoring from a file-backed raw segment without loading full posting payloads
+  at open time.
 - Added `RawSegment::top_k_weighted_u32` for exact sparse inner-product scoring
   directly from byte-backed numeric raw segments.
+- Added raw-segment benchmark coverage for file-backed open, posting-block
+  decode, posting-list decode, and exact top-k scoring.
 - Added raw-segment benchmark coverage for disjunctive candidate generation
   and metadata-only candidate planning against the in-memory path.
 - Added `PostingsIndex::top_k_weighted` for sparse inner-product ranking over

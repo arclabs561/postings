@@ -14,7 +14,7 @@
 //!
 //! - `postings::codec`: low-level codecs (varint/gap) for postings payloads (in this repo).
 //! - `postings::positional` (feature `positional`): positional postings for phrase/proximity evaluation.
-//! - `postings::raw` (feature `raw-segment`): byte-backed raw segment reader experiments.
+//! - `postings::raw` (feature `raw-segment`): byte- and file-backed raw segment reader experiments.
 //!
 //! ## Non-goals (for now)
 //!

@@ -1156,6 +1156,112 @@ impl RawSegmentFile {
         Ok(out)
     }
 
+    /// Return the top `k` documents by sparse inner product over raw `u32` weights.
+    ///
+    /// This matches [`RawSegment::top_k_weighted_u32`] while keeping fixed
+    /// directories in memory and range-reading only posting payloads needed by
+    /// the query.
+    pub fn top_k_weighted_u32(
+        &mut self,
+        query_terms: &[(RawTermId, f32)],
+        k: usize,
+    ) -> Result<Vec<(DocId, f32)>, RawSegmentFileError> {
+        if k == 0 || query_terms.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let query_terms = normalize_weighted_query_terms(query_terms);
+        if query_terms.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut lists = Vec::with_capacity(query_terms.len());
+        let mut total_postings = 0usize;
+        for (term_id, query_weight) in query_terms {
+            let Some((entry, block_directory)) = self.term_entry_with_blocks(term_id)? else {
+                continue;
+            };
+            if entry.df == 0 {
+                continue;
+            }
+            total_postings = total_postings.saturating_add(entry.df as usize);
+            lists.push((entry, block_directory, query_weight));
+        }
+        if lists.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        if lists.len() == 1 {
+            let (entry, block_directory, query_weight) = lists[0];
+            return self.top_k_single_raw_term(entry, block_directory, query_weight, k);
+        }
+
+        let dense_slots = usize::try_from(self.meta.max_doc_id)
+            .ok()
+            .and_then(|max_doc_id| max_doc_id.checked_add(1))
+            .unwrap_or(usize::MAX);
+        let dense_limit = crate::dense_scratch_limit(self.meta.doc_count as usize);
+        if dense_slots <= dense_limit {
+            let mut scores = vec![0.0; dense_slots];
+            let mut touched = Vec::with_capacity(total_postings.min(self.meta.doc_count as usize));
+            let contributions_are_nonnegative = lists
+                .iter()
+                .all(|(_, _, query_weight)| *query_weight >= 0.0 && query_weight.is_finite());
+
+            if contributions_are_nonnegative {
+                for (entry, _, query_weight) in lists {
+                    self.for_each_posting_in_entry(entry, |doc_id, doc_weight| {
+                        let contribution = query_weight * doc_weight as f32;
+                        if contribution == 0.0 {
+                            return;
+                        }
+                        let slot = doc_id as usize;
+                        if scores[slot] == 0.0 {
+                            touched.push(doc_id);
+                        }
+                        scores[slot] += contribution;
+                    })?;
+                }
+            } else {
+                let mut seen = vec![false; dense_slots];
+                for (entry, _, query_weight) in lists {
+                    self.for_each_posting_in_entry(entry, |doc_id, doc_weight| {
+                        let contribution = query_weight * doc_weight as f32;
+                        if contribution == 0.0 {
+                            return;
+                        }
+                        let slot = doc_id as usize;
+                        if !seen[slot] {
+                            seen[slot] = true;
+                            touched.push(doc_id);
+                        }
+                        scores[slot] += contribution;
+                    })?;
+                }
+            }
+
+            return Ok(crate::top_k_scored_docs(
+                touched
+                    .into_iter()
+                    .map(|doc_id| (doc_id, scores[doc_id as usize])),
+                k,
+            ));
+        }
+
+        let mut scores: HashMap<DocId, f32> =
+            HashMap::with_capacity(total_postings.min(self.meta.doc_count as usize));
+        for (entry, _, query_weight) in lists {
+            self.for_each_posting_in_entry(entry, |doc_id, doc_weight| {
+                let contribution = query_weight * doc_weight as f32;
+                if contribution != 0.0 {
+                    *scores.entry(doc_id).or_insert(0.0) += contribution;
+                }
+            })?;
+        }
+
+        Ok(crate::top_k_scored_docs(scores, k))
+    }
+
     fn term_entry(&self, term_id: RawTermId) -> Result<Option<TermEntry>, Error> {
         let Some(index) = self.term_entry_index(term_id)? else {
             return Ok(None);
@@ -1319,6 +1425,79 @@ impl RawSegmentFile {
     ) -> Result<Vec<u8>, RawSegmentFileError> {
         checked_range(offset, len, self.file_len, "postings")?;
         read_exact_at(&mut self.file, offset, len)
+    }
+
+    fn for_each_posting_in_entry(
+        &mut self,
+        entry: TermEntry,
+        mut visit: impl FnMut(DocId, u32),
+    ) -> Result<(), RawSegmentFileError> {
+        let bytes = self.read_postings_range(entry.postings_offset, entry.postings_len as u64)?;
+        let postings = RawPostings {
+            term_id: entry.term_id,
+            bytes: &bytes,
+            remaining: entry.df,
+            consumed: 0,
+            prev_doc_id: 0,
+            index: 0,
+            failed: false,
+        };
+        for posting in postings {
+            let (doc_id, weight) = posting?;
+            visit(doc_id, weight);
+        }
+        Ok(())
+    }
+
+    fn top_k_single_raw_term(
+        &mut self,
+        entry: TermEntry,
+        block_directory: TermBlockDirectory,
+        query_weight: f32,
+        k: usize,
+    ) -> Result<Vec<(DocId, f32)>, RawSegmentFileError> {
+        if query_weight == 0.0 || k == 0 {
+            return Ok(Vec::new());
+        }
+
+        self.validate_block_directory(block_directory)?;
+        let mut ranked = Vec::with_capacity(k);
+        let mut sorted = false;
+        let can_prune_blocks = query_weight > 0.0 && query_weight.is_finite();
+        for block_index in 0..block_directory.block_count {
+            let block = self.posting_block_at(entry, block_directory, block_index)?;
+            if can_prune_blocks && ranked.len() == k {
+                if !sorted {
+                    ranked.sort_by(crate::cmp_doc_scores);
+                    sorted = true;
+                }
+                let threshold = ranked.last().expect("top-k buffer is full").1;
+                if query_weight * (block.max_weight as f32) < threshold {
+                    continue;
+                }
+            }
+
+            let bytes =
+                self.read_postings_range(block.postings_offset, block.postings_len as u64)?;
+            for_each_posting_in_block(
+                entry.term_id,
+                &bytes,
+                block.base_doc_id,
+                block.last_doc_id,
+                |doc_id, doc_weight| {
+                    push_top_k_doc(
+                        &mut ranked,
+                        &mut sorted,
+                        (doc_id, query_weight * doc_weight as f32),
+                        k,
+                    );
+                },
+            )?;
+        }
+        if !sorted {
+            ranked.sort_by(crate::cmp_doc_scores);
+        }
+        Ok(ranked)
     }
 }
 
@@ -2093,6 +2272,7 @@ mod tests {
     use super::*;
     use crate::PostingsIndex;
     use proptest::prelude::*;
+    use std::io::Write;
 
     fn collect_postings(segment: &RawSegment<'_>, term_id: RawTermId) -> Vec<(DocId, u32)> {
         segment
@@ -2274,6 +2454,46 @@ mod tests {
             segment.posting_block_postings(10, 0).unwrap(),
             vec![(2, 1), (5, 4)]
         );
+    }
+
+    #[test]
+    fn raw_segment_file_top_k_weighted_matches_byte_backed() {
+        let weighted_terms: Vec<Vec<(RawTermId, u32)>> = (0..140u32)
+            .map(|doc_id| {
+                vec![
+                    (7, 1 + (doc_id % 11)),
+                    ((doc_id % 5) as RawTermId, 1 + (doc_id % 3)),
+                    (100 + (doc_id % 13) as RawTermId, 2),
+                ]
+            })
+            .collect();
+        let docs: Vec<_> = weighted_terms
+            .iter()
+            .enumerate()
+            .map(|(doc_id, terms)| RawDocument::new((doc_id as DocId) * 37, terms))
+            .collect();
+
+        let bytes = write_u64_u32_segment(&docs).unwrap();
+        let segment = RawSegment::open(&bytes).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raw.segment");
+        std::fs::write(&path, &bytes).unwrap();
+        let mut file_segment = RawSegmentFile::open(&path).unwrap();
+
+        for query in [
+            vec![(7, 1.25)],
+            vec![(7, -1.0)],
+            vec![(7, 1.0), (3, 2.0), (3, -0.5)],
+            vec![(999, 1.0)],
+        ] {
+            for k in [0usize, 1, 5, 32] {
+                assert_eq!(
+                    file_segment.top_k_weighted_u32(&query, k).unwrap(),
+                    segment.top_k_weighted_u32(&query, k).unwrap(),
+                    "query {query:?} k={k}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2578,6 +2798,14 @@ mod tests {
             prop_assert_eq!(
                 segment.top_k_weighted_u32(&raw_weighted_query, 5).unwrap(),
                 idx.top_k_weighted(&memory_weighted_query, 5)
+            );
+            let mut file = tempfile::tempfile().unwrap();
+            file.write_all(&bytes).unwrap();
+            file.flush().unwrap();
+            let mut file_segment = RawSegmentFile::from_file(file).unwrap();
+            prop_assert_eq!(
+                file_segment.top_k_weighted_u32(&raw_weighted_query, 5).unwrap(),
+                segment.top_k_weighted_u32(&raw_weighted_query, 5).unwrap()
             );
             for term_id in 0..12u64 {
                 prop_assert_eq!(segment.df(term_id).unwrap(), idx.df(&term_id));

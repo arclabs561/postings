@@ -84,7 +84,7 @@ Runnable examples live in [`examples/`](examples/):
 - `postings/sbits`: enable succinct monotone sequences (Elias–Fano) under `postings::codec::ef`.
 - `postings/positional`: enable positional postings (`postings::positional::PosingsIndex`).
 - `postings/cnk-compression`: enable optional compressed-candidate helpers under `postings::positional::cnk_candidates`.
-- `postings/raw-segment`: enable the experimental byte-backed raw segment reader.
+- `postings/raw-segment`: enable the experimental byte- and file-backed raw segment reader.
 
 ## Optional: positional postings
 
