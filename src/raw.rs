@@ -6,7 +6,7 @@
 
 use crate::codec::varint;
 use crate::{CandidatePlan, DocId, PlannerConfig};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 const MAGIC: &[u8; 8] = b"PSTRW001";
 const FOOTER_MAGIC: &[u8; 8] = b"PSTRF001";
@@ -555,6 +555,111 @@ impl<'a> RawSegment<'a> {
         ))
     }
 
+    /// Return the top `k` documents by sparse inner product over raw `u32` weights.
+    ///
+    /// Duplicate query terms are accumulated before scoring. Ties are broken by
+    /// ascending doc id, matching [`crate::PostingsIndex::top_k_weighted`].
+    pub fn top_k_weighted_u32(
+        &self,
+        query_terms: &[(RawTermId, f32)],
+        k: usize,
+    ) -> Result<Vec<(DocId, f32)>, Error> {
+        if k == 0 || query_terms.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let query_terms = normalize_weighted_query_terms(query_terms);
+        if query_terms.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut lists = Vec::with_capacity(query_terms.len());
+        let mut total_postings = 0usize;
+        for (term_id, query_weight) in query_terms {
+            let Some((entry, block_directory)) = self.term_entry_with_blocks(term_id)? else {
+                continue;
+            };
+            if entry.df == 0 {
+                continue;
+            }
+            total_postings = total_postings.saturating_add(entry.df as usize);
+            lists.push((entry, block_directory, query_weight));
+        }
+        if lists.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        if lists.len() == 1 {
+            let (entry, block_directory, query_weight) = lists[0];
+            return self.top_k_single_raw_term(entry, block_directory, query_weight, k);
+        }
+
+        let dense_slots = usize::try_from(self.meta.max_doc_id)
+            .ok()
+            .and_then(|max_doc_id| max_doc_id.checked_add(1))
+            .unwrap_or(usize::MAX);
+        let dense_limit = crate::dense_scratch_limit(self.meta.doc_count as usize);
+        if dense_slots <= dense_limit {
+            let mut scores = vec![0.0; dense_slots];
+            let mut touched = Vec::with_capacity(total_postings.min(self.meta.doc_count as usize));
+            let contributions_are_nonnegative = lists
+                .iter()
+                .all(|(_, _, query_weight)| *query_weight >= 0.0 && query_weight.is_finite());
+
+            if contributions_are_nonnegative {
+                for (entry, _, query_weight) in lists {
+                    self.for_each_posting_in_entry(entry, |doc_id, doc_weight| {
+                        let contribution = query_weight * doc_weight as f32;
+                        if contribution == 0.0 {
+                            return;
+                        }
+                        let slot = doc_id as usize;
+                        if scores[slot] == 0.0 {
+                            touched.push(doc_id);
+                        }
+                        scores[slot] += contribution;
+                    })?;
+                }
+            } else {
+                let mut seen = vec![false; dense_slots];
+                for (entry, _, query_weight) in lists {
+                    self.for_each_posting_in_entry(entry, |doc_id, doc_weight| {
+                        let contribution = query_weight * doc_weight as f32;
+                        if contribution == 0.0 {
+                            return;
+                        }
+                        let slot = doc_id as usize;
+                        if !seen[slot] {
+                            seen[slot] = true;
+                            touched.push(doc_id);
+                        }
+                        scores[slot] += contribution;
+                    })?;
+                }
+            }
+
+            return Ok(crate::top_k_scored_docs(
+                touched
+                    .into_iter()
+                    .map(|doc_id| (doc_id, scores[doc_id as usize])),
+                k,
+            ));
+        }
+
+        let mut scores: HashMap<DocId, f32> =
+            HashMap::with_capacity(total_postings.min(self.meta.doc_count as usize));
+        for (entry, _, query_weight) in lists {
+            self.for_each_posting_in_entry(entry, |doc_id, doc_weight| {
+                let contribution = query_weight * doc_weight as f32;
+                if contribution != 0.0 {
+                    *scores.entry(doc_id).or_insert(0.0) += contribution;
+                }
+            })?;
+        }
+
+        Ok(crate::top_k_scored_docs(scores, k))
+    }
+
     fn term_entry(&self, term_id: RawTermId) -> Result<Option<TermEntry>, Error> {
         let Some(index) = self.term_entry_index(term_id)? else {
             return Ok(None);
@@ -728,11 +833,228 @@ impl<'a> RawSegment<'a> {
 
     fn posting_doc_ids_into(&self, entry: TermEntry, docs: &mut Vec<DocId>) -> Result<(), Error> {
         docs.clear();
-        for posting in RawPostings::from_entry(self.bytes, entry)? {
-            let (doc_id, _) = posting?;
+        self.for_each_posting_in_entry(entry, |doc_id, _| {
             docs.push(doc_id);
+        })?;
+        Ok(())
+    }
+
+    fn for_each_posting_in_entry(
+        &self,
+        entry: TermEntry,
+        mut visit: impl FnMut(DocId, u32),
+    ) -> Result<(), Error> {
+        let range = checked_range(
+            entry.postings_offset,
+            entry.postings_len as u64,
+            self.bytes.len(),
+            "postings",
+        )?;
+        let bytes = &self.bytes[range];
+        let mut consumed = 0usize;
+        let mut prev_doc_id: DocId = 0;
+        for index in 0..entry.df {
+            let Some((gap, gap_len)) = varint::decode_u32(&bytes[consumed..]) else {
+                return Err(Error::InvalidVarint {
+                    term_id: entry.term_id,
+                    index,
+                });
+            };
+            consumed += gap_len;
+            let Some((weight, weight_len)) = varint::decode_u32(&bytes[consumed..]) else {
+                return Err(Error::InvalidVarint {
+                    term_id: entry.term_id,
+                    index,
+                });
+            };
+            consumed += weight_len;
+
+            let doc_id = if index == 0 {
+                gap
+            } else {
+                if gap == 0 {
+                    return Err(Error::NonIncreasingDocId {
+                        term_id: entry.term_id,
+                        index,
+                    });
+                }
+                prev_doc_id.checked_add(gap).ok_or(Error::DocIdOverflow {
+                    term_id: entry.term_id,
+                    index,
+                })?
+            };
+            if weight == 0 {
+                return Err(Error::ZeroWeight {
+                    doc_id,
+                    term_id: entry.term_id,
+                });
+            }
+
+            prev_doc_id = doc_id;
+            visit(doc_id, weight);
+        }
+        if consumed != bytes.len() {
+            return Err(Error::TrailingPostingsBytes {
+                term_id: entry.term_id,
+            });
         }
         Ok(())
+    }
+
+    fn top_k_single_raw_term(
+        &self,
+        entry: TermEntry,
+        block_directory: TermBlockDirectory,
+        query_weight: f32,
+        k: usize,
+    ) -> Result<Vec<(DocId, f32)>, Error> {
+        if query_weight == 0.0 || k == 0 {
+            return Ok(Vec::new());
+        }
+
+        self.validate_block_directory(block_directory)?;
+        let mut ranked = Vec::with_capacity(k);
+        let mut sorted = false;
+        let can_prune_blocks = query_weight > 0.0 && query_weight.is_finite();
+        for block_index in 0..block_directory.block_count {
+            let block = self.posting_block_at(entry, block_directory, block_index)?;
+            if can_prune_blocks && ranked.len() == k {
+                if !sorted {
+                    ranked.sort_by(crate::cmp_doc_scores);
+                    sorted = true;
+                }
+                let threshold = ranked.last().expect("top-k buffer is full").1;
+                if query_weight * (block.max_weight as f32) < threshold {
+                    continue;
+                }
+            }
+
+            let range = checked_range(
+                block.postings_offset,
+                block.postings_len as u64,
+                self.bytes.len(),
+                "postings",
+            )?;
+            for_each_posting_in_block(
+                entry.term_id,
+                &self.bytes[range],
+                block.base_doc_id,
+                block.last_doc_id,
+                |doc_id, doc_weight| {
+                    push_top_k_doc(
+                        &mut ranked,
+                        &mut sorted,
+                        (doc_id, query_weight * doc_weight as f32),
+                        k,
+                    );
+                },
+            )?;
+        }
+        if !sorted {
+            ranked.sort_by(crate::cmp_doc_scores);
+        }
+        Ok(ranked)
+    }
+}
+
+fn for_each_posting_in_block(
+    term_id: RawTermId,
+    bytes: &[u8],
+    base_doc_id: DocId,
+    last_doc_id: DocId,
+    mut visit: impl FnMut(DocId, u32),
+) -> Result<(), Error> {
+    let mut consumed = 0usize;
+    let mut prev_doc_id = base_doc_id;
+    let mut index = 0u32;
+    while consumed < bytes.len() {
+        let Some((gap, gap_len)) = varint::decode_u32(&bytes[consumed..]) else {
+            return Err(Error::InvalidVarint { term_id, index });
+        };
+        consumed += gap_len;
+        let Some((weight, weight_len)) = varint::decode_u32(&bytes[consumed..]) else {
+            return Err(Error::InvalidVarint { term_id, index });
+        };
+        consumed += weight_len;
+
+        if index == 0 && gap == 0 && base_doc_id != 0 {
+            return Err(Error::NonIncreasingDocId { term_id, index });
+        }
+        if index > 0 && gap == 0 {
+            return Err(Error::NonIncreasingDocId { term_id, index });
+        }
+        let doc_id = prev_doc_id
+            .checked_add(gap)
+            .ok_or(Error::DocIdOverflow { term_id, index })?;
+        if doc_id > last_doc_id {
+            return Err(Error::InvalidLayout {
+                reason: "block posting exceeds last doc",
+            });
+        }
+        if weight == 0 {
+            return Err(Error::ZeroWeight { doc_id, term_id });
+        }
+
+        prev_doc_id = doc_id;
+        index += 1;
+        visit(doc_id, weight);
+    }
+    if index == 0 || prev_doc_id != last_doc_id {
+        return Err(Error::InvalidLayout {
+            reason: "block last doc does not match decoded postings",
+        });
+    }
+    Ok(())
+}
+
+fn normalize_weighted_query_terms(query_terms: &[(RawTermId, f32)]) -> Vec<(RawTermId, f32)> {
+    let mut terms: Vec<_> = query_terms
+        .iter()
+        .copied()
+        .filter(|(_, weight)| *weight != 0.0)
+        .collect();
+    terms.sort_unstable_by_key(|(term_id, _)| *term_id);
+
+    let mut normalized = Vec::with_capacity(terms.len());
+    for (term_id, weight) in terms {
+        if let Some((last_term_id, last_weight)) = normalized.last_mut() {
+            if *last_term_id == term_id {
+                *last_weight += weight;
+                continue;
+            }
+        }
+        normalized.push((term_id, weight));
+    }
+    normalized.retain(|(_, weight)| *weight != 0.0);
+    normalized
+}
+
+fn push_top_k_doc(
+    ranked: &mut Vec<(DocId, f32)>,
+    sorted: &mut bool,
+    candidate: (DocId, f32),
+    k: usize,
+) {
+    if candidate.1 == 0.0 || k == 0 {
+        return;
+    }
+    if ranked.len() < k {
+        ranked.push(candidate);
+        *sorted = false;
+        return;
+    }
+    if !*sorted {
+        ranked.sort_by(crate::cmp_doc_scores);
+        *sorted = true;
+    }
+    if crate::cmp_doc_scores(&candidate, ranked.last().expect("top-k buffer is full")).is_lt() {
+        let last = ranked.len() - 1;
+        ranked[last] = candidate;
+        let mut i = last;
+        while i > 0 && crate::cmp_doc_scores(&ranked[i], &ranked[i - 1]).is_lt() {
+            ranked.swap(i, i - 1);
+            i -= 1;
+        }
     }
 }
 
@@ -1512,6 +1834,79 @@ mod tests {
     }
 
     #[test]
+    fn raw_top_k_weighted_scores_sparse_inner_product() {
+        let doc_a = vec![(10, 2), (20, 1)];
+        let doc_b = vec![(10, 1), (30, 5)];
+        let doc_c = vec![(20, 4), (30, 1)];
+        let docs = vec![
+            RawDocument::new(7, &doc_a),
+            RawDocument::new(1_000_000, &doc_b),
+            RawDocument::new(42, &doc_c),
+        ];
+
+        let bytes = write_u64_u32_segment(&docs).unwrap();
+        let segment = RawSegment::open(&bytes).unwrap();
+
+        assert_eq!(
+            segment
+                .top_k_weighted_u32(&[(10, 2.0), (20, 0.5), (30, 1.0)], 3)
+                .unwrap(),
+            vec![(1_000_000, 7.0), (7, 4.5), (42, 3.0)]
+        );
+    }
+
+    #[test]
+    fn raw_top_k_weighted_accumulates_duplicate_query_terms() {
+        let doc_a = vec![(10, 2)];
+        let doc_b = vec![(10, 1)];
+        let docs = vec![RawDocument::new(4, &doc_a), RawDocument::new(2, &doc_b)];
+
+        let bytes = write_u64_u32_segment(&docs).unwrap();
+        let segment = RawSegment::open(&bytes).unwrap();
+
+        assert_eq!(
+            segment
+                .top_k_weighted_u32(&[(10, 1.0), (10, 0.5)], 1)
+                .unwrap(),
+            vec![(4, 3.0)]
+        );
+        assert!(segment
+            .top_k_weighted_u32(&[(10, 1.0), (10, -1.0)], 10)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn raw_top_k_weighted_handles_cancellation_and_ties() {
+        let doc_a = vec![(10, 2), (20, 2)];
+        let doc_b = vec![(10, 2)];
+        let doc_c = vec![(10, 1), (30, 4)];
+        let docs = vec![
+            RawDocument::new(4, &doc_a),
+            RawDocument::new(2, &doc_b),
+            RawDocument::new(3, &doc_c),
+        ];
+
+        let bytes = write_u64_u32_segment(&docs).unwrap();
+        let segment = RawSegment::open(&bytes).unwrap();
+
+        assert_eq!(
+            segment
+                .top_k_weighted_u32(&[(10, 1.0), (20, -1.0), (30, 0.25)], 10)
+                .unwrap(),
+            vec![(2, 2.0), (3, 2.0)]
+        );
+        assert!(segment
+            .top_k_weighted_u32(&[(999, 1.0)], 10)
+            .unwrap()
+            .is_empty());
+        assert!(segment
+            .top_k_weighted_u32(&[(10, 1.0)], 0)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
     fn raw_segment_block_iterator_validates_block_last_doc() {
         let term = vec![(7, 1)];
         let docs: Vec<_> = (0..130u32)
@@ -1671,6 +2066,7 @@ mod tests {
                 0..24
             ),
             query in prop::collection::vec(0u8..12, 0..8),
+            weighted_query in prop::collection::vec((0u8..12, -3i8..4), 0..8),
             stride in prop::sample::select(vec![1u32, 37u32]),
         ) {
             let weighted_docs: Vec<Vec<(RawTermId, u32)>> = docs
@@ -1713,6 +2109,18 @@ mod tests {
             prop_assert_eq!(
                 segment.plan_candidates(&query_terms, PlannerConfig::default()).unwrap(),
                 idx.plan_candidates(&query_terms, PlannerConfig::default())
+            );
+            let raw_weighted_query: Vec<(RawTermId, f32)> = weighted_query
+                .iter()
+                .map(|&(term, weight)| (term as RawTermId, weight as f32))
+                .collect();
+            let memory_weighted_query: Vec<(&RawTermId, f32)> = raw_weighted_query
+                .iter()
+                .map(|(term, weight)| (term, *weight))
+                .collect();
+            prop_assert_eq!(
+                segment.top_k_weighted_u32(&raw_weighted_query, 5).unwrap(),
+                idx.top_k_weighted(&memory_weighted_query, 5)
             );
             for term_id in 0..12u64 {
                 prop_assert_eq!(segment.df(term_id).unwrap(), idx.df(&term_id));

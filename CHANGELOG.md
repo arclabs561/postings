@@ -24,6 +24,8 @@
   opaque byte span.
 - Added `RawSegment::posting_block_postings` for decoding one raw posting block
   without scanning the rest of the term's posting list.
+- Added `RawSegment::top_k_weighted_u32` for exact sparse inner-product scoring
+  directly from byte-backed numeric raw segments.
 - Added raw-segment benchmark coverage for disjunctive candidate generation
   and metadata-only candidate planning against the in-memory path.
 - Added `PostingsIndex::top_k_weighted` for sparse inner-product ranking over
@@ -36,6 +38,12 @@
 
 ### Changed
 
+- Sped up raw-segment posting consumers by decoding directly into hot-path
+  callers instead of routing every posting through an iterator `Result`. In
+  focused runs, `raw_segment/raw_top_k_weighted_5` moved from
+  `[774.40 us 776.69 us 779.21 us]` to
+  `[550.53 us 551.25 us 551.84 us]`, and
+  `raw_segment/raw_candidates_all_terms_5` improved by about 29%.
 - Refreshed cached float weight bounds when deleting a boundary weighted
   posting, so later positive queries can regain the dense non-negative scorer
   path. In the focused benchmark,

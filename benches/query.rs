@@ -460,6 +460,15 @@ fn bench_raw_segment_queries(c: &mut Criterion) {
     let (idx, bytes) = build_raw_numeric_fixture();
     let segment = RawSegment::open(&bytes).unwrap();
     let terms = numeric_query_terms(&idx, 5, 10);
+    let weighted_terms: Vec<(u64, f32)> = terms
+        .iter()
+        .enumerate()
+        .map(|(i, &term)| (term, 1.0 + (i as f32 * 0.1)))
+        .collect();
+    let memory_weighted_terms: Vec<(&u64, f32)> = weighted_terms
+        .iter()
+        .map(|(term, weight)| (term, *weight))
+        .collect();
     let common_term = terms[0];
     let mut group = c.benchmark_group("raw_segment");
 
@@ -534,6 +543,16 @@ fn bench_raw_segment_queries(c: &mut Criterion) {
         });
     });
 
+    group.bench_function("raw_top_k_weighted_5", |b| {
+        b.iter(|| {
+            black_box(
+                segment
+                    .top_k_weighted_u32(black_box(weighted_terms.as_slice()), black_box(10))
+                    .unwrap(),
+            );
+        });
+    });
+
     group.bench_function("in_memory_candidates_all_terms_5", |b| {
         b.iter(|| {
             black_box(idx.candidates_all_terms(black_box(terms.as_slice())));
@@ -543,6 +562,14 @@ fn bench_raw_segment_queries(c: &mut Criterion) {
     group.bench_function("in_memory_candidates_any_terms_5", |b| {
         b.iter(|| {
             black_box(idx.candidates(black_box(terms.as_slice())));
+        });
+    });
+
+    group.bench_function("in_memory_top_k_weighted_5", |b| {
+        b.iter(|| {
+            black_box(
+                idx.top_k_weighted(black_box(memory_weighted_terms.as_slice()), black_box(10)),
+            );
         });
     });
 
