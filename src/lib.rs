@@ -14,10 +14,11 @@
 //!
 //! - `postings::codec`: low-level codecs (varint/gap) for postings payloads (in this repo).
 //! - `postings::positional` (feature `positional`): positional postings for phrase/proximity evaluation.
+//! - `postings::raw` (feature `raw-segment`): byte-backed raw segment reader experiments.
 //!
 //! ## Non-goals (for now)
 //!
-//! - On-disk persistence / compaction
+//! - Full on-disk compaction
 //! - Rich query language beyond candidate generation and sparse top-k scoring
 
 #![forbid(unsafe_code)]
@@ -27,6 +28,9 @@ pub mod codec;
 
 #[cfg(feature = "positional")]
 pub mod positional;
+
+#[cfg(feature = "raw-segment")]
+pub mod raw;
 
 use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};

@@ -6,6 +6,8 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 #[cfg(feature = "positional")]
 use postings::positional::PosingsIndex;
+#[cfg(feature = "raw-segment")]
+use postings::raw::{write_u64_u32_segment, RawDocument, RawSegment};
 use postings::{CandidatePlan, PlannerConfig, PostingsIndex};
 
 // ---------------------------------------------------------------------------
@@ -92,6 +94,33 @@ fn build_sparse_doc_id_weighted_index() -> PostingsIndex<String, f32> {
             .unwrap();
     }
     idx
+}
+
+#[cfg(feature = "raw-segment")]
+fn build_raw_numeric_fixture() -> (PostingsIndex<u64>, Vec<u8>) {
+    let mut idx: PostingsIndex<u64> = PostingsIndex::new();
+    let mut weighted_docs: Vec<Vec<(u64, u32)>> = Vec::with_capacity(N_DOCS);
+    let mut rng: u64 = 0xdeadbeef_cafebabe;
+
+    for doc_id in 0..N_DOCS as u32 {
+        let mut expanded = Vec::with_capacity(TERMS_PER_DOC);
+        let mut counts = std::collections::BTreeMap::new();
+        for _ in 0..TERMS_PER_DOC {
+            let term_id = zipf_sample(&mut rng, VOCAB_SIZE, 1.0) as u64;
+            expanded.push(term_id);
+            *counts.entry(term_id).or_insert(0u32) += 1;
+        }
+        idx.add_document(doc_id, &expanded).unwrap();
+        weighted_docs.push(counts.into_iter().collect());
+    }
+
+    let raw_docs: Vec<_> = weighted_docs
+        .iter()
+        .enumerate()
+        .map(|(doc_id, terms)| RawDocument::new(doc_id as u32, terms))
+        .collect();
+    let bytes = write_u64_u32_segment(&raw_docs).unwrap();
+    (idx, bytes)
 }
 
 fn build_delete_index(n_docs: u32, common_terms: usize) -> PostingsIndex<String> {
@@ -182,6 +211,14 @@ fn weighted_query_terms_in_df_range(
         "benchmark fixture did not find {count} terms with df in [{min_df}, {max_df}]"
     );
     terms
+}
+
+#[cfg(feature = "raw-segment")]
+fn numeric_query_terms(idx: &PostingsIndex<u64>, count: usize, min_df: u32) -> Vec<u64> {
+    (0..VOCAB_SIZE as u64)
+        .filter(|term| idx.df(term) >= min_df)
+        .take(count)
+        .collect()
 }
 
 fn query_from_weighted_terms(terms: &[(String, f32)]) -> Vec<(&str, f32)> {
@@ -395,6 +432,63 @@ fn bench_delete(c: &mut Criterion) {
     group.finish();
 }
 
+#[cfg(feature = "raw-segment")]
+fn bench_raw_segment_queries(c: &mut Criterion) {
+    let (idx, bytes) = build_raw_numeric_fixture();
+    let segment = RawSegment::open(&bytes).unwrap();
+    let terms = numeric_query_terms(&idx, 5, 10);
+    let common_term = terms[0];
+    let mut group = c.benchmark_group("raw_segment");
+
+    group.bench_function("open", |b| {
+        b.iter(|| {
+            black_box(
+                RawSegment::open(black_box(bytes.as_slice()))
+                    .unwrap()
+                    .num_docs(),
+            );
+        });
+    });
+
+    group.bench_function("df_lookup", |b| {
+        b.iter(|| {
+            black_box(segment.df(black_box(common_term)).unwrap());
+        });
+    });
+
+    group.bench_function("postings_decode_common", |b| {
+        b.iter(|| {
+            let postings = segment
+                .postings(black_box(common_term))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            black_box(postings.len());
+        });
+    });
+
+    group.bench_function("raw_candidates_all_terms_5", |b| {
+        b.iter(|| {
+            black_box(
+                segment
+                    .candidates_all_terms(black_box(terms.as_slice()))
+                    .unwrap(),
+            );
+        });
+    });
+
+    group.bench_function("in_memory_candidates_all_terms_5", |b| {
+        b.iter(|| {
+            black_box(idx.candidates_all_terms(black_box(terms.as_slice())));
+        });
+    });
+
+    group.finish();
+}
+
+#[cfg(not(feature = "raw-segment"))]
+fn bench_raw_segment_queries(_c: &mut Criterion) {}
+
 #[cfg(feature = "positional")]
 fn bench_positional_queries(c: &mut Criterion) {
     let idx = build_positional_index();
@@ -461,6 +555,7 @@ criterion_group!(
     bench_weighted_top_k,
     bench_weighted_top_k_sparse_doc_ids,
     bench_delete,
+    bench_raw_segment_queries,
     bench_positional_queries
 );
 criterion_main!(benches);

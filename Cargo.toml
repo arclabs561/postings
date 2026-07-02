@@ -31,6 +31,7 @@ persistence = ["dep:durability", "dep:postcard", "serde"]
 sbits = ["dep:sbits"]
 positional = []
 cnk-compression = ["dep:cnk", "positional"]
+raw-segment = []
 
 [dev-dependencies]
 proptest = "1.9"

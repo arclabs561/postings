@@ -7,6 +7,12 @@
 - Added a raw-segment reader design for the first larger-than-memory postings
   path: numeric term ids, consumer-owned segment bytes, block metadata, and a
   filesystem-backed reader before mmap/object-store/GPU variants.
+- Added an experimental `raw-segment` feature with a byte-backed reader for
+  numeric `u64` terms and `u32` weights. The reader validates the segment
+  envelope, answers document metadata and document-frequency lookups from fixed
+  directories, and decodes only the posting lists needed by a query.
+- Added raw-segment benchmarks for open, document-frequency lookup, posting
+  decode, and conjunctive candidate queries against the in-memory path.
 - Added `PostingsIndex::top_k_weighted` for sparse inner-product ranking over
   weighted postings.
 - Added a property-test quality gate that checks `top_k_weighted` against a
