@@ -50,6 +50,11 @@
 
 ### Changed
 
+- Used a Unix positional-read path for file-backed raw posting-block payloads
+  while leaving full posting-list reads on the seek/read path. In the focused
+  cached-read benchmark, `file_postings_decode_common_block_0` measured
+  `[832.22 ns 837.60 ns 843.21 ns]`, and `file_top_k_weighted_5` measured
+  `[758.43 us 760.40 us 762.20 us]`.
 - Sped up raw-segment posting consumers by decoding directly into hot-path
   callers instead of routing every posting through an iterator `Result`. In
   focused runs, `raw_segment/raw_top_k_weighted_5` moved from

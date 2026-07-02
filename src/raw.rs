@@ -1144,7 +1144,8 @@ impl RawSegmentFile {
         };
         self.validate_block_directory(block_directory)?;
         let block = self.posting_block_at(entry, block_directory, block_index)?;
-        let bytes = self.read_postings_range(block.postings_offset, block.postings_len as u64)?;
+        let bytes =
+            self.read_posting_block_range(block.postings_offset, block.postings_len as u64)?;
         let mut out = Vec::new();
         for_each_posting_in_block(
             entry.term_id,
@@ -1561,6 +1562,15 @@ impl RawSegmentFile {
         read_exact_at(&mut self.file, offset, len)
     }
 
+    fn read_posting_block_range(
+        &mut self,
+        offset: u64,
+        len: u64,
+    ) -> Result<Vec<u8>, RawSegmentFileError> {
+        checked_range(offset, len, self.file_len, "postings")?;
+        read_exact_at_positional(&mut self.file, offset, len)
+    }
+
     fn posting_doc_ids(&mut self, entry: TermEntry) -> Result<Vec<DocId>, RawSegmentFileError> {
         let mut docs = Vec::with_capacity(entry.df as usize);
         self.posting_doc_ids_into(entry, &mut docs)?;
@@ -1630,7 +1640,7 @@ impl RawSegmentFile {
             }
 
             let bytes =
-                self.read_postings_range(block.postings_offset, block.postings_len as u64)?;
+                self.read_posting_block_range(block.postings_offset, block.postings_len as u64)?;
             for_each_posting_in_block(
                 entry.term_id,
                 &bytes,
@@ -1659,6 +1669,37 @@ fn read_exact_at(file: &mut File, offset: u64, len: u64) -> Result<Vec<u8>, RawS
     file.seek(SeekFrom::Start(offset))?;
     file.read_exact(&mut bytes)?;
     Ok(bytes)
+}
+
+fn read_exact_at_positional(
+    file: &mut File,
+    offset: u64,
+    len: u64,
+) -> Result<Vec<u8>, RawSegmentFileError> {
+    let len = usize::try_from(len).map_err(|_| Error::SegmentTooLarge)?;
+    let mut bytes = vec![0; len];
+    read_exact_at_positional_into(file, offset, &mut bytes)?;
+    Ok(bytes)
+}
+
+#[cfg(unix)]
+fn read_exact_at_positional_into(
+    file: &File,
+    offset: u64,
+    bytes: &mut [u8],
+) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.read_exact_at(bytes, offset)
+}
+
+#[cfg(not(unix))]
+fn read_exact_at_positional_into(
+    file: &mut File,
+    offset: u64,
+    bytes: &mut [u8],
+) -> std::io::Result<()> {
+    file.seek(SeekFrom::Start(offset))?;
+    file.read_exact(bytes)
 }
 
 fn for_each_posting_in_block(
