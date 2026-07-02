@@ -16,8 +16,10 @@
 - Added `RawSegment::candidates_any_terms` for disjunctive candidate generation
   over byte-backed numeric segments, with property coverage against
   `PostingsIndex::candidates`.
+- Added `RawSegment::plan_candidates`, which can return broad-query `ScanAll`
+  decisions from fixed term-directory metadata without decoding posting bytes.
 - Added raw-segment benchmark coverage for disjunctive candidate generation
-  against the in-memory path.
+  and metadata-only candidate planning against the in-memory path.
 - Added `PostingsIndex::top_k_weighted` for sparse inner-product ranking over
   weighted postings.
 - Added a property-test quality gate that checks `top_k_weighted` against a

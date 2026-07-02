@@ -5,7 +5,7 @@
 //! without reconstructing a full [`crate::PostingsIndex`].
 
 use crate::codec::varint;
-use crate::DocId;
+use crate::{CandidatePlan, DocId, PlannerConfig};
 use std::collections::BTreeMap;
 
 const MAGIC: &[u8; 8] = b"PSTRW001";
@@ -430,6 +430,41 @@ impl<'a> RawSegment<'a> {
             out = union_doc_id_lists(&out, &scratch);
         }
         Ok(out)
+    }
+
+    /// Plan disjunctive candidate generation, with bailout for broad queries.
+    ///
+    /// The selectivity estimate reads only fixed term-directory metadata. Posting
+    /// bytes are decoded only when the plan returns concrete candidates.
+    pub fn plan_candidates(
+        &self,
+        query_terms: &[RawTermId],
+        cfg: PlannerConfig,
+    ) -> Result<CandidatePlan, Error> {
+        if query_terms.is_empty() || self.meta.doc_count == 0 {
+            return Ok(CandidatePlan::Candidates(Vec::new()));
+        }
+
+        let mut terms = query_terms.to_vec();
+        terms.sort_unstable();
+        terms.dedup();
+
+        let mut df_sum = 0u64;
+        for term_id in terms {
+            df_sum = df_sum.saturating_add(self.df(term_id)? as u64);
+            if df_sum >= cfg.max_candidates as u64 {
+                return Ok(CandidatePlan::ScanAll);
+            }
+        }
+
+        let ratio = (df_sum as f32) / (self.meta.doc_count as f32);
+        if ratio > cfg.max_candidate_ratio {
+            return Ok(CandidatePlan::ScanAll);
+        }
+
+        Ok(CandidatePlan::Candidates(
+            self.candidates_any_terms(query_terms)?,
+        ))
     }
 
     fn term_entry(&self, term_id: RawTermId) -> Result<Option<TermEntry>, Error> {
@@ -1018,6 +1053,24 @@ mod tests {
         );
         assert_eq!(segment.candidates_any_terms(&[10, 10]).unwrap(), vec![2, 5]);
         assert!(segment.candidates_any_terms(&[999]).unwrap().is_empty());
+        assert_eq!(
+            segment
+                .plan_candidates(&[10, 20], PlannerConfig::default())
+                .unwrap(),
+            CandidatePlan::ScanAll
+        );
+        assert_eq!(
+            segment
+                .plan_candidates(
+                    &[10, 20],
+                    PlannerConfig {
+                        max_candidate_ratio: 2.0,
+                        max_candidates: 10,
+                    },
+                )
+                .unwrap(),
+            CandidatePlan::Candidates(vec![2, 5, 9])
+        );
         assert_eq!(segment.candidates_all_terms(&[10, 20]).unwrap(), vec![5]);
         assert_eq!(segment.candidates_all_terms(&[20]).unwrap(), vec![5, 9]);
         assert_eq!(segment.candidates_all_terms(&[10, 10]).unwrap(), vec![2, 5]);
@@ -1184,6 +1237,10 @@ mod tests {
             prop_assert_eq!(
                 segment.candidates_any_terms(&query_terms).unwrap(),
                 idx.candidates(&query_terms)
+            );
+            prop_assert_eq!(
+                segment.plan_candidates(&query_terms, PlannerConfig::default()).unwrap(),
+                idx.plan_candidates(&query_terms, PlannerConfig::default())
             );
             for term_id in 0..12u64 {
                 prop_assert_eq!(segment.df(term_id).unwrap(), idx.df(&term_id));

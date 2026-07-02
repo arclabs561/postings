@@ -479,6 +479,19 @@ fn bench_raw_segment_queries(c: &mut Criterion) {
         });
     });
 
+    group.bench_function("plan_candidates_5", |b| {
+        b.iter(|| {
+            black_box(
+                segment
+                    .plan_candidates(
+                        black_box(terms.as_slice()),
+                        black_box(PlannerConfig::default()),
+                    )
+                    .unwrap(),
+            );
+        });
+    });
+
     group.bench_function("postings_decode_common", |b| {
         b.iter(|| {
             let postings = segment
