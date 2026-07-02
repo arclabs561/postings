@@ -493,6 +493,16 @@ impl PosingsIndex {
         if terms.len() < 2 || window == 0 {
             return Vec::new();
         }
+        if let [a, b, c] = terms {
+            let terms = [a.as_str(), b.as_str(), c.as_str()];
+            if terms[0] != terms[1] && terms[0] != terms[2] && terms[1] != terms[2] {
+                return if ordered {
+                    self.near_match_three_unique::<true>(terms, window)
+                } else {
+                    self.near_match_three_unique::<false>(terms, window)
+                };
+            }
+        }
 
         // Multiplicity requirements for duplicates.
         let mut required: HashMap<&str, usize> = HashMap::new();
@@ -519,6 +529,103 @@ impl PosingsIndex {
         out.sort_unstable();
         out
     }
+
+    fn near_match_three_unique<const ORDERED: bool>(
+        &self,
+        terms: [&str; 3],
+        window: u32,
+    ) -> Vec<DocId> {
+        let mut anchor_i = 0usize;
+        let mut anchor_df = self.df(terms[0]);
+        for (i, term) in terms.iter().enumerate().skip(1) {
+            let df = self.df(term);
+            if df < anchor_df {
+                anchor_i = i;
+                anchor_df = df;
+            }
+        }
+
+        let Some(anchor_map) = self.postings.get(terms[anchor_i]) else {
+            return Vec::new();
+        };
+
+        let mut out = Vec::new();
+        for (&doc_id, anchor_positions) in anchor_map {
+            let positions = match anchor_i {
+                0 => [
+                    anchor_positions.as_slice(),
+                    self.positions(terms[1], doc_id),
+                    self.positions(terms[2], doc_id),
+                ],
+                1 => [
+                    self.positions(terms[0], doc_id),
+                    anchor_positions.as_slice(),
+                    self.positions(terms[2], doc_id),
+                ],
+                _ => [
+                    self.positions(terms[0], doc_id),
+                    self.positions(terms[1], doc_id),
+                    anchor_positions.as_slice(),
+                ],
+            };
+            if positions.iter().any(|ps| ps.is_empty()) {
+                continue;
+            }
+            let hit = if ORDERED {
+                near_positions_ordered_three(positions, window)
+            } else {
+                near_positions_unordered_three(positions, window)
+            };
+            if hit {
+                out.push(doc_id);
+            }
+        }
+        out.sort_unstable();
+        out
+    }
+}
+
+fn near_positions_unordered_three(positions: [&[TokenPos]; 3], window: u32) -> bool {
+    let [a, b, c] = positions;
+    let mut i = 0usize;
+    let mut j = 0usize;
+    let mut k = 0usize;
+    while i < a.len() && j < b.len() && k < c.len() {
+        let pa = a[i];
+        let pb = b[j];
+        let pc = c[k];
+        let min_pos = pa.min(pb).min(pc);
+        let max_pos = pa.max(pb).max(pc);
+        if max_pos - min_pos <= window {
+            return true;
+        }
+        if pa == min_pos {
+            i += 1;
+        } else if pb == min_pos {
+            j += 1;
+        } else {
+            k += 1;
+        }
+    }
+    false
+}
+
+fn near_positions_ordered_three(positions: [&[TokenPos]; 3], window: u32) -> bool {
+    let [a, b, c] = positions;
+    for &pa in a {
+        let b_i = b.partition_point(|&p| p <= pa);
+        let Some(&pb) = b.get(b_i) else {
+            return false;
+        };
+        let c_i = c.partition_point(|&p| p <= pb);
+        let Some(&pc) = c.get(c_i) else {
+            return false;
+        };
+        if pc.saturating_sub(pa) <= window {
+            return true;
+        }
+    }
+    false
 }
 
 fn near_doc_unordered(
@@ -528,7 +635,14 @@ fn near_doc_unordered(
     window: u32,
 ) -> bool {
     if let [(a, 1), (b, 1), (c, 1)] = required {
-        return near_doc_unordered_three(ix, doc_id, [*a, *b, *c], window);
+        return near_positions_unordered_three(
+            [
+                ix.positions(a, doc_id),
+                ix.positions(b, doc_id),
+                ix.positions(c, doc_id),
+            ],
+            window,
+        );
     }
 
     // Build occurrences (pos, term) for all required term strings.
@@ -567,42 +681,6 @@ fn near_doc_unordered(
             }
             have[term_l] -= 1;
             l += 1;
-        }
-    }
-    false
-}
-
-fn near_doc_unordered_three(
-    ix: &PosingsIndex,
-    doc_id: DocId,
-    terms: [&str; 3],
-    window: u32,
-) -> bool {
-    let a = ix.positions(terms[0], doc_id);
-    let b = ix.positions(terms[1], doc_id);
-    let c = ix.positions(terms[2], doc_id);
-    if a.is_empty() || b.is_empty() || c.is_empty() {
-        return false;
-    }
-
-    let mut i = 0usize;
-    let mut j = 0usize;
-    let mut k = 0usize;
-    while i < a.len() && j < b.len() && k < c.len() {
-        let pa = a[i];
-        let pb = b[j];
-        let pc = c[k];
-        let min_pos = pa.min(pb).min(pc);
-        let max_pos = pa.max(pb).max(pc);
-        if max_pos - min_pos <= window {
-            return true;
-        }
-        if pa == min_pos {
-            i += 1;
-        } else if pb == min_pos {
-            j += 1;
-        } else {
-            k += 1;
         }
     }
     false
@@ -716,6 +794,37 @@ mod tests {
         .unwrap();
 
         let hits = ix.near_match_terms(&["a".into(), "b".into(), "c".into()], 4, false);
+        assert_eq!(hits, vec![1]);
+    }
+
+    #[test]
+    fn near_match_terms_ordered_unique_three_terms() {
+        let mut ix = PosingsIndex::new();
+        ix.add_document(
+            1,
+            &["a".into(), "x".into(), "b".into(), "y".into(), "c".into()],
+        )
+        .unwrap();
+        ix.add_document(
+            2,
+            &["a".into(), "x".into(), "c".into(), "y".into(), "b".into()],
+        )
+        .unwrap();
+        ix.add_document(
+            3,
+            &[
+                "a".into(),
+                "x".into(),
+                "b".into(),
+                "y".into(),
+                "y".into(),
+                "y".into(),
+                "c".into(),
+            ],
+        )
+        .unwrap();
+
+        let hits = ix.near_match_terms(&["a".into(), "b".into(), "c".into()], 4, true);
         assert_eq!(hits, vec![1]);
     }
 

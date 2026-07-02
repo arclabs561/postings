@@ -14,6 +14,16 @@
 
 ### Changed
 
+- Sped up three-unique-term positional proximity queries by bypassing the
+  generic candidate-set materialization and checking positions directly from
+  the rarest term's postings map. Duplicate-term queries still use the generic
+  multiplicity-aware path. In focused runs,
+  `near_unordered_3_terms_window_16` moved from
+  `[719.80 us 723.63 us 728.76 us]` to
+  `[342.90 us 343.84 us 344.77 us]`, and
+  `near_ordered_3_terms_window_16` moved from
+  `[726.54 us 729.49 us 732.68 us]` to
+  `[331.20 us 332.07 us 333.01 us]`.
 - Sped up positional phrase and two-term proximity queries by reusing the
   already-visited anchor term positions instead of re-looking them up for every
   candidate document. In the positional benchmark, `phrase_3_terms` moved from
