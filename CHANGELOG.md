@@ -30,10 +30,14 @@
 - Added `RawSegmentFile::top_k_weighted_u32` for exact sparse inner-product
   scoring from a file-backed raw segment without loading full posting payloads
   at open time.
+- Added file-backed raw-segment candidate generation and planning with
+  `RawSegmentFile::candidates_all_terms`, `candidates_any_terms`, and
+  `plan_candidates`.
 - Added `RawSegment::top_k_weighted_u32` for exact sparse inner-product scoring
   directly from byte-backed numeric raw segments.
 - Added raw-segment benchmark coverage for file-backed open, posting-block
-  decode, posting-list decode, and exact top-k scoring.
+  decode, posting-list decode, candidate generation, planning, and exact top-k
+  scoring.
 - Added raw-segment benchmark coverage for disjunctive candidate generation
   and metadata-only candidate planning against the in-memory path.
 - Added `PostingsIndex::top_k_weighted` for sparse inner-product ranking over

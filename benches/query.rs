@@ -515,6 +515,19 @@ fn bench_raw_segment_queries(c: &mut Criterion) {
         });
     });
 
+    group.bench_function("file_plan_candidates_5", |b| {
+        b.iter(|| {
+            black_box(
+                file_segment
+                    .plan_candidates(
+                        black_box(terms.as_slice()),
+                        black_box(PlannerConfig::default()),
+                    )
+                    .unwrap(),
+            );
+        });
+    });
+
     group.bench_function("postings_decode_common", |b| {
         b.iter(|| {
             let postings = segment
@@ -567,6 +580,26 @@ fn bench_raw_segment_queries(c: &mut Criterion) {
         b.iter(|| {
             black_box(
                 segment
+                    .candidates_any_terms(black_box(terms.as_slice()))
+                    .unwrap(),
+            );
+        });
+    });
+
+    group.bench_function("file_candidates_all_terms_5", |b| {
+        b.iter(|| {
+            black_box(
+                file_segment
+                    .candidates_all_terms(black_box(terms.as_slice()))
+                    .unwrap(),
+            );
+        });
+    });
+
+    group.bench_function("file_candidates_any_terms_5", |b| {
+        b.iter(|| {
+            black_box(
+                file_segment
                     .candidates_any_terms(black_box(terms.as_slice()))
                     .unwrap(),
             );

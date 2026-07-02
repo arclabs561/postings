@@ -1156,6 +1156,140 @@ impl RawSegmentFile {
         Ok(out)
     }
 
+    /// Candidate documents that contain every term id.
+    pub fn candidates_all_terms(
+        &mut self,
+        query_terms: &[RawTermId],
+    ) -> Result<Vec<DocId>, RawSegmentFileError> {
+        if query_terms.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut terms = query_terms.to_vec();
+        terms.sort_unstable();
+        terms.dedup();
+        if terms.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut entries = Vec::with_capacity(terms.len());
+        for term_id in terms {
+            let Some(entry) = self.term_entry(term_id)? else {
+                return Ok(Vec::new());
+            };
+            if entry.df == 0 {
+                return Ok(Vec::new());
+            }
+            entries.push(entry);
+        }
+        entries.sort_by_key(|entry| entry.df);
+
+        let mut candidates = self.posting_doc_ids(entries[0])?;
+        let mut scratch = Vec::with_capacity(entries.last().map_or(0, |entry| entry.df as usize));
+        for entry in entries.into_iter().skip(1) {
+            self.posting_doc_ids_into(entry, &mut scratch)?;
+            intersect_doc_id_lists_in_place(&mut candidates, &scratch);
+            if candidates.is_empty() {
+                break;
+            }
+        }
+        Ok(candidates)
+    }
+
+    /// Candidate documents that contain at least one term id.
+    pub fn candidates_any_terms(
+        &mut self,
+        query_terms: &[RawTermId],
+    ) -> Result<Vec<DocId>, RawSegmentFileError> {
+        if query_terms.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut terms = query_terms.to_vec();
+        terms.sort_unstable();
+        terms.dedup();
+
+        let mut entries = Vec::with_capacity(terms.len());
+        for term_id in terms {
+            if let Some(entry) = self.term_entry(term_id)? {
+                if entry.df != 0 {
+                    entries.push(entry);
+                }
+            }
+        }
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+        if entries.len() == 1 {
+            return self.posting_doc_ids(entries[0]);
+        }
+
+        let dense_slots = usize::try_from(self.meta.max_doc_id)
+            .ok()
+            .and_then(|max_doc_id| max_doc_id.checked_add(1))
+            .unwrap_or(usize::MAX);
+        let dense_limit = crate::dense_scratch_limit(self.meta.doc_count as usize);
+        if dense_slots <= dense_limit {
+            let mut seen = vec![false; dense_slots];
+            for entry in entries {
+                self.for_each_posting_in_entry(entry, |doc_id, _| {
+                    seen[doc_id as usize] = true;
+                })?;
+            }
+            return Ok(seen
+                .into_iter()
+                .enumerate()
+                .filter_map(|(doc_id, hit)| hit.then_some(doc_id as DocId))
+                .collect());
+        }
+
+        entries.sort_by_key(|entry| entry.df);
+        let mut entries = entries.into_iter();
+        let mut out = self.posting_doc_ids(entries.next().expect("entries is not empty"))?;
+        let mut scratch = Vec::new();
+        for entry in entries {
+            self.posting_doc_ids_into(entry, &mut scratch)?;
+            out = union_doc_id_lists(&out, &scratch);
+        }
+        Ok(out)
+    }
+
+    /// Plan disjunctive candidate generation, with bailout for broad queries.
+    ///
+    /// The selectivity estimate reads only fixed term-directory metadata.
+    /// Posting payloads are range-read only when the plan returns concrete
+    /// candidates.
+    pub fn plan_candidates(
+        &mut self,
+        query_terms: &[RawTermId],
+        cfg: PlannerConfig,
+    ) -> Result<CandidatePlan, RawSegmentFileError> {
+        if query_terms.is_empty() || self.meta.doc_count == 0 {
+            return Ok(CandidatePlan::Candidates(Vec::new()));
+        }
+
+        let mut terms = query_terms.to_vec();
+        terms.sort_unstable();
+        terms.dedup();
+
+        let mut df_sum = 0u64;
+        for term_id in terms {
+            df_sum = df_sum.saturating_add(self.df(term_id)? as u64);
+            if df_sum >= cfg.max_candidates as u64 {
+                return Ok(CandidatePlan::ScanAll);
+            }
+        }
+
+        let ratio = (df_sum as f32) / (self.meta.doc_count as f32);
+        if ratio > cfg.max_candidate_ratio {
+            return Ok(CandidatePlan::ScanAll);
+        }
+
+        Ok(CandidatePlan::Candidates(
+            self.candidates_any_terms(query_terms)?,
+        ))
+    }
+
     /// Return the top `k` documents by sparse inner product over raw `u32` weights.
     ///
     /// This matches [`RawSegment::top_k_weighted_u32`] while keeping fixed
@@ -1425,6 +1559,24 @@ impl RawSegmentFile {
     ) -> Result<Vec<u8>, RawSegmentFileError> {
         checked_range(offset, len, self.file_len, "postings")?;
         read_exact_at(&mut self.file, offset, len)
+    }
+
+    fn posting_doc_ids(&mut self, entry: TermEntry) -> Result<Vec<DocId>, RawSegmentFileError> {
+        let mut docs = Vec::with_capacity(entry.df as usize);
+        self.posting_doc_ids_into(entry, &mut docs)?;
+        Ok(docs)
+    }
+
+    fn posting_doc_ids_into(
+        &mut self,
+        entry: TermEntry,
+        docs: &mut Vec<DocId>,
+    ) -> Result<(), RawSegmentFileError> {
+        docs.clear();
+        self.for_each_posting_in_entry(entry, |doc_id, _| {
+            docs.push(doc_id);
+        })?;
+        Ok(())
     }
 
     fn for_each_posting_in_entry(
@@ -2454,6 +2606,23 @@ mod tests {
             segment.posting_block_postings(10, 0).unwrap(),
             vec![(2, 1), (5, 4)]
         );
+        assert_eq!(segment.candidates_all_terms(&[10, 20]).unwrap(), vec![5]);
+        assert_eq!(
+            segment.candidates_any_terms(&[10, 20]).unwrap(),
+            vec![2, 5, 9]
+        );
+        assert_eq!(
+            segment
+                .plan_candidates(
+                    &[10, 20],
+                    PlannerConfig {
+                        max_candidate_ratio: 2.0,
+                        max_candidates: 10,
+                    },
+                )
+                .unwrap(),
+            CandidatePlan::Candidates(vec![2, 5, 9])
+        );
     }
 
     #[test]
@@ -2803,6 +2972,18 @@ mod tests {
             file.write_all(&bytes).unwrap();
             file.flush().unwrap();
             let mut file_segment = RawSegmentFile::from_file(file).unwrap();
+            prop_assert_eq!(
+                file_segment.candidates_all_terms(&query_terms).unwrap(),
+                segment.candidates_all_terms(&query_terms).unwrap()
+            );
+            prop_assert_eq!(
+                file_segment.candidates_any_terms(&query_terms).unwrap(),
+                segment.candidates_any_terms(&query_terms).unwrap()
+            );
+            prop_assert_eq!(
+                file_segment.plan_candidates(&query_terms, PlannerConfig::default()).unwrap(),
+                segment.plan_candidates(&query_terms, PlannerConfig::default()).unwrap()
+            );
             prop_assert_eq!(
                 file_segment.top_k_weighted_u32(&raw_weighted_query, 5).unwrap(),
                 segment.top_k_weighted_u32(&raw_weighted_query, 5).unwrap()
