@@ -365,9 +365,10 @@ impl<'a> RawSegment<'a> {
         entries.sort_by_key(|entry| entry.df);
 
         let mut candidates = self.posting_doc_ids(entries[0])?;
+        let mut scratch = Vec::with_capacity(entries.last().map_or(0, |entry| entry.df as usize));
         for entry in entries.into_iter().skip(1) {
-            let docs = self.posting_doc_ids(entry)?;
-            intersect_doc_id_lists_in_place(&mut candidates, &docs);
+            self.posting_doc_ids_into(entry, &mut scratch)?;
+            intersect_doc_id_lists_in_place(&mut candidates, &scratch);
             if candidates.is_empty() {
                 break;
             }
@@ -450,11 +451,17 @@ impl<'a> RawSegment<'a> {
 
     fn posting_doc_ids(&self, entry: TermEntry) -> Result<Vec<DocId>, Error> {
         let mut docs = Vec::with_capacity(entry.df as usize);
+        self.posting_doc_ids_into(entry, &mut docs)?;
+        Ok(docs)
+    }
+
+    fn posting_doc_ids_into(&self, entry: TermEntry, docs: &mut Vec<DocId>) -> Result<(), Error> {
+        docs.clear();
         for posting in RawPostings::from_entry(self.bytes, entry)? {
             let (doc_id, _) = posting?;
             docs.push(doc_id);
         }
-        Ok(docs)
+        Ok(())
     }
 }
 
@@ -977,6 +984,34 @@ mod tests {
             Error::ZeroWeight {
                 doc_id: 3,
                 term_id: 7
+            }
+        );
+    }
+
+    #[test]
+    fn raw_candidates_still_validate_current_intersection_list() {
+        let term_a = vec![(1, 1)];
+        let term_b = vec![(2, 1)];
+        let term_c = vec![(2, 1)];
+        let docs = vec![
+            RawDocument::new(1, &term_a),
+            RawDocument::new(2, &term_b),
+            RawDocument::new(100, &term_c),
+        ];
+        let mut bytes = write_u64_u32_segment(&docs).unwrap();
+        let segment = RawSegment::open(&bytes).unwrap();
+        let entry = segment.term_entry(2).unwrap().unwrap();
+        let offset = entry.postings_offset as usize;
+        bytes[offset + 3] = 0;
+
+        let segment = RawSegment::open(&bytes).unwrap();
+        let err = segment.candidates_all_terms(&[1, 2]).unwrap_err();
+
+        assert_eq!(
+            err,
+            Error::ZeroWeight {
+                doc_id: 100,
+                term_id: 2
             }
         );
     }

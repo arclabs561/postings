@@ -28,6 +28,10 @@
   query term. In the focused raw-segment benchmark,
   `raw_candidates_all_terms_5` moved from `[930.64 us 947.83 us 958.44 us]`
   to `[901.89 us 910.71 us 920.60 us]`.
+- Reduced raw-segment conjunctive query allocations by reusing a decoded doc-id
+  scratch buffer across non-anchor posting lists. The focused latency benchmark
+  stayed within noise, but multi-term queries no longer allocate a fresh
+  scratch vector for each intersected list.
 - Capped dense per-query scratch for candidate generation and weighted top-k.
   Dense accumulators are still used for small and medium dense indexes, but
   massive dense doc-id spaces now fall back to sparse accumulation instead of
@@ -187,6 +191,8 @@
 
 ### Fixed
 
+- Rejected overflowing five-byte `u32` varints instead of accepting payload bits
+  above `u32::MAX` in raw posting streams.
 - Removed stale postings on delete and kept global postings sorted for
   out-of-order document ids.
 - Omitted zero-score documents from multi-term `top_k_weighted` results after
