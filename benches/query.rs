@@ -503,6 +503,17 @@ fn bench_raw_segment_queries(c: &mut Criterion) {
         });
     });
 
+    group.bench_function("postings_decode_common_block_0", |b| {
+        b.iter(|| {
+            let postings = segment
+                .posting_block_postings(black_box(common_term), black_box(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            black_box(postings.len());
+        });
+    });
+
     group.bench_function("raw_candidates_all_terms_5", |b| {
         b.iter(|| {
             black_box(

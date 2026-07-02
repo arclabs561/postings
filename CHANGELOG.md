@@ -21,6 +21,8 @@
 - Added raw-segment posting-block metadata for each term, recording block base
   doc id, last doc id, and byte range so later readers can prune or range-read
   posting blocks instead of treating each posting list as one opaque byte span.
+- Added `RawSegment::posting_block_postings` for decoding one raw posting block
+  without scanning the rest of the term's posting list.
 - Added raw-segment benchmark coverage for disjunctive candidate generation
   and metadata-only candidate planning against the in-memory path.
 - Added `PostingsIndex::top_k_weighted` for sparse inner-product ranking over

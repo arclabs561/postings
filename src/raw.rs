@@ -391,6 +391,36 @@ impl<'a> RawSegment<'a> {
         Ok(blocks)
     }
 
+    /// Return a lazy posting iterator for one encoded block of a term id.
+    pub fn posting_block_postings(
+        &self,
+        term_id: RawTermId,
+        block_index: u32,
+    ) -> Result<RawPostingBlockPostings<'a>, Error> {
+        let Some((entry, block_directory)) = self.term_entry_with_blocks(term_id)? else {
+            return Ok(RawPostingBlockPostings::empty(term_id));
+        };
+        self.validate_block_directory(block_directory)?;
+        let block = self.posting_block_at(entry, block_directory, block_index)?;
+        let range = checked_range(
+            block.postings_offset,
+            block.postings_len as u64,
+            self.bytes.len(),
+            "postings",
+        )?;
+        Ok(RawPostingBlockPostings {
+            term_id,
+            bytes: &self.bytes[range],
+            consumed: 0,
+            base_doc_id: block.base_doc_id,
+            last_doc_id: block.last_doc_id,
+            prev_doc_id: block.base_doc_id,
+            index: 0,
+            done: false,
+            failed: false,
+        })
+    }
+
     /// Candidate documents that contain every term id.
     pub fn candidates_all_terms(&self, query_terms: &[RawTermId]) -> Result<Vec<DocId>, Error> {
         if query_terms.is_empty() {
@@ -824,6 +854,112 @@ impl Iterator for RawPostings<'_> {
     }
 }
 
+/// Lazy iterator over one raw posting block.
+#[derive(Debug, Clone)]
+pub struct RawPostingBlockPostings<'a> {
+    term_id: RawTermId,
+    bytes: &'a [u8],
+    consumed: usize,
+    base_doc_id: DocId,
+    last_doc_id: DocId,
+    prev_doc_id: DocId,
+    index: u32,
+    done: bool,
+    failed: bool,
+}
+
+impl<'a> RawPostingBlockPostings<'a> {
+    fn empty(term_id: RawTermId) -> Self {
+        Self {
+            term_id,
+            bytes: &[],
+            consumed: 0,
+            base_doc_id: 0,
+            last_doc_id: 0,
+            prev_doc_id: 0,
+            index: 0,
+            done: true,
+            failed: false,
+        }
+    }
+}
+
+impl Iterator for RawPostingBlockPostings<'_> {
+    type Item = Result<(DocId, u32), Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.failed || self.done {
+            return None;
+        }
+        if self.consumed == self.bytes.len() {
+            self.done = true;
+            if self.index == 0 || self.prev_doc_id != self.last_doc_id {
+                self.failed = true;
+                return Some(Err(Error::InvalidLayout {
+                    reason: "block last doc does not match decoded postings",
+                }));
+            }
+            return None;
+        }
+
+        let Some((gap, gap_len)) = varint::decode_u32(&self.bytes[self.consumed..]) else {
+            self.failed = true;
+            return Some(Err(Error::InvalidVarint {
+                term_id: self.term_id,
+                index: self.index,
+            }));
+        };
+        self.consumed += gap_len;
+        let Some((weight, weight_len)) = varint::decode_u32(&self.bytes[self.consumed..]) else {
+            self.failed = true;
+            return Some(Err(Error::InvalidVarint {
+                term_id: self.term_id,
+                index: self.index,
+            }));
+        };
+        self.consumed += weight_len;
+
+        if self.index == 0 && gap == 0 && self.base_doc_id != 0 {
+            self.failed = true;
+            return Some(Err(Error::NonIncreasingDocId {
+                term_id: self.term_id,
+                index: self.index,
+            }));
+        }
+        if self.index > 0 && gap == 0 {
+            self.failed = true;
+            return Some(Err(Error::NonIncreasingDocId {
+                term_id: self.term_id,
+                index: self.index,
+            }));
+        }
+        let Some(doc_id) = self.prev_doc_id.checked_add(gap) else {
+            self.failed = true;
+            return Some(Err(Error::DocIdOverflow {
+                term_id: self.term_id,
+                index: self.index,
+            }));
+        };
+        if doc_id > self.last_doc_id {
+            self.failed = true;
+            return Some(Err(Error::InvalidLayout {
+                reason: "block posting exceeds last doc",
+            }));
+        }
+        if weight == 0 {
+            self.failed = true;
+            return Some(Err(Error::ZeroWeight {
+                doc_id,
+                term_id: self.term_id,
+            }));
+        }
+
+        self.prev_doc_id = doc_id;
+        self.index += 1;
+        Some(Ok((doc_id, weight)))
+    }
+}
+
 /// Encode documents into the first raw `u64` term, `u32` weight segment format.
 pub fn write_u64_u32_segment(documents: &[RawDocument<'_>]) -> Result<Vec<u8>, Error> {
     let mut docs: BTreeMap<DocId, (u32, BTreeMap<RawTermId, u32>)> = BTreeMap::new();
@@ -1227,6 +1363,18 @@ mod tests {
             .unwrap()
     }
 
+    fn collect_block(
+        segment: &RawSegment<'_>,
+        term_id: RawTermId,
+        block_index: u32,
+    ) -> Vec<(DocId, u32)> {
+        segment
+            .posting_block_postings(term_id, block_index)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
     #[test]
     fn raw_segment_roundtrips_numeric_terms() {
         let doc_a = vec![(10, 1), (20, 2), (10, 3)];
@@ -1312,6 +1460,34 @@ mod tests {
         assert_eq!(blocks[1].base_doc_id(), 127);
         assert_eq!(blocks[1].last_doc_id(), 129);
         assert_eq!(collect_postings(&segment, 7).len(), 130);
+        let first_block = collect_block(&segment, 7, 0);
+        assert_eq!(first_block.len(), 128);
+        assert_eq!(first_block[0], (0, 1));
+        assert_eq!(first_block[127], (127, 1));
+        assert_eq!(collect_block(&segment, 7, 1), vec![(128, 1), (129, 1)]);
+        assert!(collect_block(&segment, 999, 0).is_empty());
+        assert!(segment.posting_block_postings(7, 2).is_err());
+    }
+
+    #[test]
+    fn raw_segment_block_iterator_validates_block_last_doc() {
+        let term = vec![(7, 1)];
+        let docs: Vec<_> = (0..130u32)
+            .map(|doc_id| RawDocument::new(doc_id, term.as_slice()))
+            .collect();
+
+        let mut bytes = write_u64_u32_segment(&docs).unwrap();
+        let segment = RawSegment::open(&bytes).unwrap();
+        let second_block = doc_meta_end(segment.meta()).unwrap() as usize + BLOCK_ENTRY_LEN;
+        bytes[second_block + 4..second_block + 8].copy_from_slice(&128u32.to_le_bytes());
+
+        let segment = RawSegment::open(&bytes).unwrap();
+        let err = segment
+            .posting_block_postings(7, 1)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidLayout { .. }));
     }
 
     #[test]
