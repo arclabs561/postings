@@ -13,6 +13,11 @@
   directories, and decodes only the posting lists needed by a query.
 - Added raw-segment benchmarks for open, document-frequency lookup, posting
   decode, and conjunctive candidate queries against the in-memory path.
+- Added `RawSegment::candidates_any_terms` for disjunctive candidate generation
+  over byte-backed numeric segments, with property coverage against
+  `PostingsIndex::candidates`.
+- Added raw-segment benchmark coverage for disjunctive candidate generation
+  against the in-memory path.
 - Added `PostingsIndex::top_k_weighted` for sparse inner-product ranking over
   weighted postings.
 - Added a property-test quality gate that checks `top_k_weighted` against a

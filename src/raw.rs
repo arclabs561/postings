@@ -376,6 +376,62 @@ impl<'a> RawSegment<'a> {
         Ok(candidates)
     }
 
+    /// Candidate documents that contain at least one term id.
+    pub fn candidates_any_terms(&self, query_terms: &[RawTermId]) -> Result<Vec<DocId>, Error> {
+        if query_terms.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut terms = query_terms.to_vec();
+        terms.sort_unstable();
+        terms.dedup();
+
+        let mut entries = Vec::with_capacity(terms.len());
+        for term_id in terms {
+            if let Some(entry) = self.term_entry(term_id)? {
+                if entry.df != 0 {
+                    entries.push(entry);
+                }
+            }
+        }
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+        if entries.len() == 1 {
+            return self.posting_doc_ids(entries[0]);
+        }
+
+        let dense_slots = usize::try_from(self.meta.max_doc_id)
+            .ok()
+            .and_then(|max_doc_id| max_doc_id.checked_add(1))
+            .unwrap_or(usize::MAX);
+        let dense_limit = crate::dense_scratch_limit(self.meta.doc_count as usize);
+        if dense_slots <= dense_limit {
+            let mut seen = vec![false; dense_slots];
+            for entry in entries {
+                for posting in RawPostings::from_entry(self.bytes, entry)? {
+                    let (doc_id, _) = posting?;
+                    seen[doc_id as usize] = true;
+                }
+            }
+            return Ok(seen
+                .into_iter()
+                .enumerate()
+                .filter_map(|(doc_id, hit)| hit.then_some(doc_id as DocId))
+                .collect());
+        }
+
+        entries.sort_by_key(|entry| entry.df);
+        let mut entries = entries.into_iter();
+        let mut out = self.posting_doc_ids(entries.next().expect("entries is not empty"))?;
+        let mut scratch = Vec::new();
+        for entry in entries {
+            self.posting_doc_ids_into(entry, &mut scratch)?;
+            out = union_doc_id_lists(&out, &scratch);
+        }
+        Ok(out)
+    }
+
     fn term_entry(&self, term_id: RawTermId) -> Result<Option<TermEntry>, Error> {
         let mut low = 0u32;
         let mut high = self.meta.term_count;
@@ -874,6 +930,46 @@ fn intersect_doc_id_lists_in_place(candidates: &mut Vec<DocId>, docs: &[DocId]) 
     candidates.truncate(write);
 }
 
+fn union_doc_id_lists(a: &[DocId], b: &[DocId]) -> Vec<DocId> {
+    let mut out = Vec::with_capacity(a.len().saturating_add(b.len()));
+    let mut i = 0usize;
+    let mut j = 0usize;
+
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Equal => {
+                push_unique_doc_id(&mut out, a[i]);
+                i += 1;
+                j += 1;
+            }
+            std::cmp::Ordering::Less => {
+                push_unique_doc_id(&mut out, a[i]);
+                i += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                push_unique_doc_id(&mut out, b[j]);
+                j += 1;
+            }
+        }
+    }
+    while i < a.len() {
+        push_unique_doc_id(&mut out, a[i]);
+        i += 1;
+    }
+    while j < b.len() {
+        push_unique_doc_id(&mut out, b[j]);
+        j += 1;
+    }
+    out
+}
+
+#[inline]
+fn push_unique_doc_id(out: &mut Vec<DocId>, doc_id: DocId) {
+    if out.last().copied() != Some(doc_id) {
+        out.push(doc_id);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -916,6 +1012,12 @@ mod tests {
         assert_eq!(collect_postings(&segment, 10), vec![(2, 1), (5, 4)]);
         assert_eq!(collect_postings(&segment, 20), vec![(5, 2), (9, 1)]);
         assert!(collect_postings(&segment, 999).is_empty());
+        assert_eq!(
+            segment.candidates_any_terms(&[10, 20]).unwrap(),
+            vec![2, 5, 9]
+        );
+        assert_eq!(segment.candidates_any_terms(&[10, 10]).unwrap(), vec![2, 5]);
+        assert!(segment.candidates_any_terms(&[999]).unwrap().is_empty());
         assert_eq!(segment.candidates_all_terms(&[10, 20]).unwrap(), vec![5]);
         assert_eq!(segment.candidates_all_terms(&[20]).unwrap(), vec![5, 9]);
         assert_eq!(segment.candidates_all_terms(&[10, 10]).unwrap(), vec![2, 5]);
@@ -1078,6 +1180,10 @@ mod tests {
             prop_assert_eq!(
                 segment.candidates_all_terms(&query_terms).unwrap(),
                 idx.candidates_all_terms(&query_terms)
+            );
+            prop_assert_eq!(
+                segment.candidates_any_terms(&query_terms).unwrap(),
+                idx.candidates(&query_terms)
             );
             for term_id in 0..12u64 {
                 prop_assert_eq!(segment.df(term_id).unwrap(), idx.df(&term_id));

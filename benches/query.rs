@@ -500,9 +500,25 @@ fn bench_raw_segment_queries(c: &mut Criterion) {
         });
     });
 
+    group.bench_function("raw_candidates_any_terms_5", |b| {
+        b.iter(|| {
+            black_box(
+                segment
+                    .candidates_any_terms(black_box(terms.as_slice()))
+                    .unwrap(),
+            );
+        });
+    });
+
     group.bench_function("in_memory_candidates_all_terms_5", |b| {
         b.iter(|| {
             black_box(idx.candidates_all_terms(black_box(terms.as_slice())));
+        });
+    });
+
+    group.bench_function("in_memory_candidates_any_terms_5", |b| {
+        b.iter(|| {
+            black_box(idx.candidates(black_box(terms.as_slice())));
         });
     });
 
