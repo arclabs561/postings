@@ -385,12 +385,24 @@ impl PosingsIndex {
         };
 
         let mut out = Vec::new();
-        'doc: for &doc_id in anchor_map.keys() {
-            let positions = [
-                self.positions(terms[0], doc_id),
-                self.positions(terms[1], doc_id),
-                self.positions(terms[2], doc_id),
-            ];
+        'doc: for (&doc_id, anchor_positions) in anchor_map {
+            let positions = match anchor_i {
+                0 => [
+                    anchor_positions.as_slice(),
+                    self.positions(terms[1], doc_id),
+                    self.positions(terms[2], doc_id),
+                ],
+                1 => [
+                    self.positions(terms[0], doc_id),
+                    anchor_positions.as_slice(),
+                    self.positions(terms[2], doc_id),
+                ],
+                _ => [
+                    self.positions(terms[0], doc_id),
+                    self.positions(terms[1], doc_id),
+                    anchor_positions.as_slice(),
+                ],
+            };
             if positions.iter().any(|ps| ps.is_empty()) {
                 continue;
             }
@@ -432,11 +444,17 @@ impl PosingsIndex {
         } else {
             (b, a)
         };
+        let Some(anchor_map) = self.postings.get(anchor) else {
+            return Vec::new();
+        };
         let mut out = Vec::new();
-        for doc_id in self.docs_with_term(anchor) {
-            let pa = self.positions(anchor, doc_id);
-            let pb = self.positions(other, doc_id);
-            if pa.is_empty() || pb.is_empty() {
+        for (&doc_id, pa) in anchor_map {
+            let pb = if anchor == other {
+                pa.as_slice()
+            } else {
+                self.positions(other, doc_id)
+            };
+            if pb.is_empty() {
                 continue;
             }
             // Two-pointer scan on sorted position lists.

@@ -14,6 +14,15 @@
 
 ### Changed
 
+- Sped up positional phrase and two-term proximity queries by reusing the
+  already-visited anchor term positions instead of re-looking them up for every
+  candidate document. In the positional benchmark, `phrase_3_terms` moved from
+  `[500.79 us 502.83 us 504.83 us]` to
+  `[337.84 us 338.87 us 339.92 us]`, `near_pair_window_4` moved from
+  `[339.59 us 341.14 us 342.66 us]` to
+  `[161.56 us 161.81 us 162.06 us]`, and
+  `near_pair_skewed_window_4` moved from `[85.515 us 85.774 us 86.030 us]` to
+  `[39.087 us 39.148 us 39.211 us]`.
 - Sped up deleting documents that appear in long common-term posting lists by
   removing the sorted posting entry with binary search instead of scanning the
   full list. In the delete benchmark, `delete/common_terms_20k` moved from
