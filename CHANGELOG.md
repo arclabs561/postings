@@ -14,6 +14,10 @@
 
 ### Changed
 
+- Capped dense per-query scratch for candidate generation and weighted top-k.
+  Dense accumulators are still used for small and medium dense indexes, but
+  massive dense doc-id spaces now fall back to sparse accumulation instead of
+  allocating scratch proportional to the corpus on every query.
 - Sped up three-unique-term positional proximity queries by bypassing the
   generic candidate-set materialization and checking positions directly from
   the rarest term's postings map. Duplicate-term queries still use the generic

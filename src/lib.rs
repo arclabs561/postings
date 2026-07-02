@@ -35,6 +35,20 @@ use std::hash::Hash;
 /// Document identifier.
 pub type DocId = u32;
 
+/// Upper bound on dense per-query scratch slots.
+///
+/// Dense accumulators are faster for small dense indexes, but tying scratch
+/// memory only to `max_doc_id` makes large dense corpora allocate tens or
+/// hundreds of MiB per query. Above this cap, use sparse accumulation instead.
+const MAX_DENSE_SCRATCH_SLOTS: usize = 4_000_000;
+
+#[inline]
+fn dense_scratch_limit(live_docs: usize) -> usize {
+    live_docs
+        .saturating_mul(4)
+        .clamp(1024, MAX_DENSE_SCRATCH_SLOTS)
+}
+
 /// Trait for term weight types in posting lists.
 ///
 /// `u32` is the default for classical term frequency counts.
@@ -535,7 +549,7 @@ where
                 })
                 .max()
                 .unwrap_or(0);
-            let dense_limit = self.doc_len.len().saturating_mul(4).max(1024);
+            let dense_limit = dense_scratch_limit(self.doc_len.len());
             if dense_slots <= dense_limit {
                 let mut seen = vec![false; dense_slots];
                 for postings in lists {
@@ -837,7 +851,7 @@ where
             })
             .max()
             .unwrap_or(0);
-        let dense_limit = self.doc_len.len().saturating_mul(4).max(1024);
+        let dense_limit = dense_scratch_limit(self.doc_len.len());
         if dense_slots <= dense_limit {
             let mut scores = vec![0.0; dense_slots];
             let mut touched = Vec::with_capacity(total_postings.min(self.doc_len.len()));
@@ -1220,6 +1234,13 @@ mod tests {
         assert_eq!(idx.df("quick"), 1);
         assert_eq!(idx.term_frequency(0, "quick"), 2);
         assert_eq!(idx.term_frequency(0, "missing"), 0);
+    }
+
+    #[test]
+    fn dense_scratch_limit_is_capped_for_large_corpora() {
+        assert_eq!(dense_scratch_limit(0), 1024);
+        assert_eq!(dense_scratch_limit(50_000), 200_000);
+        assert_eq!(dense_scratch_limit(2_000_000), MAX_DENSE_SCRATCH_SLOTS);
     }
 
     #[test]
