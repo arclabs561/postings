@@ -96,6 +96,17 @@ fn build_sparse_doc_id_weighted_index() -> PostingsIndex<String, f32> {
     idx
 }
 
+fn build_weighted_index_after_negative_delete() -> PostingsIndex<String, f32> {
+    let mut idx = build_weighted_index();
+    idx.add_weighted_document(
+        N_DOCS as u32,
+        &[(term_str(0), -1.0), (String::from("deleted"), 1.0)],
+    )
+    .unwrap();
+    assert!(idx.delete_document(N_DOCS as u32));
+    idx
+}
+
 #[cfg(feature = "raw-segment")]
 fn build_raw_numeric_fixture() -> (PostingsIndex<u64>, Vec<u8>) {
     let mut idx: PostingsIndex<u64> = PostingsIndex::new();
@@ -391,6 +402,18 @@ fn bench_weighted_top_k(c: &mut Criterion) {
         |b, query| {
             b.iter(|| {
                 black_box(idx.top_k_weighted(black_box(query.as_slice()), 10));
+            });
+        },
+    );
+
+    let deleted_negative_idx = build_weighted_index_after_negative_delete();
+    let deleted_negative_query = [("t00000", 1.0), ("t00001", 1.0)];
+    group.bench_with_input(
+        BenchmarkId::new("after_negative_delete", 2),
+        &deleted_negative_query.as_slice(),
+        |b, query| {
+            b.iter(|| {
+                black_box(deleted_negative_idx.top_k_weighted(black_box(query), 10));
             });
         },
     );

@@ -460,12 +460,34 @@ where
                     }
                 }
                 if let Some(postings) = self.global_postings.get_mut(term) {
-                    if let Ok(i) = postings.binary_search_by_key(&doc_id, |(id, _)| *id) {
-                        postings.remove(i);
-                    }
+                    let removed_weight =
+                        if let Ok(i) = postings.binary_search_by_key(&doc_id, |(id, _)| *id) {
+                            let removed_weight = postings[i].1.to_f32();
+                            postings.remove(i);
+                            Some(removed_weight)
+                        } else {
+                            None
+                        };
                     if postings.is_empty() {
                         self.global_postings.remove(term);
                         self.term_weight_bounds.remove(term);
+                    } else if !W::ALWAYS_NONNEGATIVE {
+                        if let Some(removed_weight) = removed_weight {
+                            let recompute_bounds = match self.term_weight_bounds.get(term).copied()
+                            {
+                                Some(bounds) => {
+                                    !removed_weight.is_finite()
+                                        || removed_weight <= bounds.min
+                                        || removed_weight >= bounds.max
+                                }
+                                None => true,
+                            };
+                            if recompute_bounds {
+                                if let Some(bounds) = WeightBounds::from_postings(postings) {
+                                    self.term_weight_bounds.insert(term.clone(), bounds);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1725,6 +1747,25 @@ mod tests {
         let ranked = idx.top_k_weighted(&[("term", 1.0)], 10);
 
         assert_eq!(ranked, vec![(1, 1.0)]);
+    }
+
+    #[test]
+    fn delete_refreshes_float_weight_bounds() {
+        let mut idx: PostingsIndex<String, f32> = PostingsIndex::new();
+        idx.add_weighted_document(
+            0,
+            &[(String::from("term"), -1.0), (String::from("other"), 1.0)],
+        )
+        .unwrap();
+        idx.add_weighted_document(1, &[(String::from("term"), 2.0)])
+            .unwrap();
+
+        let postings = idx.global_postings.get("term").unwrap();
+        assert!(!idx.contributions_are_nonnegative("term", postings, 1.0));
+
+        assert!(idx.delete_document(0));
+        let postings = idx.global_postings.get("term").unwrap();
+        assert!(idx.contributions_are_nonnegative("term", postings, 1.0));
     }
 
     #[test]

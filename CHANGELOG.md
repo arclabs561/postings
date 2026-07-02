@@ -23,6 +23,12 @@
 
 ### Changed
 
+- Refreshed cached float weight bounds when deleting a boundary weighted
+  posting, so later positive queries can regain the dense non-negative scorer
+  path. In the focused benchmark,
+  `weighted_top_k/after_negative_delete/2` moved from
+  `[208.00 us 208.50 us 208.95 us]` to
+  `[166.84 us 167.39 us 167.97 us]`.
 - Sped up raw-segment conjunctive candidate queries by intersecting decoded doc
   id lists in place instead of allocating a fresh candidate vector for each
   query term. In the focused raw-segment benchmark,
