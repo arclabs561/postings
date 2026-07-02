@@ -2,7 +2,7 @@
 
 use durability::checkpoint::CheckpointFile;
 use durability::recordlog::{RecordLogReadMode, RecordLogReader, RecordLogWriter};
-use durability::storage::MemoryDirectory;
+use durability::storage::{Directory, MemoryDirectory};
 use postings::{DocId, PostingsIndex};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -153,4 +153,74 @@ fn recovered_candidates_have_no_false_negatives() {
             );
         }
     }
+}
+
+#[cfg(feature = "persistence")]
+#[test]
+fn save_load_preserves_weighted_queries_and_deletes() {
+    let dir = MemoryDirectory::new();
+    let mut idx: PostingsIndex<String, f32> = PostingsIndex::new();
+    idx.add_weighted_document(
+        1,
+        &[(String::from("neural"), 1.5), (String::from("search"), 2.0)],
+    )
+    .unwrap();
+    idx.add_weighted_document(
+        2,
+        &[(String::from("neural"), 10.0), (String::from("stale"), 1.0)],
+    )
+    .unwrap();
+    idx.add_weighted_document(
+        3,
+        &[
+            (String::from("search"), 3.0),
+            (String::from("retrieval"), 4.0),
+        ],
+    )
+    .unwrap();
+    assert!(idx.delete_document(2));
+
+    idx.save(&dir, "weighted.bin").unwrap();
+    let loaded = PostingsIndex::<String, f32>::load(&dir, "weighted.bin").unwrap();
+
+    assert_eq!(loaded.num_docs(), 2);
+    assert_eq!(loaded.df("neural"), 1);
+    assert_eq!(loaded.df("stale"), 0);
+    assert_eq!(loaded.term_frequency(2, "neural"), 0.0);
+    assert_eq!(
+        loaded.top_k_weighted(&[("neural", 2.0), ("search", 1.0)], 10),
+        vec![(1, 5.0), (3, 3.0)]
+    );
+}
+
+#[cfg(feature = "persistence")]
+#[test]
+fn save_durable_roundtrips_on_filesystem() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = durability::storage::FsDirectory::new(tmp.path()).unwrap();
+    let mut idx: PostingsIndex<String> = PostingsIndex::new();
+    idx.add_document(4, &[String::from("alpha"), String::from("beta")])
+        .unwrap();
+    idx.add_document(1, &[String::from("beta"), String::from("gamma")])
+        .unwrap();
+
+    idx.save_durable(&dir, "index.bin").unwrap();
+    let loaded = PostingsIndex::<String>::load(&dir, "index.bin").unwrap();
+
+    assert_eq!(loaded.candidates(&[String::from("beta")]), vec![1, 4]);
+    assert_eq!(
+        loaded.candidates_all_terms(&[String::from("beta")]),
+        vec![1, 4]
+    );
+    assert_eq!(loaded.term_frequency(4, "alpha"), 1);
+}
+
+#[cfg(feature = "persistence")]
+#[test]
+fn load_rejects_corrupt_saved_index() {
+    let dir = MemoryDirectory::new();
+    dir.atomic_write("index.bin", b"not-a-postcard-index")
+        .unwrap();
+
+    assert!(PostingsIndex::<String>::load(&dir, "index.bin").is_err());
 }
