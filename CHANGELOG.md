@@ -24,6 +24,9 @@
   opaque byte span.
 - Added `RawSegment::posting_block_postings` for decoding one raw posting block
   without scanning the rest of the term's posting list.
+- Added `RawSegmentFile`, a file-backed raw-segment reader that keeps fixed
+  directories in memory and range-reads requested posting lists or posting
+  blocks from the segment file.
 - Added `RawSegment::top_k_weighted_u32` for exact sparse inner-product scoring
   directly from byte-backed numeric raw segments.
 - Added raw-segment benchmark coverage for disjunctive candidate generation
