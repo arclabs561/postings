@@ -19,8 +19,9 @@
 - Added `RawSegment::plan_candidates`, which can return broad-query `ScanAll`
   decisions from fixed term-directory metadata without decoding posting bytes.
 - Added raw-segment posting-block metadata for each term, recording block base
-  doc id, last doc id, and byte range so later readers can prune or range-read
-  posting blocks instead of treating each posting list as one opaque byte span.
+  doc id, last doc id, byte range, and max term weight so later readers can
+  prune or range-read posting blocks instead of treating each posting list as one
+  opaque byte span.
 - Added `RawSegment::posting_block_postings` for decoding one raw posting block
   without scanning the rest of the term's posting list.
 - Added raw-segment benchmark coverage for disjunctive candidate generation

@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 
 const MAGIC: &[u8; 8] = b"PSTRW001";
 const FOOTER_MAGIC: &[u8; 8] = b"PSTRF001";
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 const HEADER_LEN: usize = 72;
 const TERM_ENTRY_LEN: usize = 48;
 const DOC_ENTRY_LEN: usize = 8;
@@ -223,6 +223,7 @@ pub struct RawPostingBlockMeta {
     last_doc_id: DocId,
     postings_offset: u64,
     postings_len: u32,
+    max_weight: u32,
 }
 
 impl RawPostingBlockMeta {
@@ -244,6 +245,11 @@ impl RawPostingBlockMeta {
     /// Byte length of this block's encoded postings payload.
     pub fn postings_len(self) -> u32 {
         self.postings_len
+    }
+
+    /// Maximum term weight encoded in this block.
+    pub fn max_weight(self) -> u32 {
+        self.max_weight
     }
 }
 
@@ -659,6 +665,7 @@ impl<'a> RawSegment<'a> {
             last_doc_id: read_u32_at(self.bytes, offset + 4, "block directory")?,
             postings_offset: read_u64_at(self.bytes, offset + 8, "block directory")?,
             postings_len: read_u32_at(self.bytes, offset + 16, "block directory")?,
+            max_weight: read_u32_at(self.bytes, offset + 20, "block directory")?,
         };
         let postings_end = block
             .postings_offset
@@ -1052,6 +1059,7 @@ pub fn write_u64_u32_segment(documents: &[RawDocument<'_>]) -> Result<Vec<u8>, E
         for chunk in list.chunks(DEFAULT_BLOCK_SIZE as usize) {
             let block_base_doc_id = prev_doc_id;
             let block_start_len = postings_bytes.len();
+            let mut block_max_weight = 0u32;
             for &(doc_id, weight) in chunk {
                 let gap = if first_posting {
                     first_posting = false;
@@ -1063,6 +1071,7 @@ pub fn write_u64_u32_segment(documents: &[RawDocument<'_>]) -> Result<Vec<u8>, E
                 varint::encode_u32(weight, &mut postings_bytes);
                 prev_doc_id = doc_id;
                 max_weight = max_weight.max(weight);
+                block_max_weight = block_max_weight.max(weight);
                 total_weight = total_weight.saturating_add(weight as u64);
             }
             block_entries.push(RawPostingBlockMeta {
@@ -1075,6 +1084,7 @@ pub fn write_u64_u32_segment(documents: &[RawDocument<'_>]) -> Result<Vec<u8>, E
                     .ok_or(Error::SegmentTooLarge)?,
                 postings_len: u32::try_from(postings_bytes.len() - block_start_len)
                     .map_err(|_| Error::SegmentTooLarge)?,
+                max_weight: block_max_weight,
             });
         }
         let postings_len =
@@ -1136,7 +1146,7 @@ pub fn write_u64_u32_segment(documents: &[RawDocument<'_>]) -> Result<Vec<u8>, E
         put_u32(&mut out, block.last_doc_id);
         put_u64(&mut out, block.postings_offset);
         put_u32(&mut out, block.postings_len);
-        put_u32(&mut out, 0);
+        put_u32(&mut out, block.max_weight);
     }
     out.extend_from_slice(&postings_bytes);
     out.extend_from_slice(FOOTER_MAGIC);
@@ -1409,6 +1419,7 @@ mod tests {
                 last_doc_id: 5,
                 postings_offset: segment.term_entry(10).unwrap().unwrap().postings_offset,
                 postings_len: segment.term_entry(10).unwrap().unwrap().postings_len,
+                max_weight: 4,
             }]
         );
         assert!(collect_postings(&segment, 999).is_empty());
@@ -1457,8 +1468,10 @@ mod tests {
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[0].base_doc_id(), 0);
         assert_eq!(blocks[0].last_doc_id(), 127);
+        assert_eq!(blocks[0].max_weight(), 1);
         assert_eq!(blocks[1].base_doc_id(), 127);
         assert_eq!(blocks[1].last_doc_id(), 129);
+        assert_eq!(blocks[1].max_weight(), 1);
         assert_eq!(collect_postings(&segment, 7).len(), 130);
         let first_block = collect_block(&segment, 7, 0);
         assert_eq!(first_block.len(), 128);
@@ -1467,6 +1480,35 @@ mod tests {
         assert_eq!(collect_block(&segment, 7, 1), vec![(128, 1), (129, 1)]);
         assert!(collect_block(&segment, 999, 0).is_empty());
         assert!(segment.posting_block_postings(7, 2).is_err());
+    }
+
+    #[test]
+    fn raw_segment_records_block_max_weights() {
+        let weighted_terms: Vec<_> = (0..130u32)
+            .map(|doc_id| {
+                let weight = if doc_id == 12 {
+                    9
+                } else if doc_id == 129 {
+                    17
+                } else {
+                    1
+                };
+                vec![(7, weight)]
+            })
+            .collect();
+        let docs: Vec<_> = weighted_terms
+            .iter()
+            .enumerate()
+            .map(|(doc_id, terms)| RawDocument::new(doc_id as DocId, terms))
+            .collect();
+
+        let bytes = write_u64_u32_segment(&docs).unwrap();
+        let segment = RawSegment::open(&bytes).unwrap();
+        let blocks = segment.posting_blocks(7).unwrap();
+
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].max_weight(), 9);
+        assert_eq!(blocks[1].max_weight(), 17);
     }
 
     #[test]
