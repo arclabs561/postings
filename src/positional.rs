@@ -314,7 +314,9 @@ impl PosingsIndex {
         }
         if phrase.len() == 1 {
             let t0 = &phrase[0];
-            return self.docs_with_term(t0).collect();
+            let mut docs: Vec<DocId> = self.docs_with_term(t0).collect();
+            docs.sort_unstable();
+            return docs;
         }
         if let [a, b, c] = phrase {
             let terms = [a.as_str(), b.as_str(), c.as_str()];
@@ -438,6 +440,22 @@ impl PosingsIndex {
         if window == 0 {
             // window=0 means the same position, which can't happen for two distinct terms.
             return Vec::new();
+        }
+        if a == b {
+            let Some(docs) = self.postings.get(a) else {
+                return Vec::new();
+            };
+            let mut out = Vec::new();
+            for (&doc_id, positions) in docs {
+                if positions
+                    .windows(2)
+                    .any(|pair| pair[1].saturating_sub(pair[0]) <= window)
+                {
+                    out.push(doc_id);
+                }
+            }
+            out.sort_unstable();
+            return out;
         }
         let (anchor, other) = if self.df(a) <= self.df(b) {
             (a, b)
@@ -749,6 +767,16 @@ mod tests {
     }
 
     #[test]
+    fn phrase_match_single_term_is_sorted() {
+        let mut ix = PosingsIndex::new();
+        ix.add_document(2, &["a".into()]).unwrap();
+        ix.add_document(1, &["a".into()]).unwrap();
+
+        let hits = ix.phrase_match(&["a".into()]);
+        assert_eq!(hits, vec![1, 2]);
+    }
+
+    #[test]
     fn near_match_finds_within_window_unordered() {
         let mut ix = PosingsIndex::new();
         ix.add_document(1, &["new".into(), "york".into(), "city".into()])
@@ -777,6 +805,19 @@ mod tests {
 
         assert_eq!(ix.near_match("common", "rare", 2), vec![1, 3]);
         assert_eq!(ix.near_match("rare", "common", 2), vec![1, 3]);
+    }
+
+    #[test]
+    fn near_match_same_term_requires_distinct_positions() {
+        let mut ix = PosingsIndex::new();
+        ix.add_document(1, &["a".into()]).unwrap();
+        ix.add_document(2, &["a".into(), "x".into(), "a".into()])
+            .unwrap();
+        ix.add_document(3, &["a".into(), "x".into(), "x".into(), "a".into()])
+            .unwrap();
+
+        assert_eq!(ix.near_match("a", "a", 2), vec![2]);
+        assert_eq!(ix.near_match("a", "a", 3), vec![2, 3]);
     }
 
     #[test]

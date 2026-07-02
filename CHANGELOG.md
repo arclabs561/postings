@@ -177,6 +177,11 @@
   out-of-order document ids.
 - Omitted zero-score documents from multi-term `top_k_weighted` results after
   exact score cancellation, matching the single-term path.
+- Fixed same-term positional proximity so `near_match(term, term, window)`
+  requires two distinct token positions instead of matching a single occurrence
+  against itself.
+- Made single-term phrase results deterministic by sorting doc ids before
+  returning.
 
 ## [0.1.8] - 2026-06-10
 
