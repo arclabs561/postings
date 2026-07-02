@@ -990,6 +990,9 @@ where
     let mut ranked: Vec<(DocId, f32)> = Vec::with_capacity(k);
     let mut sorted = false;
     for doc in docs {
+        if doc.1 == 0.0 {
+            continue;
+        }
         if ranked.len() < k {
             ranked.push(doc);
             continue;
@@ -1610,6 +1613,26 @@ mod tests {
         assert_eq!(ranked, vec![(1_000_000, 4.0), (7, 2.0)]);
     }
 
+    #[test]
+    fn top_k_weighted_omits_zero_scores_after_cancellation() {
+        let mut idx: PostingsIndex<String, f32> = PostingsIndex::new();
+        idx.add_weighted_document(
+            0,
+            &[
+                (String::from("positive"), 1.0),
+                (String::from("negative"), 1.0),
+            ],
+        )
+        .unwrap();
+        idx.add_weighted_document(1, &[(String::from("late"), 1.0)])
+            .unwrap();
+
+        let ranked =
+            idx.top_k_weighted(&[("positive", 1.0), ("negative", -1.0), ("late", 1.0)], 10);
+
+        assert_eq!(ranked, vec![(1, 1.0)]);
+    }
+
     fn exact_sparse_top_k(
         docs: &[(DocId, std::collections::HashMap<u8, f32>)],
         query_terms: &[(u8, f32)],
@@ -1656,6 +1679,10 @@ mod tests {
         (raw as f32) * 0.25
     }
 
+    fn signed_quarter_weight(raw: i8) -> f32 {
+        (raw as f32) * 0.25
+    }
+
     proptest! {
         #[test]
         fn top_k_weighted_matches_exact_sparse_dot_product(
@@ -1663,7 +1690,7 @@ mod tests {
                 prop::collection::vec((0u8..20, 0u8..8), 0..16),
                 0..40
             ),
-            query in prop::collection::vec((0u8..20, 0u8..8), 0..12),
+            query in prop::collection::vec((0u8..20, -8i8..8i8), 0..12),
             k in 0usize..12,
             stride in prop::sample::select(vec![1u32, 97u32]),
         ) {
@@ -1687,7 +1714,7 @@ mod tests {
 
             let query_owned: Vec<(String, f32)> = query
                 .iter()
-                .map(|&(term, weight)| (format!("t{term:02}"), quarter_weight(weight)))
+                .map(|&(term, weight)| (format!("t{term:02}"), signed_quarter_weight(weight)))
                 .collect();
             let query_refs: Vec<(&str, f32)> = query_owned
                 .iter()
@@ -1695,7 +1722,7 @@ mod tests {
                 .collect();
             let oracle_query: Vec<(u8, f32)> = query
                 .iter()
-                .map(|&(term, weight)| (term, quarter_weight(weight)))
+                .map(|&(term, weight)| (term, signed_quarter_weight(weight)))
                 .collect();
 
             let ranked = idx.top_k_weighted(&query_refs, k);

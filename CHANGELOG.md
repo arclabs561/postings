@@ -133,6 +133,8 @@
 
 - Removed stale postings on delete and kept global postings sorted for
   out-of-order document ids.
+- Omitted zero-score documents from multi-term `top_k_weighted` results after
+  exact score cancellation, matching the single-term path.
 
 ## [0.1.8] - 2026-06-10
 
