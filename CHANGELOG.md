@@ -110,6 +110,13 @@
   `[97.965 us 98.222 us 98.472 us]`, and `conjunctive/terms/5` moved from
   `[466.91 us 467.79 us 468.69 us]` to
   `[392.37 us 395.10 us 397.89 us]`.
+- Sped up conjunctive candidate generation by collecting posting lists during
+  term deduplication instead of sorting by `df` and doing a second set of hash
+  lookups. In the focused benchmark, `conjunctive/terms/2` moved from
+  `[51.429 us 51.518 us 51.617 us]` to
+  `[50.780 us 50.847 us 50.915 us]`, and `conjunctive/terms/5` moved from
+  `[390.82 us 395.33 us 400.03 us]` to
+  `[330.26 us 334.30 us 338.50 us]`.
 
 ### Fixed
 

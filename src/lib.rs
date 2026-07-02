@@ -510,8 +510,9 @@ where
             return Vec::new();
         }
 
-        let mut uniq: Vec<&Q> = Vec::new();
+        let mut lists: Vec<&[(DocId, W)]> = Vec::new();
         if query_terms.len() <= 32 {
+            let mut uniq: Vec<&Q> = Vec::new();
             'term: for term in query_terms {
                 for seen in &uniq {
                     if *seen == term {
@@ -519,45 +520,42 @@ where
                     }
                 }
                 uniq.push(term);
+                let Some(postings) = self.global_postings.get(term) else {
+                    return Vec::new();
+                };
+                if postings.is_empty() {
+                    return Vec::new();
+                }
+                lists.push(postings);
             }
         } else {
             let mut seen: HashSet<&Q> = HashSet::new();
             for t in query_terms {
                 if seen.insert(t) {
-                    uniq.push(t);
+                    let Some(postings) = self.global_postings.get(t) else {
+                        return Vec::new();
+                    };
+                    if postings.is_empty() {
+                        return Vec::new();
+                    }
+                    lists.push(postings);
                 }
             }
         }
-        if uniq.is_empty() {
+        if lists.is_empty() {
             return Vec::new();
         }
 
         // DAAT-style intersection over sorted doc-id lists.
         // Anchor on the rarest term to minimize intermediate sets.
-        uniq.sort_by_key(|t| self.df(*t));
-        if self.df(uniq[0]) == 0 {
-            return Vec::new();
-        }
+        lists.sort_by_key(|postings| postings.len());
 
         // Collect doc ids for the rarest term; global postings are sorted and
         // delete removes stale entries eagerly.
-        let mut acc: Vec<DocId> = {
-            let Some(list) = self.global_postings.get(uniq[0]) else {
-                return Vec::new();
-            };
-            list.iter().map(|(id, _)| *id).collect()
-        };
+        let mut acc: Vec<DocId> = lists[0].iter().map(|(id, _)| *id).collect();
 
-        for &t in uniq.iter().skip(1) {
-            if self.df(t) == 0 {
-                return Vec::new();
-            }
-            match self.global_postings.get(t) {
-                Some(list) => {
-                    acc = intersect_sorted_postings(&acc, list);
-                }
-                None => return Vec::new(),
-            }
+        for list in lists.into_iter().skip(1) {
+            acc = intersect_sorted_postings(&acc, list);
             if acc.is_empty() {
                 break;
             }
