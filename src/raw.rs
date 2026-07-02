@@ -10,11 +10,13 @@ use std::collections::BTreeMap;
 
 const MAGIC: &[u8; 8] = b"PSTRW001";
 const FOOTER_MAGIC: &[u8; 8] = b"PSTRF001";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const HEADER_LEN: usize = 72;
-const TERM_ENTRY_LEN: usize = 40;
+const TERM_ENTRY_LEN: usize = 48;
 const DOC_ENTRY_LEN: usize = 8;
+const BLOCK_ENTRY_LEN: usize = 24;
 const FOOTER_LEN: usize = 12;
+const DEFAULT_BLOCK_SIZE: u32 = 128;
 
 /// A numeric term id in the first raw postings format.
 pub type RawTermId = u64;
@@ -208,6 +210,43 @@ struct TermEntry {
     postings_len: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TermBlockDirectory {
+    block_count: u32,
+    blocks_offset: u64,
+}
+
+/// Metadata for one encoded posting block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RawPostingBlockMeta {
+    base_doc_id: DocId,
+    last_doc_id: DocId,
+    postings_offset: u64,
+    postings_len: u32,
+}
+
+impl RawPostingBlockMeta {
+    /// Previous document id before the first posting in this block.
+    pub fn base_doc_id(self) -> DocId {
+        self.base_doc_id
+    }
+
+    /// Last document id encoded in this block.
+    pub fn last_doc_id(self) -> DocId {
+        self.last_doc_id
+    }
+
+    /// Absolute byte offset of this block's encoded postings payload.
+    pub fn postings_offset(self) -> u64 {
+        self.postings_offset
+    }
+
+    /// Byte length of this block's encoded postings payload.
+    pub fn postings_len(self) -> u32 {
+        self.postings_len
+    }
+}
+
 /// A byte-backed raw segment reader.
 #[derive(Debug, Clone, Copy)]
 pub struct RawSegment<'a> {
@@ -339,6 +378,19 @@ impl<'a> RawSegment<'a> {
         })
     }
 
+    /// Return posting-block metadata for a term id.
+    pub fn posting_blocks(&self, term_id: RawTermId) -> Result<Vec<RawPostingBlockMeta>, Error> {
+        let Some((entry, block_directory)) = self.term_entry_with_blocks(term_id)? else {
+            return Ok(Vec::new());
+        };
+        self.validate_block_directory(block_directory)?;
+        let mut blocks = Vec::with_capacity(block_directory.block_count as usize);
+        for i in 0..block_directory.block_count {
+            blocks.push(self.posting_block_at(entry, block_directory, i)?);
+        }
+        Ok(blocks)
+    }
+
     /// Candidate documents that contain every term id.
     pub fn candidates_all_terms(&self, query_terms: &[RawTermId]) -> Result<Vec<DocId>, Error> {
         if query_terms.is_empty() {
@@ -468,15 +520,36 @@ impl<'a> RawSegment<'a> {
     }
 
     fn term_entry(&self, term_id: RawTermId) -> Result<Option<TermEntry>, Error> {
+        let Some(index) = self.term_entry_index(term_id)? else {
+            return Ok(None);
+        };
+        Ok(Some(self.term_entry_at(index)?))
+    }
+
+    fn term_entry_with_blocks(
+        &self,
+        term_id: RawTermId,
+    ) -> Result<Option<(TermEntry, TermBlockDirectory)>, Error> {
+        let Some(index) = self.term_entry_index(term_id)? else {
+            return Ok(None);
+        };
+        Ok(Some((
+            self.term_entry_at(index)?,
+            self.term_block_directory_at(index)?,
+        )))
+    }
+
+    fn term_entry_index(&self, term_id: RawTermId) -> Result<Option<u32>, Error> {
         let mut low = 0u32;
         let mut high = self.meta.term_count;
         while low < high {
             let mid = low + ((high - low) / 2);
-            let entry = self.term_entry_at(mid)?;
-            match entry.term_id.cmp(&term_id) {
+            let offset = self.term_entry_offset(mid)?;
+            let mid_term_id = read_u64_at(self.bytes, offset, "term directory")?;
+            match mid_term_id.cmp(&term_id) {
                 std::cmp::Ordering::Less => low = mid + 1,
                 std::cmp::Ordering::Greater => high = mid,
-                std::cmp::Ordering::Equal => return Ok(Some(entry)),
+                std::cmp::Ordering::Equal => return Ok(Some(mid)),
             }
         }
         Ok(None)
@@ -506,6 +579,76 @@ impl<'a> RawSegment<'a> {
             });
         }
         Ok(entry)
+    }
+
+    fn term_block_directory_at(&self, index: u32) -> Result<TermBlockDirectory, Error> {
+        let offset = self.term_entry_offset(index)?;
+        Ok(TermBlockDirectory {
+            block_count: read_u32_at(self.bytes, offset + 36, "term directory")?,
+            blocks_offset: read_u64_at(self.bytes, offset + 40, "term directory")?,
+        })
+    }
+
+    fn validate_block_directory(&self, block_directory: TermBlockDirectory) -> Result<(), Error> {
+        let block_dir_end = block_directory
+            .blocks_offset
+            .checked_add(block_directory.block_count as u64 * BLOCK_ENTRY_LEN as u64)
+            .ok_or(Error::InvalidLayout {
+                reason: "block range overflows",
+            })?;
+        let doc_meta_end = doc_meta_end(self.meta)?;
+        if block_directory.blocks_offset < doc_meta_end || block_dir_end > self.meta.postings_offset
+        {
+            return Err(Error::InvalidLayout {
+                reason: "block range is outside block directory section",
+            });
+        }
+        Ok(())
+    }
+
+    fn posting_block_at(
+        &self,
+        entry: TermEntry,
+        block_directory: TermBlockDirectory,
+        index: u32,
+    ) -> Result<RawPostingBlockMeta, Error> {
+        if index >= block_directory.block_count {
+            return Err(Error::InvalidLayout {
+                reason: "block index out of range",
+            });
+        }
+        let offset = block_directory
+            .blocks_offset
+            .checked_add(index as u64 * BLOCK_ENTRY_LEN as u64)
+            .ok_or(Error::InvalidLayout {
+                reason: "block entry offset overflows",
+            })?;
+        let offset = usize::try_from(offset).map_err(|_| Error::SegmentTooLarge)?;
+        let block = RawPostingBlockMeta {
+            base_doc_id: read_u32_at(self.bytes, offset, "block directory")?,
+            last_doc_id: read_u32_at(self.bytes, offset + 4, "block directory")?,
+            postings_offset: read_u64_at(self.bytes, offset + 8, "block directory")?,
+            postings_len: read_u32_at(self.bytes, offset + 16, "block directory")?,
+        };
+        let postings_end = block
+            .postings_offset
+            .checked_add(block.postings_len as u64)
+            .ok_or(Error::InvalidLayout {
+                reason: "block posting range overflows",
+            })?;
+        if block.postings_offset < entry.postings_offset
+            || postings_end > entry.postings_offset + entry.postings_len as u64
+        {
+            return Err(Error::InvalidLayout {
+                reason: "block posting range is outside term postings",
+            });
+        }
+        if block.last_doc_id < block.base_doc_id {
+            return Err(Error::InvalidLayout {
+                reason: "block last doc precedes base doc",
+            });
+        }
+        Ok(block)
     }
 
     fn term_entry_offset(&self, index: u32) -> Result<usize, Error> {
@@ -734,31 +877,69 @@ pub fn write_u64_u32_segment(documents: &[RawDocument<'_>]) -> Result<Vec<u8>, E
     let doc_meta_len = (doc_count as u64)
         .checked_mul(DOC_ENTRY_LEN as u64)
         .ok_or(Error::SegmentTooLarge)?;
-    let postings_offset = doc_meta_offset
+    let block_dir_offset = doc_meta_offset
         .checked_add(doc_meta_len)
+        .ok_or(Error::SegmentTooLarge)?;
+    let total_block_count: u64 = postings
+        .values()
+        .map(|list| {
+            let len = list.len() as u64;
+            len.div_ceil(DEFAULT_BLOCK_SIZE as u64)
+        })
+        .sum();
+    let block_dir_len = total_block_count
+        .checked_mul(BLOCK_ENTRY_LEN as u64)
+        .ok_or(Error::SegmentTooLarge)?;
+    let postings_offset = block_dir_offset
+        .checked_add(block_dir_len)
         .ok_or(Error::SegmentTooLarge)?;
 
     let mut postings_bytes = Vec::new();
     let mut term_entries = Vec::with_capacity(postings.len());
+    let mut term_block_directories = Vec::with_capacity(postings.len());
+    let mut block_entries = Vec::new();
     for (&term_id, list) in &postings {
         let offset = postings_offset
             .checked_add(u64::try_from(postings_bytes.len()).map_err(|_| Error::SegmentTooLarge)?)
             .ok_or(Error::SegmentTooLarge)?;
+        let blocks_offset = block_dir_offset
+            .checked_add(
+                u64::try_from(block_entries.len()).map_err(|_| Error::SegmentTooLarge)?
+                    * BLOCK_ENTRY_LEN as u64,
+            )
+            .ok_or(Error::SegmentTooLarge)?;
         let start_len = postings_bytes.len();
         let mut prev_doc_id = 0;
+        let mut first_posting = true;
         let mut max_weight = 0u32;
         let mut total_weight = 0u64;
-        for (index, &(doc_id, weight)) in list.iter().enumerate() {
-            let gap = if index == 0 {
-                doc_id
-            } else {
-                doc_id - prev_doc_id
-            };
-            varint::encode_u32(gap, &mut postings_bytes);
-            varint::encode_u32(weight, &mut postings_bytes);
-            prev_doc_id = doc_id;
-            max_weight = max_weight.max(weight);
-            total_weight = total_weight.saturating_add(weight as u64);
+        for chunk in list.chunks(DEFAULT_BLOCK_SIZE as usize) {
+            let block_base_doc_id = prev_doc_id;
+            let block_start_len = postings_bytes.len();
+            for &(doc_id, weight) in chunk {
+                let gap = if first_posting {
+                    first_posting = false;
+                    doc_id
+                } else {
+                    doc_id - prev_doc_id
+                };
+                varint::encode_u32(gap, &mut postings_bytes);
+                varint::encode_u32(weight, &mut postings_bytes);
+                prev_doc_id = doc_id;
+                max_weight = max_weight.max(weight);
+                total_weight = total_weight.saturating_add(weight as u64);
+            }
+            block_entries.push(RawPostingBlockMeta {
+                base_doc_id: block_base_doc_id,
+                last_doc_id: prev_doc_id,
+                postings_offset: postings_offset
+                    .checked_add(
+                        u64::try_from(block_start_len).map_err(|_| Error::SegmentTooLarge)?,
+                    )
+                    .ok_or(Error::SegmentTooLarge)?,
+                postings_len: u32::try_from(postings_bytes.len() - block_start_len)
+                    .map_err(|_| Error::SegmentTooLarge)?,
+            });
         }
         let postings_len =
             u32::try_from(postings_bytes.len() - start_len).map_err(|_| Error::SegmentTooLarge)?;
@@ -769,6 +950,11 @@ pub fn write_u64_u32_segment(documents: &[RawDocument<'_>]) -> Result<Vec<u8>, E
             total_weight,
             postings_offset: offset,
             postings_len,
+        });
+        term_block_directories.push(TermBlockDirectory {
+            block_count: u32::try_from(list.len().div_ceil(DEFAULT_BLOCK_SIZE as usize))
+                .map_err(|_| Error::TooManyDocuments)?,
+            blocks_offset,
         });
     }
 
@@ -787,7 +973,7 @@ pub fn write_u64_u32_segment(documents: &[RawDocument<'_>]) -> Result<Vec<u8>, E
             term_count,
             doc_count,
             max_doc_id: docs.keys().next_back().copied().unwrap_or(0),
-            block_size: 0,
+            block_size: DEFAULT_BLOCK_SIZE,
             total_doc_len,
             term_dir_offset,
             doc_meta_offset,
@@ -795,18 +981,26 @@ pub fn write_u64_u32_segment(documents: &[RawDocument<'_>]) -> Result<Vec<u8>, E
             footer_offset,
         },
     );
-    for entry in term_entries {
+    for (entry, block_directory) in term_entries.into_iter().zip(term_block_directories) {
         put_u64(&mut out, entry.term_id);
         put_u32(&mut out, entry.df);
         put_u32(&mut out, entry.max_weight);
         put_u64(&mut out, entry.total_weight);
         put_u64(&mut out, entry.postings_offset);
         put_u32(&mut out, entry.postings_len);
-        put_u32(&mut out, 0);
+        put_u32(&mut out, block_directory.block_count);
+        put_u64(&mut out, block_directory.blocks_offset);
     }
     for (&doc_id, (doc_len, _)) in &docs {
         put_u32(&mut out, doc_id);
         put_u32(&mut out, *doc_len);
+    }
+    for block in block_entries {
+        put_u32(&mut out, block.base_doc_id);
+        put_u32(&mut out, block.last_doc_id);
+        put_u64(&mut out, block.postings_offset);
+        put_u32(&mut out, block.postings_len);
+        put_u32(&mut out, 0);
     }
     out.extend_from_slice(&postings_bytes);
     out.extend_from_slice(FOOTER_MAGIC);
@@ -867,15 +1061,10 @@ fn validate_layout(bytes: &[u8], meta: RawSegmentMeta) -> Result<(), Error> {
         .ok_or(Error::InvalidLayout {
             reason: "doc metadata length overflows",
         })?;
-    let doc_meta_end =
-        meta.doc_meta_offset
-            .checked_add(doc_meta_len)
-            .ok_or(Error::InvalidLayout {
-                reason: "doc metadata end overflows",
-            })?;
-    if doc_meta_end != meta.postings_offset {
+    let doc_meta_end = doc_meta_end(meta)?;
+    if doc_meta_end > meta.postings_offset {
         return Err(Error::InvalidLayout {
-            reason: "postings must follow doc metadata",
+            reason: "block directory must follow doc metadata",
         });
     }
     if meta.postings_offset > meta.footer_offset {
@@ -907,12 +1096,31 @@ fn validate_layout(bytes: &[u8], meta: RawSegmentMeta) -> Result<(), Error> {
         "doc metadata",
     )?;
     checked_range(
+        doc_meta_end,
+        meta.postings_offset - doc_meta_end,
+        bytes.len(),
+        "block directory",
+    )?;
+    checked_range(
         meta.postings_offset,
         meta.footer_offset - meta.postings_offset,
         bytes.len(),
         "postings",
     )?;
     Ok(())
+}
+
+fn doc_meta_end(meta: RawSegmentMeta) -> Result<u64, Error> {
+    let doc_meta_len = (meta.doc_count as u64)
+        .checked_mul(DOC_ENTRY_LEN as u64)
+        .ok_or(Error::InvalidLayout {
+            reason: "doc metadata length overflows",
+        })?;
+    meta.doc_meta_offset
+        .checked_add(doc_meta_len)
+        .ok_or(Error::InvalidLayout {
+            reason: "doc metadata end overflows",
+        })
 }
 
 fn checked_range(
@@ -1046,6 +1254,15 @@ mod tests {
         assert_eq!(segment.max_weight(10).unwrap(), 4);
         assert_eq!(collect_postings(&segment, 10), vec![(2, 1), (5, 4)]);
         assert_eq!(collect_postings(&segment, 20), vec![(5, 2), (9, 1)]);
+        assert_eq!(
+            segment.posting_blocks(10).unwrap(),
+            vec![RawPostingBlockMeta {
+                base_doc_id: 0,
+                last_doc_id: 5,
+                postings_offset: segment.term_entry(10).unwrap().unwrap().postings_offset,
+                postings_len: segment.term_entry(10).unwrap().unwrap().postings_len,
+            }]
+        );
         assert!(collect_postings(&segment, 999).is_empty());
         assert_eq!(
             segment.candidates_any_terms(&[10, 20]).unwrap(),
@@ -1075,6 +1292,43 @@ mod tests {
         assert_eq!(segment.candidates_all_terms(&[20]).unwrap(), vec![5, 9]);
         assert_eq!(segment.candidates_all_terms(&[10, 10]).unwrap(), vec![2, 5]);
         assert!(segment.candidates_all_terms(&[999]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn raw_segment_records_multi_block_postings_metadata() {
+        let term = vec![(7, 1)];
+        let docs: Vec<_> = (0..130u32)
+            .map(|doc_id| RawDocument::new(doc_id, term.as_slice()))
+            .collect();
+
+        let bytes = write_u64_u32_segment(&docs).unwrap();
+        let segment = RawSegment::open(&bytes).unwrap();
+        let blocks = segment.posting_blocks(7).unwrap();
+
+        assert_eq!(segment.meta().block_size(), DEFAULT_BLOCK_SIZE);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].base_doc_id(), 0);
+        assert_eq!(blocks[0].last_doc_id(), 127);
+        assert_eq!(blocks[1].base_doc_id(), 127);
+        assert_eq!(blocks[1].last_doc_id(), 129);
+        assert_eq!(collect_postings(&segment, 7).len(), 130);
+    }
+
+    #[test]
+    fn raw_segment_validates_block_metadata_lazily() {
+        let terms = vec![(1, 1)];
+        let docs = vec![RawDocument::new(1, &terms)];
+        let mut bytes = write_u64_u32_segment(&docs).unwrap();
+        bytes[HEADER_LEN + 40..HEADER_LEN + 48].copy_from_slice(&0u64.to_le_bytes());
+
+        let segment = RawSegment::open(&bytes).unwrap();
+        assert_eq!(segment.df(1).unwrap(), 1);
+        assert!(matches!(
+            segment.posting_blocks(1),
+            Err(Error::InvalidLayout {
+                reason: "block range is outside block directory section"
+            })
+        ));
     }
 
     #[test]

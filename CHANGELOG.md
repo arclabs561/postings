@@ -18,6 +18,9 @@
   `PostingsIndex::candidates`.
 - Added `RawSegment::plan_candidates`, which can return broad-query `ScanAll`
   decisions from fixed term-directory metadata without decoding posting bytes.
+- Added raw-segment posting-block metadata for each term, recording block base
+  doc id, last doc id, and byte range so later readers can prune or range-read
+  posting blocks instead of treating each posting list as one opaque byte span.
 - Added raw-segment benchmark coverage for disjunctive candidate generation
   and metadata-only candidate planning against the in-memory path.
 - Added `PostingsIndex::top_k_weighted` for sparse inner-product ranking over
