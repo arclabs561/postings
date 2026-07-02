@@ -23,6 +23,11 @@
 
 ### Changed
 
+- Sped up raw-segment conjunctive candidate queries by intersecting decoded doc
+  id lists in place instead of allocating a fresh candidate vector for each
+  query term. In the focused raw-segment benchmark,
+  `raw_candidates_all_terms_5` moved from `[930.64 us 947.83 us 958.44 us]`
+  to `[901.89 us 910.71 us 920.60 us]`.
 - Capped dense per-query scratch for candidate generation and weighted top-k.
   Dense accumulators are still used for small and medium dense indexes, but
   massive dense doc-id spaces now fall back to sparse accumulation instead of

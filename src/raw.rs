@@ -367,7 +367,7 @@ impl<'a> RawSegment<'a> {
         let mut candidates = self.posting_doc_ids(entries[0])?;
         for entry in entries.into_iter().skip(1) {
             let docs = self.posting_doc_ids(entry)?;
-            candidates = intersect_doc_id_lists(&candidates, &docs);
+            intersect_doc_id_lists_in_place(&mut candidates, &docs);
             if candidates.is_empty() {
                 break;
             }
@@ -848,14 +848,15 @@ fn read_u64_at(bytes: &[u8], offset: usize, section: &'static str) -> Result<u64
     Ok(u64::from_le_bytes(arr))
 }
 
-fn intersect_doc_id_lists(a: &[DocId], b: &[DocId]) -> Vec<DocId> {
-    let mut out = Vec::with_capacity(a.len().min(b.len()));
+fn intersect_doc_id_lists_in_place(candidates: &mut Vec<DocId>, docs: &[DocId]) {
     let mut i = 0usize;
     let mut j = 0usize;
-    while i < a.len() && j < b.len() {
-        match a[i].cmp(&b[j]) {
+    let mut write = 0usize;
+    while i < candidates.len() && j < docs.len() {
+        match candidates[i].cmp(&docs[j]) {
             std::cmp::Ordering::Equal => {
-                out.push(a[i]);
+                candidates[write] = candidates[i];
+                write += 1;
                 i += 1;
                 j += 1;
             }
@@ -863,7 +864,7 @@ fn intersect_doc_id_lists(a: &[DocId], b: &[DocId]) -> Vec<DocId> {
             std::cmp::Ordering::Greater => j += 1,
         }
     }
-    out
+    candidates.truncate(write);
 }
 
 #[cfg(test)]
