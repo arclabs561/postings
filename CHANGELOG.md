@@ -4,6 +4,9 @@
 
 ### Added
 
+- Added a raw-segment reader design for the first larger-than-memory postings
+  path: numeric term ids, consumer-owned segment bytes, block metadata, and a
+  filesystem-backed reader before mmap/object-store/GPU variants.
 - Added `PostingsIndex::top_k_weighted` for sparse inner-product ranking over
   weighted postings.
 - Added a property-test quality gate that checks `top_k_weighted` against a
