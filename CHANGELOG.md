@@ -18,6 +18,17 @@
   `[3.2583 ms 3.3284 ms 3.4373 ms]` to
   `[3.0940 ms 3.1817 ms 3.2701 ms]`; `delete/common_terms_5k` stayed within
   noise.
+- Sped up positive multi-term `top_k_weighted` queries by caching per-term
+  weight bounds and skipping the dense scorer's separate `seen` bitmap when
+  every contribution is non-negative. In focused runs, `weighted_top_k/terms/5`
+  moved from `[266.33 us 273.77 us 276.66 us]` to
+  `[237.46 us 238.95 us 239.92 us]`,
+  `weighted_top_k/expanded_terms/16` moved from
+  `[467.64 us 469.66 us 472.90 us]` to
+  `[438.44 us 438.91 us 439.75 us]`, and
+  `weighted_top_k/rare_terms/8` moved from
+  `[7.0772 us 7.1154 us 7.1553 us]` to
+  `[5.6593 us 5.6818 us 5.7066 us]`.
 - Sped up multi-term `top_k_weighted` scoring for dense doc ids by using a dense
   accumulator with sparse-id fallback. On the benchmark query workload,
   `weighted_top_k/terms/2` moved from `[1.0914 ms 1.0979 ms 1.1059 ms]` to

@@ -2,7 +2,9 @@
 
 use durability::checkpoint::CheckpointFile;
 use durability::recordlog::{RecordLogReadMode, RecordLogReader, RecordLogWriter};
-use durability::storage::{Directory, MemoryDirectory};
+#[cfg(feature = "persistence")]
+use durability::storage::Directory;
+use durability::storage::MemoryDirectory;
 use postings::{DocId, PostingsIndex};
 use std::collections::BTreeMap;
 use std::sync::Arc;

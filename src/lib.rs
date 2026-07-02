@@ -41,6 +41,9 @@ pub type DocId = u32;
 /// `f32` enables learned sparse representations (SPLADE, SPLADE++, etc.)
 /// where terms carry continuous weights rather than integer frequencies.
 pub trait Weight: Copy + Default + std::fmt::Debug + 'static {
+    /// Whether every value of this weight type converts to a non-negative `f32`.
+    const ALWAYS_NONNEGATIVE: bool = false;
+
     /// The zero/absent weight.
     fn zero() -> Self;
     /// Accumulate (add) a weight into self.
@@ -52,6 +55,8 @@ pub trait Weight: Copy + Default + std::fmt::Debug + 'static {
 }
 
 impl Weight for u32 {
+    const ALWAYS_NONNEGATIVE: bool = true;
+
     #[inline]
     fn zero() -> Self {
         0
@@ -154,6 +159,53 @@ struct Segment<Term, W: Weight = u32> {
     _w: std::marker::PhantomData<W>,
 }
 
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+struct WeightBounds {
+    min: f32,
+    max: f32,
+    all_finite: bool,
+}
+
+impl WeightBounds {
+    #[inline]
+    fn new(weight: f32) -> Self {
+        Self {
+            min: weight,
+            max: weight,
+            all_finite: weight.is_finite(),
+        }
+    }
+
+    #[inline]
+    fn update(&mut self, weight: f32) {
+        if weight < self.min {
+            self.min = weight;
+        }
+        if weight > self.max {
+            self.max = weight;
+        }
+        self.all_finite &= weight.is_finite();
+    }
+
+    fn from_postings<W: Weight>(postings: &[(DocId, W)]) -> Option<Self> {
+        let (_, first_weight) = postings.first()?;
+        let mut bounds = Self::new(first_weight.to_f32());
+        for &(_, weight) in &postings[1..] {
+            bounds.update(weight.to_f32());
+        }
+        Some(bounds)
+    }
+
+    #[inline]
+    fn contribution_is_nonnegative(self, query_weight: f32) -> bool {
+        self.all_finite
+            && query_weight.is_finite()
+            && ((query_weight >= 0.0 && self.min >= 0.0)
+                || (query_weight <= 0.0 && self.max <= 0.0))
+    }
+}
+
 impl<Term, W: Weight> Default for Segment<Term, W> {
     fn default() -> Self {
         Self {
@@ -191,6 +243,14 @@ pub struct PostingsIndex<Term = String, W: Weight = u32> {
     /// Deletes remove postings eagerly; query hot paths rely on that private
     /// invariant to avoid a per-posting live-doc check.
     global_postings: HashMap<Term, Vec<(DocId, W)>>,
+    /// Conservative per-term weight bounds used to select exact scoring fast paths
+    /// for weight types whose sign is not statically known.
+    ///
+    /// Deletes may leave these wider than the live postings list. That is intentional:
+    /// stale wider bounds can disable an optimization, but they cannot make the
+    /// non-negative-contribution proof unsound.
+    #[cfg_attr(feature = "serde", serde(default))]
+    term_weight_bounds: HashMap<Term, WeightBounds>,
 }
 
 impl<Term, W: Weight> Default for PostingsIndex<Term, W> {
@@ -202,6 +262,7 @@ impl<Term, W: Weight> Default for PostingsIndex<Term, W> {
             df: HashMap::new(),
             total_doc_len: 0,
             global_postings: HashMap::new(),
+            term_weight_bounds: HashMap::new(),
         }
     }
 }
@@ -307,6 +368,13 @@ where
                 Ok(i) => postings[i].1 = *w,
                 Err(i) => postings.insert(i, (doc_id, *w)),
             }
+            if !W::ALWAYS_NONNEGATIVE {
+                let weight = w.to_f32();
+                self.term_weight_bounds
+                    .entry(term.clone())
+                    .and_modify(|bounds| bounds.update(weight))
+                    .or_insert_with(|| WeightBounds::new(weight));
+            }
         }
 
         // Update global df before moving doc_terms into the segment.
@@ -379,6 +447,7 @@ where
                     }
                     if postings.is_empty() {
                         self.global_postings.remove(term);
+                        self.term_weight_bounds.remove(term);
                     }
                 }
             }
@@ -637,6 +706,37 @@ where
             .filter(|(doc_id, _)| self.doc_segment.contains_key(doc_id))
     }
 
+    fn weight_bounds<Q>(&self, term: &Q, postings: &[(DocId, W)]) -> Option<WeightBounds>
+    where
+        Term: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.term_weight_bounds
+            .get(term)
+            .copied()
+            .or_else(|| WeightBounds::from_postings(postings))
+    }
+
+    fn contributions_are_nonnegative<Q>(
+        &self,
+        term: &Q,
+        postings: &[(DocId, W)],
+        query_weight: f32,
+    ) -> bool
+    where
+        Term: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        if !query_weight.is_finite() {
+            return false;
+        }
+        if W::ALWAYS_NONNEGATIVE {
+            return query_weight >= 0.0;
+        }
+        self.weight_bounds(term, postings)
+            .is_some_and(|bounds| bounds.contribution_is_nonnegative(query_weight))
+    }
+
     /// Return the top `k` documents by sparse inner product.
     ///
     /// Query terms are borrowed so a `PostingsIndex<String, f32>` can be queried
@@ -689,8 +789,11 @@ where
                 let Some(postings) = self.global_postings.get(term) else {
                     continue;
                 };
+                if postings.is_empty() {
+                    continue;
+                }
                 total_postings = total_postings.saturating_add(postings.len());
-                lists.push((postings.as_slice(), query_weight));
+                lists.push((term, postings.as_slice(), query_weight));
             }
         } else {
             let mut query_weights: HashMap<&Q, f32> = HashMap::new();
@@ -710,8 +813,11 @@ where
                 let Some(postings) = self.global_postings.get(term) else {
                     continue;
                 };
+                if postings.is_empty() {
+                    continue;
+                }
                 total_postings = total_postings.saturating_add(postings.len());
-                lists.push((postings.as_slice(), query_weight));
+                lists.push((term, postings.as_slice(), query_weight));
             }
         }
         if lists.is_empty() {
@@ -719,13 +825,13 @@ where
         }
 
         if lists.len() == 1 {
-            let (postings, query_weight) = lists[0];
+            let (_, postings, query_weight) = lists[0];
             return top_k_single_postings(postings, query_weight, k);
         }
 
         let dense_slots = lists
             .iter()
-            .filter_map(|(postings, _)| {
+            .filter_map(|(_, postings, _)| {
                 let (last_doc_id, _) = postings.last()?;
                 usize::try_from(*last_doc_id).ok()?.checked_add(1)
             })
@@ -734,21 +840,42 @@ where
         let dense_limit = self.doc_len.len().saturating_mul(4).max(1024);
         if dense_slots <= dense_limit {
             let mut scores = vec![0.0; dense_slots];
-            let mut seen = vec![false; dense_slots];
             let mut touched = Vec::with_capacity(total_postings.min(self.doc_len.len()));
 
-            for (postings, query_weight) in lists {
-                for &(doc_id, doc_weight) in postings {
-                    let contribution = query_weight * doc_weight.to_f32();
-                    if contribution == 0.0 {
-                        continue;
+            let contributions_are_nonnegative =
+                lists.iter().all(|(term, postings, query_weight)| {
+                    self.contributions_are_nonnegative(*term, postings, *query_weight)
+                });
+
+            if contributions_are_nonnegative {
+                for (_, postings, query_weight) in lists {
+                    for &(doc_id, doc_weight) in postings {
+                        let contribution = query_weight * doc_weight.to_f32();
+                        if contribution == 0.0 {
+                            continue;
+                        }
+                        let slot = doc_id as usize;
+                        if scores[slot] == 0.0 {
+                            touched.push(doc_id);
+                        }
+                        scores[slot] += contribution;
                     }
-                    let slot = doc_id as usize;
-                    if !seen[slot] {
-                        seen[slot] = true;
-                        touched.push(doc_id);
+                }
+            } else {
+                let mut seen = vec![false; dense_slots];
+                for (_, postings, query_weight) in lists {
+                    for &(doc_id, doc_weight) in postings {
+                        let contribution = query_weight * doc_weight.to_f32();
+                        if contribution == 0.0 {
+                            continue;
+                        }
+                        let slot = doc_id as usize;
+                        if !seen[slot] {
+                            seen[slot] = true;
+                            touched.push(doc_id);
+                        }
+                        scores[slot] += contribution;
                     }
-                    scores[slot] += contribution;
                 }
             }
 
@@ -762,7 +889,7 @@ where
 
         let mut scores: HashMap<DocId, f32> =
             HashMap::with_capacity(total_postings.min(self.doc_len.len()));
-        for (postings, query_weight) in lists {
+        for (_, postings, query_weight) in lists {
             for &(doc_id, doc_weight) in postings {
                 let contribution = query_weight * doc_weight.to_f32();
                 if contribution != 0.0 {
@@ -1648,6 +1775,26 @@ mod tests {
             idx.top_k_weighted(&[("positive", 1.0), ("negative", -1.0), ("late", 1.0)], 10);
 
         assert_eq!(ranked, vec![(1, 1.0)]);
+    }
+
+    #[test]
+    fn top_k_weighted_u32_negative_query_weights_use_exact_path() {
+        let mut idx: PostingsIndex<String> = PostingsIndex::new();
+        idx.add_document(
+            0,
+            &[
+                String::from("positive"),
+                String::from("negative"),
+                String::from("late"),
+            ],
+        )
+        .unwrap();
+        idx.add_document(1, &[String::from("late")]).unwrap();
+
+        let ranked =
+            idx.top_k_weighted(&[("positive", 1.0), ("negative", -1.0), ("late", 2.0)], 10);
+
+        assert_eq!(ranked, vec![(0, 2.0), (1, 2.0)]);
     }
 
     fn exact_sparse_top_k(
