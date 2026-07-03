@@ -418,6 +418,11 @@ impl<'a> RawSegment<'a> {
         Ok(None)
     }
 
+    /// Visit all document ids and document lengths in ascending document id order.
+    pub fn for_each_document_len(&self, visit: impl FnMut(DocId, u32)) -> Result<(), Error> {
+        for_each_document_len_in_doc_meta(self.doc_meta_bytes()?, self.meta.doc_count, visit)
+    }
+
     /// Document frequency for a term id.
     pub fn df(&self, term_id: RawTermId) -> Result<u32, Error> {
         Ok(self.term_entry(term_id)?.map_or(0, |entry| entry.df))
@@ -1378,6 +1383,11 @@ impl RawSegmentFile {
     /// Document length for a document id, if the id is present.
     pub fn document_len(&self, doc_id: DocId) -> Result<Option<u32>, Error> {
         document_len_in_doc_meta(&self.doc_meta, self.meta.doc_count, doc_id)
+    }
+
+    /// Visit all document ids and document lengths in ascending document id order.
+    pub fn for_each_document_len(&self, visit: impl FnMut(DocId, u32)) -> Result<(), Error> {
+        for_each_document_len_in_doc_meta(&self.doc_meta, self.meta.doc_count, visit)
     }
 
     /// Document frequency for a term id.
@@ -2565,6 +2575,20 @@ fn document_len_in_doc_meta(
     Ok(None)
 }
 
+fn for_each_document_len_in_doc_meta(
+    doc_meta: &[u8],
+    doc_count: u32,
+    mut visit: impl FnMut(DocId, u32),
+) -> Result<(), Error> {
+    for index in 0..doc_count {
+        let offset = doc_meta_offset(index)?;
+        let doc_id = read_u32_at(doc_meta, offset, "doc metadata")?;
+        let doc_len = read_u32_at(doc_meta, offset + 4, "doc metadata")?;
+        visit(doc_id, doc_len);
+    }
+    Ok(())
+}
+
 fn doc_meta_offset(index: u32) -> Result<usize, Error> {
     let offset = (index as u64)
         .checked_mul(DOC_ENTRY_LEN as u64)
@@ -3675,6 +3699,11 @@ mod tests {
         assert_eq!(segment.document_len(5).unwrap(), Some(6));
         assert_eq!(segment.document_len(2).unwrap(), Some(2));
         assert_eq!(segment.document_len(999).unwrap(), None);
+        let mut document_lengths = Vec::new();
+        segment
+            .for_each_document_len(|doc_id, len| document_lengths.push((doc_id, len)))
+            .unwrap();
+        assert_eq!(document_lengths, vec![(2, 2), (5, 6), (9, 1)]);
         assert_eq!(segment.df(10).unwrap(), 2);
         assert_eq!(segment.total_weight(10).unwrap(), 5);
         assert_eq!(segment.max_weight(10).unwrap(), 4);
@@ -3836,6 +3865,11 @@ mod tests {
         assert_eq!(segment.meta().term_count(), 2);
         assert_eq!(segment.document_len(5).unwrap(), Some(6));
         assert_eq!(segment.document_len(999).unwrap(), None);
+        let mut document_lengths = Vec::new();
+        segment
+            .for_each_document_len(|doc_id, len| document_lengths.push((doc_id, len)))
+            .unwrap();
+        assert_eq!(document_lengths, vec![(2, 1), (5, 6), (9, 1)]);
         assert_eq!(segment.df(10).unwrap(), 2);
         assert_eq!(segment.total_weight(10).unwrap(), 5);
         assert_eq!(segment.max_weight(10).unwrap(), 4);

@@ -8,6 +8,9 @@
   `RawSegmentFile::for_each_posting_block_with_document_len` for block-scoped
   scorers that need term weight and document length without decoding a full
   posting list.
+- Added `RawSegment::for_each_document_len` and
+  `RawSegmentFile::for_each_document_len` for scorers that want to build dense
+  document-length caches from raw segment metadata.
 - Added raw-segment content checksums behind the `raw-segment` feature. New
   writes include directory CRC32s plus per-posting-block CRC32s; readers keep
   accepting legacy flag-zero raw segments and file-backed readers verify posting
