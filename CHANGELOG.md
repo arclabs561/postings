@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-07-03
+
 ### Added
 
 - Added `RawSegment::for_each_posting_block_with_document_len` and
