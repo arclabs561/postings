@@ -2519,6 +2519,7 @@ pub fn top_k_weighted_u32_files(
             }
             order.push((index, upper_bound));
         }
+        order.retain(|(_, upper_bound)| *upper_bound > 0.0 || !upper_bound.is_finite());
         order.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
 
         let mut threshold = 0.0;
@@ -4503,6 +4504,24 @@ mod tests {
             top_k_weighted_u32_files(&mut segments, &[(7, 1.0)], 1).unwrap(),
             vec![(1, 5.0)]
         );
+    }
+
+    #[test]
+    fn raw_segment_files_return_empty_for_absent_terms() {
+        let first_docs = [RawDocument::new(10, &[(7, 5)])];
+        let second_docs = [RawDocument::new(1, &[(8, 5)])];
+        let dir = tempfile::tempdir().unwrap();
+        let first_path = dir.path().join("first.raw");
+        let second_path = dir.path().join("second.raw");
+        std::fs::write(&first_path, write_u64_u32_segment(&first_docs).unwrap()).unwrap();
+        std::fs::write(&second_path, write_u64_u32_segment(&second_docs).unwrap()).unwrap();
+        let mut first_segment = RawSegmentFile::open(&first_path).unwrap();
+        let mut second_segment = RawSegmentFile::open(&second_path).unwrap();
+        let mut segments = [&mut first_segment, &mut second_segment];
+
+        assert!(top_k_weighted_u32_files(&mut segments, &[(99, 1.0)], 10)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

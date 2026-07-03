@@ -7,6 +7,8 @@
 - Sped up raw-segment pruned block top-k scoring by maintaining the current
   threshold incrementally instead of rescanning all touched documents after each
   block.
+- Sped up multi-file raw-segment sparse top-k queries by skipping finite
+  zero-bound segments before scoring.
 - Sped up positional phrase and proximity queries by reusing term posting maps
   inside specialized two- and three-term paths instead of re-hashing term
   strings for every candidate document.
