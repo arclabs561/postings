@@ -1652,7 +1652,7 @@ impl RawSegmentFile {
         len: u64,
     ) -> Result<Vec<u8>, RawSegmentFileError> {
         checked_range(offset, len, self.file_len, "postings")?;
-        read_exact_at(&mut self.file, offset, len)
+        read_exact_at_positional(&mut self.file, offset, len)
     }
 
     fn read_posting_block_range(
@@ -1921,9 +1921,42 @@ pub fn top_k_weighted_u32_files(
         return Ok(Vec::new());
     }
 
+    let query_terms = normalize_weighted_query_terms(query_terms);
+    if query_terms.is_empty() {
+        return Ok(Vec::new());
+    }
+
     let mut candidates = Vec::with_capacity(k.saturating_mul(segments.len()));
-    for segment in segments.iter_mut() {
-        candidates.extend(segment.top_k_weighted_u32(query_terms, k)?);
+    let can_prune_segments = query_terms
+        .iter()
+        .all(|(_, weight)| *weight >= 0.0 && weight.is_finite());
+
+    if can_prune_segments {
+        let mut order = Vec::with_capacity(segments.len());
+        for (index, segment) in segments.iter().enumerate() {
+            let mut upper_bound = 0.0;
+            for &(term_id, query_weight) in &query_terms {
+                upper_bound += query_weight * segment.max_weight(term_id)? as f32;
+            }
+            order.push((index, upper_bound));
+        }
+        order.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+
+        let mut threshold = 0.0;
+        for (index, upper_bound) in order {
+            if candidates.len() >= k && upper_bound < threshold {
+                continue;
+            }
+            candidates.extend(segments[index].top_k_weighted_u32(&query_terms, k)?);
+            if candidates.len() >= k {
+                candidates = crate::top_k_scored_docs(candidates, k);
+                threshold = candidates.last().map_or(0.0, |(_, score)| *score);
+            }
+        }
+    } else {
+        for segment in segments.iter_mut() {
+            candidates.extend(segment.top_k_weighted_u32(&query_terms, k)?);
+        }
     }
 
     Ok(crate::top_k_scored_docs(candidates, k))
@@ -3204,6 +3237,25 @@ mod tests {
         assert_eq!(
             top_k_weighted_u32_files(&mut segments, &query, 4).unwrap(),
             idx.top_k_weighted(&memory_query, 4)
+        );
+    }
+
+    #[test]
+    fn raw_segment_files_do_not_prune_equal_bound_tie() {
+        let first_docs = [RawDocument::new(10, &[(7, 5)])];
+        let second_docs = [RawDocument::new(1, &[(7, 5)])];
+        let dir = tempfile::tempdir().unwrap();
+        let first_path = dir.path().join("first.raw");
+        let second_path = dir.path().join("second.raw");
+        std::fs::write(&first_path, write_u64_u32_segment(&first_docs).unwrap()).unwrap();
+        std::fs::write(&second_path, write_u64_u32_segment(&second_docs).unwrap()).unwrap();
+        let mut first_segment = RawSegmentFile::open(&first_path).unwrap();
+        let mut second_segment = RawSegmentFile::open(&second_path).unwrap();
+        let mut segments = [&mut first_segment, &mut second_segment];
+
+        assert_eq!(
+            top_k_weighted_u32_files(&mut segments, &[(7, 1.0)], 1).unwrap(),
+            vec![(1, 5.0)]
         );
     }
 
