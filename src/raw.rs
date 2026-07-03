@@ -20,6 +20,9 @@ const DOC_ENTRY_LEN: usize = 8;
 const BLOCK_ENTRY_LEN: usize = 24;
 const FOOTER_LEN: usize = 12;
 const DEFAULT_BLOCK_SIZE: u32 = 128;
+// Keep normal local-file queries on one read, but cap pathological high-DF term
+// payloads so file-backed traversal cannot allocate an entire huge posting list.
+const FILE_FULL_POSTINGS_READ_LIMIT: u64 = 1024 * 1024;
 
 /// A numeric term id in the first raw postings format.
 pub type RawTermId = u64;
@@ -1612,6 +1615,10 @@ impl RawSegmentFile {
         entry: TermEntry,
         mut visit: impl FnMut(DocId, u32),
     ) -> Result<(), RawSegmentFileError> {
+        if entry.postings_len as u64 > FILE_FULL_POSTINGS_READ_LIMIT {
+            return self.for_each_posting_in_entry_blocks(entry, visit);
+        }
+
         let bytes = self.read_postings_range(entry.postings_offset, entry.postings_len as u64)?;
         let postings = RawPostings {
             term_id: entry.term_id,
@@ -1625,6 +1632,50 @@ impl RawSegmentFile {
         for posting in postings {
             let (doc_id, weight) = posting?;
             visit(doc_id, weight);
+        }
+        Ok(())
+    }
+
+    fn for_each_posting_in_entry_blocks(
+        &mut self,
+        entry: TermEntry,
+        mut visit: impl FnMut(DocId, u32),
+    ) -> Result<(), RawSegmentFileError> {
+        let Some((_, block_directory)) = self.term_entry_with_blocks(entry.term_id)? else {
+            return Err(Error::InvalidLayout {
+                reason: "term block directory missing",
+            }
+            .into());
+        };
+        self.validate_block_directory(block_directory)?;
+        if entry.df != 0 && block_directory.block_count == 0 {
+            return Err(Error::InvalidLayout {
+                reason: "nonempty term has no posting blocks",
+            }
+            .into());
+        }
+
+        let mut decoded = 0u32;
+        for block_index in 0..block_directory.block_count {
+            let block = self.posting_block_at(entry, block_directory, block_index)?;
+            let bytes =
+                self.read_posting_block_range(block.postings_offset, block.postings_len as u64)?;
+            for_each_posting_in_block(
+                entry.term_id,
+                &bytes,
+                block.base_doc_id,
+                block.last_doc_id,
+                |doc_id, weight| {
+                    decoded = decoded.saturating_add(1);
+                    visit(doc_id, weight);
+                },
+            )?;
+        }
+        if decoded != entry.df {
+            return Err(Error::InvalidLayout {
+                reason: "block directory posting count mismatch",
+            }
+            .into());
         }
         Ok(())
     }
@@ -2747,6 +2798,36 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn raw_segment_file_blocked_entry_traversal_matches_byte_backed() {
+        let weighted_terms: Vec<Vec<(RawTermId, u32)>> = (0..260u32)
+            .map(|doc_id| vec![(7, 1 + (doc_id % 3)), (11, 1 + (doc_id % 5))])
+            .collect();
+        let docs: Vec<_> = weighted_terms
+            .iter()
+            .enumerate()
+            .map(|(doc_id, terms)| RawDocument::new(doc_id as DocId, terms))
+            .collect();
+
+        let bytes = write_u64_u32_segment(&docs).unwrap();
+        let segment = RawSegment::open(&bytes).unwrap();
+        let entry = segment.term_entry(7).unwrap().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raw.segment");
+        std::fs::write(&path, &bytes).unwrap();
+        let mut file_segment = RawSegmentFile::open(&path).unwrap();
+
+        let mut blocked = Vec::new();
+        file_segment
+            .for_each_posting_in_entry_blocks(entry, |doc_id, weight| {
+                blocked.push((doc_id, weight));
+            })
+            .unwrap();
+
+        assert_eq!(blocked, collect_postings(&segment, 7));
     }
 
     #[test]
