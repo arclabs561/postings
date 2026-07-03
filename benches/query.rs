@@ -7,7 +7,9 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 #[cfg(feature = "positional")]
 use postings::positional::PosingsIndex;
 #[cfg(feature = "raw-segment")]
-use postings::raw::{write_u64_u32_segment, RawDocument, RawSegment, RawSegmentFile};
+use postings::raw::{
+    top_k_weighted_u32_files, write_u64_u32_segment, RawDocument, RawSegment, RawSegmentFile,
+};
 use postings::{CandidatePlan, PlannerConfig, PostingsIndex};
 
 // ---------------------------------------------------------------------------
@@ -37,6 +39,9 @@ fn zipf_sample(rng: &mut u64, vocab_size: usize, _s: f64) -> usize {
 const N_DOCS: usize = 50_000;
 const VOCAB_SIZE: usize = 10_000;
 const TERMS_PER_DOC: usize = 100;
+
+#[cfg(feature = "raw-segment")]
+type RawWeightedDocs = Vec<Vec<(u64, u32)>>;
 #[cfg(feature = "positional")]
 const POSITIONAL_DOCS: usize = 25_000;
 #[cfg(feature = "positional")]
@@ -108,7 +113,7 @@ fn build_weighted_index_after_negative_delete() -> PostingsIndex<String, f32> {
 }
 
 #[cfg(feature = "raw-segment")]
-fn build_raw_numeric_fixture() -> (PostingsIndex<u64>, Vec<u8>) {
+fn build_raw_numeric_docs() -> (PostingsIndex<u64>, RawWeightedDocs) {
     let mut idx: PostingsIndex<u64> = PostingsIndex::new();
     let mut weighted_docs: Vec<Vec<(u64, u32)>> = Vec::with_capacity(N_DOCS);
     let mut rng: u64 = 0xdeadbeef_cafebabe;
@@ -125,13 +130,24 @@ fn build_raw_numeric_fixture() -> (PostingsIndex<u64>, Vec<u8>) {
         weighted_docs.push(counts.into_iter().collect());
     }
 
+    (idx, weighted_docs)
+}
+
+#[cfg(feature = "raw-segment")]
+fn raw_segment_bytes_from_docs(weighted_docs: &[Vec<(u64, u32)>], start_doc_id: u32) -> Vec<u8> {
     let raw_docs: Vec<_> = weighted_docs
         .iter()
         .enumerate()
-        .map(|(doc_id, terms)| RawDocument::new(doc_id as u32, terms))
+        .map(|(offset, terms)| RawDocument::new(start_doc_id + offset as u32, terms))
         .collect();
-    let bytes = write_u64_u32_segment(&raw_docs).unwrap();
-    (idx, bytes)
+    write_u64_u32_segment(&raw_docs).unwrap()
+}
+
+#[cfg(feature = "raw-segment")]
+fn build_raw_numeric_fixture() -> (PostingsIndex<u64>, RawWeightedDocs, Vec<u8>) {
+    let (idx, weighted_docs) = build_raw_numeric_docs();
+    let bytes = raw_segment_bytes_from_docs(&weighted_docs, 0);
+    (idx, weighted_docs, bytes)
 }
 
 fn build_delete_index(n_docs: u32, common_terms: usize) -> PostingsIndex<String> {
@@ -457,7 +473,7 @@ fn bench_delete(c: &mut Criterion) {
 
 #[cfg(feature = "raw-segment")]
 fn bench_raw_segment_queries(c: &mut Criterion) {
-    let (idx, bytes) = build_raw_numeric_fixture();
+    let (idx, weighted_docs, bytes) = build_raw_numeric_fixture();
     let segment = RawSegment::open(&bytes).unwrap();
     let raw_dir = tempfile::tempdir().unwrap();
     let raw_path = raw_dir.path().join("numeric.raw");
@@ -474,6 +490,14 @@ fn bench_raw_segment_queries(c: &mut Criterion) {
         .map(|(term, weight)| (term, *weight))
         .collect();
     let common_term = terms[0];
+    let chunk_size = N_DOCS.div_ceil(4);
+    let mut multi_file_segments = Vec::new();
+    for (chunk_index, chunk) in weighted_docs.chunks(chunk_size).enumerate() {
+        let start_doc_id = (chunk_index * chunk_size) as u32;
+        let path = raw_dir.path().join(format!("numeric-{chunk_index}.raw"));
+        std::fs::write(&path, raw_segment_bytes_from_docs(chunk, start_doc_id)).unwrap();
+        multi_file_segments.push(RawSegmentFile::open(path).unwrap());
+    }
     let mut group = c.benchmark_group("raw_segment");
 
     group.bench_function("open", |b| {
@@ -622,6 +646,20 @@ fn bench_raw_segment_queries(c: &mut Criterion) {
                 file_segment
                     .top_k_weighted_u32(black_box(weighted_terms.as_slice()), black_box(10))
                     .unwrap(),
+            );
+        });
+    });
+
+    group.bench_function("file_top_k_weighted_5_multi_4", |b| {
+        b.iter(|| {
+            let mut segments: Vec<_> = multi_file_segments.iter_mut().collect();
+            black_box(
+                top_k_weighted_u32_files(
+                    black_box(segments.as_mut_slice()),
+                    black_box(weighted_terms.as_slice()),
+                    black_box(10),
+                )
+                .unwrap(),
             );
         });
     });

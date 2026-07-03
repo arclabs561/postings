@@ -7,6 +7,7 @@
 - Added `postings::raw::top_k_weighted_u32_files` for exact sparse
   inner-product top-k over multiple file-backed raw segments with globally
   unique document ids.
+- Added raw-segment benchmark coverage for multi-file sparse top-k merging.
 
 ## [0.2.0] - 2026-07-02
 
