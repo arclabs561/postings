@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-07-03
+
 ### Added
 
 - Added `top_k_weighted_u32_files_with_stats` for raw multi-file sparse top-k
