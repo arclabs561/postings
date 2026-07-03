@@ -379,10 +379,15 @@ impl<'a> RawSegment<'a> {
                 "block directory",
             )?];
             verify_directory_checksums(term_dir, doc_meta, block_dir, integrity)?;
-            let map = block_checksum_map(block_dir, integrity, block_count)?;
-            for (&offset, &(len, _)) in &map {
-                let range = checked_range(offset, len as u64, bytes.len(), "postings")?;
-                verify_block_slice(&map, offset, &bytes[range])?;
+            let checksums = block_checksum_list(block_dir, &integrity[INTEGRITY_HEADER_LEN..])?;
+            for checksum in &checksums {
+                let range = checked_range(
+                    checksum.offset,
+                    checksum.len as u64,
+                    bytes.len(),
+                    "postings",
+                )?;
+                verify_block_slice(&checksums, checksum.offset, &bytes[range])?;
             }
         }
 
@@ -1208,7 +1213,8 @@ impl RawSegmentFile {
             let (integrity_offset, block_count, integrity_len) = integrity_layout(meta)?;
             let integrity = read_exact_at(&mut file, integrity_offset, integrity_len)?;
             verify_directory_checksums(&term_dir, &doc_meta, &block_dir, &integrity)?;
-            if integrity.len() != INTEGRITY_HEADER_LEN + block_count as usize * 4 {
+            let block_count = usize::try_from(block_count).map_err(|_| Error::SegmentTooLarge)?;
+            if integrity.len() != INTEGRITY_HEADER_LEN + block_count * 4 {
                 return Err(Error::InvalidLayout {
                     reason: "integrity section length mismatch",
                 }
@@ -1960,8 +1966,8 @@ impl RawSegmentFile {
     ) -> Result<Vec<u8>, RawSegmentFileError> {
         checked_range(offset, len, self.file_len, "postings")?;
         let bytes = read_exact_at_positional(&mut self.file, offset, len)?;
-        if let Some(map) = &self.block_crcs {
-            verify_span_blocks(map, offset, &bytes)?;
+        if let Some(checksums) = self.decoded_block_checksums()? {
+            verify_span_blocks(checksums, offset, &bytes)?;
         }
         Ok(bytes)
     }
@@ -1973,10 +1979,17 @@ impl RawSegmentFile {
     ) -> Result<Vec<u8>, RawSegmentFileError> {
         checked_range(offset, len, self.file_len, "postings")?;
         let bytes = read_exact_at_positional(&mut self.file, offset, len)?;
-        if let Some(map) = &self.block_crcs {
-            verify_block_slice(map, offset, &bytes)?;
+        if let Some(checksums) = self.decoded_block_checksums()? {
+            verify_block_slice(checksums, offset, &bytes)?;
         }
         Ok(bytes)
+    }
+
+    fn decoded_block_checksums(&mut self) -> Result<Option<&[RawBlockChecksum]>, Error> {
+        let Some(checksums) = &mut self.block_checksums else {
+            return Ok(None);
+        };
+        Ok(Some(checksums.get(&self.block_dir)?))
     }
 
     fn posting_doc_ids(&mut self, entry: TermEntry) -> Result<Vec<DocId>, RawSegmentFileError> {
@@ -2121,10 +2134,13 @@ impl RawSegmentFile {
             blocks.push(self.posting_block_at(entry, block_directory, block_index)?);
         }
 
-        let mut decoded = 0u32;
         let file_len = self.file_len;
         let file = &mut self.file;
-        let block_crcs = self.block_crcs.as_ref();
+        let block_checksums = match &mut self.block_checksums {
+            Some(checksums) => Some(checksums.get(&self.block_dir)?),
+            None => None,
+        };
+        let mut decoded = 0u32;
         let mut lengths = DocLengthCursor::new(&self.doc_meta, self.meta.doc_count);
         for block in blocks {
             checked_range(
@@ -2135,8 +2151,8 @@ impl RawSegmentFile {
             )?;
             let bytes =
                 read_exact_at_positional(file, block.postings_offset, block.postings_len as u64)?;
-            if let Some(map) = block_crcs {
-                verify_block_slice(map, block.postings_offset, &bytes)?;
+            if let Some(checksums) = block_checksums {
+                verify_block_slice(checksums, block.postings_offset, &bytes)?;
             }
             let mut lookup_error = None;
             for_each_posting_in_block(
