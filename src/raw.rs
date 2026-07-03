@@ -5609,5 +5609,36 @@ mod tests {
                 prop_assert_eq!(segment.document_len(doc_id).unwrap(), Some(idx.document_len(doc_id)));
             }
         }
+
+        #[test]
+        fn raw_segment_sorted_writer_matches_unsorted_writer_for_sorted_input(
+            docs in prop::collection::vec(
+                prop::collection::vec((0u8..12, 1u8..4), 0..16),
+                0..24
+            ),
+            stride in prop::sample::select(vec![1u32, 37u32]),
+        ) {
+            let weighted_docs: Vec<Vec<(RawTermId, u32)>> = docs
+                .iter()
+                .map(|doc| {
+                    doc.iter()
+                        .map(|&(term, weight)| (term as RawTermId, weight as u32))
+                        .collect()
+                })
+                .collect();
+            let raw_docs: Vec<RawDocument<'_>> = weighted_docs
+                .iter()
+                .enumerate()
+                .map(|(i, terms)| RawDocument::new((i as DocId) * stride, terms))
+                .collect();
+
+            let expected = write_u64_u32_segment(&raw_docs).unwrap();
+            let sorted = write_u64_u32_segment_sorted_from_iter(raw_docs.iter().copied()).unwrap();
+            let mut written = Vec::new();
+            write_u64_u32_segment_sorted_from_iter_to(raw_docs.iter().copied(), &mut written).unwrap();
+
+            prop_assert_eq!(&sorted, &expected);
+            prop_assert_eq!(&written, &expected);
+        }
     }
 }
