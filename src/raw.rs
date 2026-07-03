@@ -402,6 +402,48 @@ impl<'a> RawSegment<'a> {
         })
     }
 
+    /// Visit decoded postings for a term id without allocating a postings list.
+    pub fn for_each_posting(
+        &self,
+        term_id: RawTermId,
+        visit: impl FnMut(DocId, u32),
+    ) -> Result<(), Error> {
+        let Some(entry) = self.term_entry(term_id)? else {
+            return Ok(());
+        };
+        self.for_each_posting_in_entry(entry, visit)
+    }
+
+    /// Visit decoded postings and their document lengths for a term id.
+    ///
+    /// This is intended for scorers such as BM25 that need both term frequency
+    /// and document length while avoiding an intermediate postings vector.
+    pub fn for_each_posting_with_document_len(
+        &self,
+        term_id: RawTermId,
+        mut visit: impl FnMut(DocId, u32, u32),
+    ) -> Result<(), Error> {
+        let mut lookup_error = None;
+        self.for_each_posting(term_id, |doc_id, weight| {
+            if lookup_error.is_some() {
+                return;
+            }
+            match self.document_len(doc_id) {
+                Ok(Some(doc_len)) => visit(doc_id, weight, doc_len),
+                Ok(None) => {
+                    lookup_error = Some(Error::InvalidLayout {
+                        reason: "posting doc id has no document metadata",
+                    });
+                }
+                Err(err) => lookup_error = Some(err),
+            }
+        })?;
+        if let Some(err) = lookup_error {
+            return Err(err);
+        }
+        Ok(())
+    }
+
     /// Return posting-block metadata for a term id.
     pub fn posting_blocks(&self, term_id: RawTermId) -> Result<Vec<RawPostingBlockMeta>, Error> {
         let Some((entry, block_directory)) = self.term_entry_with_blocks(term_id)? else {
@@ -1067,25 +1109,7 @@ impl RawSegmentFile {
 
     /// Document length for a document id, if the id is present.
     pub fn document_len(&self, doc_id: DocId) -> Result<Option<u32>, Error> {
-        let mut low = 0u32;
-        let mut high = self.meta.doc_count;
-        while low < high {
-            let mid = low + ((high - low) / 2);
-            let offset = self.doc_entry_offset(mid)?;
-            let mid_doc_id = read_u32_at(&self.doc_meta, offset, "doc metadata")?;
-            match mid_doc_id.cmp(&doc_id) {
-                std::cmp::Ordering::Less => low = mid + 1,
-                std::cmp::Ordering::Greater => high = mid,
-                std::cmp::Ordering::Equal => {
-                    return Ok(Some(read_u32_at(
-                        &self.doc_meta,
-                        offset + 4,
-                        "doc metadata",
-                    )?));
-                }
-            }
-        }
-        Ok(None)
+        document_len_in_doc_meta(&self.doc_meta, self.meta.doc_count, doc_id)
     }
 
     /// Document frequency for a term id.
@@ -1147,6 +1171,37 @@ impl RawSegmentFile {
             out.push(posting?);
         }
         Ok(out)
+    }
+
+    /// Visit decoded postings for a term id without allocating a postings list.
+    ///
+    /// This uses the same range-read strategy as [`Self::postings`]: small term
+    /// payloads stay on the single-read fast path, while large payloads are read
+    /// through the segment's block directory.
+    pub fn for_each_posting(
+        &mut self,
+        term_id: RawTermId,
+        visit: impl FnMut(DocId, u32),
+    ) -> Result<(), RawSegmentFileError> {
+        let Some(entry) = self.term_entry(term_id)? else {
+            return Ok(());
+        };
+        self.for_each_posting_in_entry(entry, visit)
+    }
+
+    /// Visit decoded postings and their document lengths for a term id.
+    ///
+    /// This is intended for out-of-core scorers such as BM25 that need document
+    /// lengths but should not materialize the full decoded postings list.
+    pub fn for_each_posting_with_document_len(
+        &mut self,
+        term_id: RawTermId,
+        visit: impl FnMut(DocId, u32, u32),
+    ) -> Result<(), RawSegmentFileError> {
+        let Some(entry) = self.term_entry(term_id)? else {
+            return Ok(());
+        };
+        self.for_each_posting_in_entry_with_document_len(entry, visit)
     }
 
     /// Return posting-block metadata for a term id.
@@ -1572,16 +1627,6 @@ impl RawSegmentFile {
         usize::try_from(offset).map_err(|_| Error::SegmentTooLarge)
     }
 
-    fn doc_entry_offset(&self, index: u32) -> Result<usize, Error> {
-        if index >= self.meta.doc_count {
-            return Err(Error::InvalidLayout {
-                reason: "doc entry index out of range",
-            });
-        }
-        let offset = index as u64 * DOC_ENTRY_LEN as u64;
-        usize::try_from(offset).map_err(|_| Error::SegmentTooLarge)
-    }
-
     fn read_postings_range(
         &mut self,
         offset: u64,
@@ -1678,6 +1723,95 @@ impl RawSegmentFile {
                     visit(doc_id, weight);
                 },
             )?;
+        }
+        if decoded != entry.df {
+            return Err(Error::InvalidLayout {
+                reason: "block directory posting count mismatch",
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    fn for_each_posting_in_entry_with_document_len(
+        &mut self,
+        entry: TermEntry,
+        mut visit: impl FnMut(DocId, u32, u32),
+    ) -> Result<(), RawSegmentFileError> {
+        if entry.postings_len as u64 > FILE_FULL_POSTINGS_READ_LIMIT {
+            return self.for_each_posting_in_entry_blocks_with_document_len(entry, visit);
+        }
+
+        let bytes = self.read_postings_range(entry.postings_offset, entry.postings_len as u64)?;
+        let postings = RawPostings {
+            term_id: entry.term_id,
+            bytes: &bytes,
+            remaining: entry.df,
+            consumed: 0,
+            prev_doc_id: 0,
+            index: 0,
+            failed: false,
+        };
+        for posting in postings {
+            let (doc_id, weight) = posting?;
+            let doc_len = document_len_in_doc_meta(&self.doc_meta, self.meta.doc_count, doc_id)?
+                .ok_or(Error::InvalidLayout {
+                    reason: "posting doc id has no document metadata",
+                })?;
+            visit(doc_id, weight, doc_len);
+        }
+        Ok(())
+    }
+
+    fn for_each_posting_in_entry_blocks_with_document_len(
+        &mut self,
+        entry: TermEntry,
+        mut visit: impl FnMut(DocId, u32, u32),
+    ) -> Result<(), RawSegmentFileError> {
+        let Some((_, block_directory)) = self.term_entry_with_blocks(entry.term_id)? else {
+            return Err(Error::InvalidLayout {
+                reason: "term block directory missing",
+            }
+            .into());
+        };
+        self.validate_block_directory(block_directory)?;
+        if entry.df != 0 && block_directory.block_count == 0 {
+            return Err(Error::InvalidLayout {
+                reason: "nonempty term has no posting blocks",
+            }
+            .into());
+        }
+
+        let mut decoded = 0u32;
+        for block_index in 0..block_directory.block_count {
+            let block = self.posting_block_at(entry, block_directory, block_index)?;
+            let bytes =
+                self.read_posting_block_range(block.postings_offset, block.postings_len as u64)?;
+            let mut lookup_error = None;
+            for_each_posting_in_block(
+                entry.term_id,
+                &bytes,
+                block.base_doc_id,
+                block.last_doc_id,
+                |doc_id, weight| {
+                    if lookup_error.is_some() {
+                        return;
+                    }
+                    decoded = decoded.saturating_add(1);
+                    match document_len_in_doc_meta(&self.doc_meta, self.meta.doc_count, doc_id) {
+                        Ok(Some(doc_len)) => visit(doc_id, weight, doc_len),
+                        Ok(None) => {
+                            lookup_error = Some(Error::InvalidLayout {
+                                reason: "posting doc id has no document metadata",
+                            });
+                        }
+                        Err(err) => lookup_error = Some(err),
+                    }
+                },
+            )?;
+            if let Some(err) = lookup_error {
+                return Err(err.into());
+            }
         }
         if decoded != entry.df {
             return Err(Error::InvalidLayout {
@@ -1800,6 +1934,34 @@ fn read_exact_at_positional_into(
 ) -> std::io::Result<()> {
     file.seek(SeekFrom::Start(offset))?;
     file.read_exact(bytes)
+}
+
+fn document_len_in_doc_meta(
+    doc_meta: &[u8],
+    doc_count: u32,
+    doc_id: DocId,
+) -> Result<Option<u32>, Error> {
+    let mut low = 0u32;
+    let mut high = doc_count;
+    while low < high {
+        let mid = low + ((high - low) / 2);
+        let offset =
+            (mid as u64)
+                .checked_mul(DOC_ENTRY_LEN as u64)
+                .ok_or(Error::InvalidLayout {
+                    reason: "doc entry offset overflows",
+                })?;
+        let offset = usize::try_from(offset).map_err(|_| Error::SegmentTooLarge)?;
+        let mid_doc_id = read_u32_at(doc_meta, offset, "doc metadata")?;
+        match mid_doc_id.cmp(&doc_id) {
+            std::cmp::Ordering::Less => low = mid + 1,
+            std::cmp::Ordering::Greater => high = mid,
+            std::cmp::Ordering::Equal => {
+                return Ok(Some(read_u32_at(doc_meta, offset + 4, "doc metadata")?));
+            }
+        }
+    }
+    Ok(None)
 }
 
 fn for_each_posting_in_block(
@@ -2614,6 +2776,18 @@ mod tests {
         assert_eq!(segment.max_weight(10).unwrap(), 4);
         assert_eq!(segment.term_ids().unwrap(), vec![10, 20, 30]);
         assert_eq!(collect_postings(&segment, 10), vec![(2, 1), (5, 4)]);
+        let mut visited = Vec::new();
+        segment
+            .for_each_posting(10, |doc_id, weight| visited.push((doc_id, weight)))
+            .unwrap();
+        assert_eq!(visited, vec![(2, 1), (5, 4)]);
+        let mut visited_with_lens = Vec::new();
+        segment
+            .for_each_posting_with_document_len(10, |doc_id, weight, doc_len| {
+                visited_with_lens.push((doc_id, weight, doc_len));
+            })
+            .unwrap();
+        assert_eq!(visited_with_lens, vec![(2, 1, 2), (5, 4, 6)]);
         assert_eq!(collect_postings(&segment, 20), vec![(5, 2), (9, 1)]);
         assert_eq!(
             segment.posting_blocks(10).unwrap(),
@@ -2740,6 +2914,18 @@ mod tests {
         assert_eq!(segment.max_weight(10).unwrap(), 4);
         assert_eq!(segment.term_ids().unwrap(), vec![10, 20]);
         assert_eq!(segment.postings(10).unwrap(), vec![(2, 1), (5, 4)]);
+        let mut visited = Vec::new();
+        segment
+            .for_each_posting(10, |doc_id, weight| visited.push((doc_id, weight)))
+            .unwrap();
+        assert_eq!(visited, vec![(2, 1), (5, 4)]);
+        let mut visited_with_lens = Vec::new();
+        segment
+            .for_each_posting_with_document_len(10, |doc_id, weight, doc_len| {
+                visited_with_lens.push((doc_id, weight, doc_len));
+            })
+            .unwrap();
+        assert_eq!(visited_with_lens, vec![(2, 1, 1), (5, 4, 6)]);
         assert!(segment.postings(999).unwrap().is_empty());
 
         let blocks = segment.posting_blocks(10).unwrap();

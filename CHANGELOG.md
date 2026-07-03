@@ -4,6 +4,11 @@
 
 ### Added
 
+- Added `RawSegment::for_each_posting`,
+  `RawSegment::for_each_posting_with_document_len`,
+  `RawSegmentFile::for_each_posting`, and
+  `RawSegmentFile::for_each_posting_with_document_len` for streaming raw
+  postings to scorers without materializing decoded posting lists.
 - Added `postings::raw::top_k_weighted_u32_files` for exact sparse
   inner-product top-k over multiple file-backed raw segments with globally
   unique document ids.
