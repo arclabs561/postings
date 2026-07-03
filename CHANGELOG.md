@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.2.5] - 2026-07-03
+
 ### Added
 
 - Added sorted-document raw segment writer APIs for callers that can provide
