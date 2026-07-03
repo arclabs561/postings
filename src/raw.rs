@@ -379,16 +379,6 @@ impl<'a> RawSegment<'a> {
                 "block directory",
             )?];
             verify_directory_checksums(term_dir, doc_meta, block_dir, integrity)?;
-            let checksums = block_checksum_list(block_dir, &integrity[INTEGRITY_HEADER_LEN..])?;
-            for checksum in &checksums {
-                let range = checked_range(
-                    checksum.offset,
-                    checksum.len as u64,
-                    bytes.len(),
-                    "postings",
-                )?;
-                verify_block_slice(&checksums, checksum.offset, &bytes[range])?;
-            }
         }
 
         Ok(Self { bytes, meta })
@@ -467,9 +457,11 @@ impl<'a> RawSegment<'a> {
             self.bytes.len(),
             "postings",
         )?;
+        let bytes = &self.bytes[range];
+        self.verify_entry_postings_bytes(entry, bytes)?;
         Ok(RawPostings {
             term_id,
-            bytes: &self.bytes[range],
+            bytes,
             remaining: entry.df,
             consumed: 0,
             prev_doc_id: 0,
@@ -554,9 +546,11 @@ impl<'a> RawSegment<'a> {
             self.bytes.len(),
             "postings",
         )?;
+        let bytes = &self.bytes[range];
+        self.verify_block_checksum(block_directory, block_index, block, bytes)?;
         Ok(RawPostingBlockPostings {
             term_id,
-            bytes: &self.bytes[range],
+            bytes,
             consumed: 0,
             base_doc_id: block.base_doc_id,
             last_doc_id: block.last_doc_id,
@@ -933,6 +927,100 @@ impl<'a> RawSegment<'a> {
         Ok(block)
     }
 
+    fn verify_entry_postings_bytes(&self, entry: TermEntry, bytes: &[u8]) -> Result<(), Error> {
+        if !self.meta.has_checksums() {
+            return Ok(());
+        }
+
+        let Some((_, block_directory)) = self.term_entry_with_blocks(entry.term_id)? else {
+            return Err(Error::InvalidLayout {
+                reason: "term block directory missing",
+            });
+        };
+        self.validate_block_directory(block_directory)?;
+        for block_index in 0..block_directory.block_count {
+            let block = self.posting_block_at(entry, block_directory, block_index)?;
+            let start = block
+                .postings_offset
+                .checked_sub(entry.postings_offset)
+                .ok_or(Error::InvalidLayout {
+                    reason: "block posting range is outside term postings",
+                })?;
+            let start = usize::try_from(start).map_err(|_| Error::SegmentTooLarge)?;
+            let len = usize::try_from(block.postings_len).map_err(|_| Error::SegmentTooLarge)?;
+            let end = start.checked_add(len).ok_or(Error::InvalidLayout {
+                reason: "block posting range overflows",
+            })?;
+            let block_bytes = bytes.get(start..end).ok_or(Error::InvalidLayout {
+                reason: "block posting range is outside term postings",
+            })?;
+            self.verify_block_checksum(block_directory, block_index, block, block_bytes)?;
+        }
+        Ok(())
+    }
+
+    fn verify_block_checksum(
+        &self,
+        block_directory: TermBlockDirectory,
+        block_index: u32,
+        block: RawPostingBlockMeta,
+        bytes: &[u8],
+    ) -> Result<(), Error> {
+        if !self.meta.has_checksums() {
+            return Ok(());
+        }
+        if block.postings_len as usize != bytes.len() {
+            return Err(Error::InvalidLayout {
+                reason: "posting block read does not match block bounds",
+            });
+        }
+        let global_index = self.global_block_index(block_directory, block_index)?;
+        let stored_crc = self.block_checksum_at(global_index)?;
+        if crc32fast::hash(bytes) != stored_crc {
+            return Err(Error::ChecksumMismatch {
+                section: "posting block",
+            });
+        }
+        Ok(())
+    }
+
+    fn global_block_index(
+        &self,
+        block_directory: TermBlockDirectory,
+        block_index: u32,
+    ) -> Result<u64, Error> {
+        let block_dir_start = doc_meta_end(self.meta)?;
+        let rel = block_directory
+            .blocks_offset
+            .checked_sub(block_dir_start)
+            .ok_or(Error::InvalidLayout {
+                reason: "block range is outside block directory section",
+            })?;
+        if rel % BLOCK_ENTRY_LEN as u64 != 0 {
+            return Err(Error::InvalidLayout {
+                reason: "block directory offset is not entry-aligned",
+            });
+        }
+        rel.checked_div(BLOCK_ENTRY_LEN as u64)
+            .and_then(|base| base.checked_add(block_index as u64))
+            .ok_or(Error::SegmentTooLarge)
+    }
+
+    fn block_checksum_at(&self, global_index: u64) -> Result<u32, Error> {
+        let (integrity_offset, block_count, _) = integrity_layout(self.meta)?;
+        if global_index >= block_count {
+            return Err(Error::InvalidLayout {
+                reason: "posting block has no checksum entry",
+            });
+        }
+        let offset = integrity_offset
+            .checked_add(INTEGRITY_HEADER_LEN as u64)
+            .and_then(|offset| offset.checked_add(global_index.checked_mul(4)?))
+            .ok_or(Error::SegmentTooLarge)?;
+        let offset = usize::try_from(offset).map_err(|_| Error::SegmentTooLarge)?;
+        read_u32_at(self.bytes, offset, "integrity")
+    }
+
     fn term_entry_offset(&self, index: u32) -> Result<usize, Error> {
         if index >= self.meta.term_count {
             return Err(Error::InvalidLayout {
@@ -1006,6 +1094,7 @@ impl<'a> RawSegment<'a> {
             "postings",
         )?;
         let bytes = &self.bytes[range];
+        self.verify_entry_postings_bytes(entry, bytes)?;
         let mut consumed = 0usize;
         let mut prev_doc_id: DocId = 0;
         for index in 0..entry.df {
@@ -1090,9 +1179,11 @@ impl<'a> RawSegment<'a> {
                 self.bytes.len(),
                 "postings",
             )?;
+            let bytes = &self.bytes[range];
+            self.verify_block_checksum(block_directory, block_index, block, bytes)?;
             for_each_posting_in_block(
                 entry.term_id,
-                &self.bytes[range],
+                bytes,
                 block.base_doc_id,
                 block.last_doc_id,
                 |doc_id, doc_weight| {
@@ -3727,18 +3818,20 @@ mod tests {
         let mut corrupt = clean.clone();
         corrupt[meta.postings_offset as usize] ^= 0xFF;
 
-        // Byte-backed verifies everything at open.
-        let err = RawSegment::open(&corrupt).unwrap_err();
+        // Posting payload checksums verify when the touched block is read; an
+        // untouched sibling block still reads.
+        let segment = RawSegment::open(&corrupt).unwrap();
+        let err = segment.postings(7).unwrap_err();
         assert_eq!(
             err,
             Error::ChecksumMismatch {
                 section: "posting block"
             }
         );
+        assert_eq!(collect_postings(&segment, 11), vec![(9, 2)]);
 
-        // File-backed opens fine (directories are intact) and fails only when
-        // the corrupted block is actually read; an untouched sibling block
-        // still reads.
+        // File-backed behavior matches: directories are intact, so open
+        // succeeds and the corrupted block fails on first read.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("corrupt.segment");
         std::fs::write(&path, &corrupt).unwrap();
@@ -4309,8 +4402,9 @@ mod tests {
         let entry = segment.term_entry(7).unwrap().unwrap();
         bytes[entry.postings_offset as usize] ^= 0x01;
 
+        let segment = RawSegment::open(&bytes).unwrap();
         assert_eq!(
-            RawSegment::open(&bytes).unwrap_err(),
+            segment.postings(7).unwrap_err(),
             Error::ChecksumMismatch {
                 section: "posting block"
             }

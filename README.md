@@ -88,6 +88,8 @@ Runnable examples live in [`examples/`](examples/):
 The `raw-segment` feature exposes `postings::raw`, a numeric-term segment format
 with a byte-backed reader and a file-backed reader. The file reader keeps the
 fixed directories in memory and range-reads posting payloads for the query terms.
+New raw files carry directory and posting-block checksums; legacy unchecked raw
+files remain readable.
 It is the path intended for large lexical and learned-sparse indexes whose
 posting payloads should not be rebuilt into a full `PostingsIndex` on every
 open.
@@ -109,7 +111,7 @@ sidecars or an application manifest when lifecycle guarantees are needed.
 - `sbits`: enable succinct monotone sequences (Elias-Fano) under `postings::codec::ef`.
 - `positional`: enable positional postings (`postings::positional::PositionalIndex`).
 - `cnk-compression`: enable optional compressed-candidate helpers under `postings::positional::cnk_candidates`.
-- `raw-segment`: enable the experimental byte- and file-backed raw segment reader.
+- `raw-segment`: enable the experimental checked byte- and file-backed raw segment reader.
 
 ## Optional: positional postings
 
