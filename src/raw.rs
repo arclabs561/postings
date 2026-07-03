@@ -882,23 +882,23 @@ impl<'a> RawSegment<'a> {
             return self.posting_doc_ids(entries[0]);
         }
 
-        let dense_slots = usize::try_from(self.meta.max_doc_id)
-            .ok()
-            .and_then(|max_doc_id| max_doc_id.checked_add(1))
-            .unwrap_or(usize::MAX);
         let dense_limit = crate::dense_scratch_limit(self.meta.doc_count as usize);
-        if dense_slots <= dense_limit {
+        let dense_range = self
+            .dense_doc_id_range()?
+            .filter(|(_, dense_slots)| *dense_slots <= dense_limit);
+        if let Some((dense_base, dense_slots)) = dense_range {
             let mut seen = vec![false; dense_slots];
             for entry in entries {
                 for posting in RawPostings::from_entry(self.bytes, entry)? {
                     let (doc_id, _) = posting?;
-                    seen[doc_id as usize] = true;
+                    let slot = dense_doc_slot(doc_id, dense_base, dense_slots);
+                    seen[slot] = true;
                 }
             }
             return Ok(seen
                 .into_iter()
                 .enumerate()
-                .filter_map(|(doc_id, hit)| hit.then_some(doc_id as DocId))
+                .filter_map(|(slot, hit)| hit.then_some(dense_base + slot as DocId))
                 .collect());
         }
 
@@ -987,12 +987,11 @@ impl<'a> RawSegment<'a> {
             return self.top_k_single_raw_term(entry, block_directory, query_weight, k);
         }
 
-        let dense_slots = usize::try_from(self.meta.max_doc_id)
-            .ok()
-            .and_then(|max_doc_id| max_doc_id.checked_add(1))
-            .unwrap_or(usize::MAX);
         let dense_limit = crate::dense_scratch_limit(self.meta.doc_count as usize);
-        if dense_slots <= dense_limit {
+        let dense_range = self
+            .dense_doc_id_range()?
+            .filter(|(_, dense_slots)| *dense_slots <= dense_limit);
+        if let Some((dense_base, dense_slots)) = dense_range {
             let mut scores = vec![0.0; dense_slots];
             let mut touched = Vec::with_capacity(total_postings.min(self.meta.doc_count as usize));
             let contributions_are_nonnegative = lists
@@ -1006,9 +1005,9 @@ impl<'a> RawSegment<'a> {
                         if contribution == 0.0 {
                             return;
                         }
-                        let slot = doc_id as usize;
+                        let slot = dense_doc_slot(doc_id, dense_base, dense_slots);
                         if scores[slot] == 0.0 {
-                            touched.push(doc_id);
+                            touched.push((doc_id, slot));
                         }
                         scores[slot] += contribution;
                     })?;
@@ -1021,10 +1020,10 @@ impl<'a> RawSegment<'a> {
                         if contribution == 0.0 {
                             return;
                         }
-                        let slot = doc_id as usize;
+                        let slot = dense_doc_slot(doc_id, dense_base, dense_slots);
                         if !seen[slot] {
                             seen[slot] = true;
-                            touched.push(doc_id);
+                            touched.push((doc_id, slot));
                         }
                         scores[slot] += contribution;
                     })?;
@@ -1034,7 +1033,7 @@ impl<'a> RawSegment<'a> {
             return Ok(crate::top_k_scored_docs(
                 touched
                     .into_iter()
-                    .map(|doc_id| (doc_id, scores[doc_id as usize])),
+                    .map(|(doc_id, slot)| (doc_id, scores[slot])),
                 k,
             ));
         }
@@ -1325,6 +1324,14 @@ impl<'a> RawSegment<'a> {
             "doc metadata",
         )?;
         Ok(&self.bytes[range])
+    }
+
+    fn dense_doc_id_range(&self) -> Result<Option<(DocId, usize)>, Error> {
+        dense_doc_id_range_in_doc_meta(
+            self.doc_meta_bytes()?,
+            self.meta.doc_count,
+            self.meta.max_doc_id,
+        )
     }
 
     fn posting_doc_ids(&self, entry: TermEntry) -> Result<Vec<DocId>, Error> {
@@ -1836,22 +1843,22 @@ impl RawSegmentFile {
             return self.posting_doc_ids(entries[0]);
         }
 
-        let dense_slots = usize::try_from(self.meta.max_doc_id)
-            .ok()
-            .and_then(|max_doc_id| max_doc_id.checked_add(1))
-            .unwrap_or(usize::MAX);
         let dense_limit = crate::dense_scratch_limit(self.meta.doc_count as usize);
-        if dense_slots <= dense_limit {
+        let dense_range = self
+            .dense_doc_id_range()?
+            .filter(|(_, dense_slots)| *dense_slots <= dense_limit);
+        if let Some((dense_base, dense_slots)) = dense_range {
             let mut seen = vec![false; dense_slots];
             for entry in entries {
                 self.for_each_posting_in_entry(entry, |doc_id, _| {
-                    seen[doc_id as usize] = true;
+                    let slot = dense_doc_slot(doc_id, dense_base, dense_slots);
+                    seen[slot] = true;
                 })?;
             }
             return Ok(seen
                 .into_iter()
                 .enumerate()
-                .filter_map(|(doc_id, hit)| hit.then_some(doc_id as DocId))
+                .filter_map(|(slot, hit)| hit.then_some(dense_base + slot as DocId))
                 .collect());
         }
 
@@ -1945,26 +1952,19 @@ impl RawSegmentFile {
             return self.top_k_single_raw_term(entry, block_directory, query_weight, k);
         }
 
-        let dense_slots = usize::try_from(self.meta.max_doc_id)
-            .ok()
-            .and_then(|max_doc_id| max_doc_id.checked_add(1))
-            .unwrap_or(usize::MAX);
         let dense_limit = crate::dense_scratch_limit(self.meta.doc_count as usize);
+        let dense_range = self
+            .dense_doc_id_range()?
+            .filter(|(_, dense_slots)| *dense_slots <= dense_limit);
         if has_large_blocked_list
             && lists
                 .iter()
                 .all(|(_, _, query_weight)| *query_weight >= 0.0 && query_weight.is_finite())
         {
-            return self.top_k_weighted_u32_pruned_blocks(
-                lists,
-                total_postings,
-                dense_slots,
-                dense_limit,
-                k,
-            );
+            return self.top_k_weighted_u32_pruned_blocks(lists, total_postings, dense_range, k);
         }
 
-        if dense_slots <= dense_limit {
+        if let Some((dense_base, dense_slots)) = dense_range {
             let mut scores = vec![0.0; dense_slots];
             let mut touched = Vec::with_capacity(total_postings.min(self.meta.doc_count as usize));
             let contributions_are_nonnegative = lists
@@ -1978,9 +1978,9 @@ impl RawSegmentFile {
                         if contribution == 0.0 {
                             return;
                         }
-                        let slot = doc_id as usize;
+                        let slot = dense_doc_slot(doc_id, dense_base, dense_slots);
                         if scores[slot] == 0.0 {
-                            touched.push(doc_id);
+                            touched.push((doc_id, slot));
                         }
                         scores[slot] += contribution;
                     })?;
@@ -1993,10 +1993,10 @@ impl RawSegmentFile {
                         if contribution == 0.0 {
                             return;
                         }
-                        let slot = doc_id as usize;
+                        let slot = dense_doc_slot(doc_id, dense_base, dense_slots);
                         if !seen[slot] {
                             seen[slot] = true;
-                            touched.push(doc_id);
+                            touched.push((doc_id, slot));
                         }
                         scores[slot] += contribution;
                     })?;
@@ -2006,7 +2006,7 @@ impl RawSegmentFile {
             return Ok(crate::top_k_scored_docs(
                 touched
                     .into_iter()
-                    .map(|doc_id| (doc_id, scores[doc_id as usize])),
+                    .map(|(doc_id, slot)| (doc_id, scores[slot])),
                 k,
             ));
         }
@@ -2029,15 +2029,15 @@ impl RawSegmentFile {
         &mut self,
         lists: Vec<(TermEntry, TermBlockDirectory, f32)>,
         total_postings: usize,
-        dense_slots: usize,
-        dense_limit: usize,
+        dense_range: Option<(DocId, usize)>,
         k: usize,
     ) -> Result<Vec<(DocId, f32)>, RawSegmentFileError> {
         let scoring_lists = self.prepare_raw_block_scoring_lists(lists)?;
-        if dense_slots <= dense_limit {
+        if let Some((dense_base, dense_slots)) = dense_range {
             return self.top_k_weighted_u32_pruned_blocks_dense(
                 &scoring_lists,
                 total_postings,
+                dense_base,
                 dense_slots,
                 k,
             );
@@ -2084,6 +2084,7 @@ impl RawSegmentFile {
         &mut self,
         lists: &[RawBlockScoringList],
         total_postings: usize,
+        dense_base: DocId,
         dense_slots: usize,
         k: usize,
     ) -> Result<Vec<(DocId, f32)>, RawSegmentFileError> {
@@ -2111,9 +2112,9 @@ impl RawSegmentFile {
                         if contribution == 0.0 {
                             return;
                         }
-                        let slot = doc_id as usize;
+                        let slot = dense_doc_slot(doc_id, dense_base, dense_slots);
                         if scores[slot] == 0.0 {
-                            touched.push(doc_id);
+                            touched.push((doc_id, slot));
                         }
                         scores[slot] += contribution;
                         threshold.update(doc_id, scores[slot]);
@@ -2125,7 +2126,7 @@ impl RawSegmentFile {
         Ok(crate::top_k_scored_docs(
             touched
                 .into_iter()
-                .map(|doc_id| (doc_id, scores[doc_id as usize])),
+                .map(|(doc_id, slot)| (doc_id, scores[slot])),
             k,
         ))
     }
@@ -2408,6 +2409,10 @@ impl RawSegmentFile {
             return Ok(None);
         };
         Ok(Some(checksums.get(&self.block_dir)?))
+    }
+
+    fn dense_doc_id_range(&self) -> Result<Option<(DocId, usize)>, Error> {
+        dense_doc_id_range_in_doc_meta(&self.doc_meta, self.meta.doc_count, self.meta.max_doc_id)
     }
 
     fn posting_doc_ids(&mut self, entry: TermEntry) -> Result<Vec<DocId>, RawSegmentFileError> {
@@ -2919,6 +2924,35 @@ fn document_len_in_doc_meta(
         }
     }
     Ok(None)
+}
+
+fn dense_doc_id_range_in_doc_meta(
+    doc_meta: &[u8],
+    doc_count: u32,
+    max_doc_id: DocId,
+) -> Result<Option<(DocId, usize)>, Error> {
+    if doc_count == 0 {
+        return Ok(None);
+    }
+
+    let min_doc_id = read_u32_at(doc_meta, 0, "doc metadata")?;
+    let span = max_doc_id
+        .checked_sub(min_doc_id)
+        .ok_or(Error::InvalidLayout {
+            reason: "max doc id precedes first document metadata",
+        })?;
+    let dense_slots = usize::try_from(span)
+        .ok()
+        .and_then(|span| span.checked_add(1))
+        .ok_or(Error::SegmentTooLarge)?;
+    Ok(Some((min_doc_id, dense_slots)))
+}
+
+#[inline]
+fn dense_doc_slot(doc_id: DocId, dense_base: DocId, dense_slots: usize) -> usize {
+    let slot = doc_id.wrapping_sub(dense_base) as usize;
+    debug_assert!(slot < dense_slots);
+    slot
 }
 
 fn for_each_document_len_in_doc_meta(
@@ -5906,21 +5940,11 @@ mod tests {
             total_postings = total_postings.saturating_add(entry.df as usize);
             lists.push((entry, block_directory, query_weight));
         }
-        let dense_slots = usize::try_from(file_segment.meta.max_doc_id)
-            .ok()
-            .and_then(|max_doc_id| max_doc_id.checked_add(1))
-            .unwrap_or(usize::MAX);
-        let dense_limit = crate::dense_scratch_limit(file_segment.meta.doc_count as usize);
+        let dense_range = file_segment.dense_doc_id_range().unwrap();
 
         assert_eq!(
             file_segment
-                .top_k_weighted_u32_pruned_blocks(
-                    lists,
-                    total_postings,
-                    dense_slots,
-                    dense_limit,
-                    k
-                )
+                .top_k_weighted_u32_pruned_blocks(lists, total_postings, dense_range, k)
                 .unwrap(),
             expected
         );
@@ -5994,21 +6018,11 @@ mod tests {
             "the term-10 second block needs the overlapping term-20 max"
         );
 
-        let dense_slots = usize::try_from(file_segment.meta.max_doc_id)
-            .ok()
-            .and_then(|max_doc_id| max_doc_id.checked_add(1))
-            .unwrap_or(usize::MAX);
-        let dense_limit = crate::dense_scratch_limit(file_segment.meta.doc_count as usize);
+        let dense_range = file_segment.dense_doc_id_range().unwrap();
 
         assert_eq!(
             file_segment
-                .top_k_weighted_u32_pruned_blocks(
-                    lists,
-                    total_postings,
-                    dense_slots,
-                    dense_limit,
-                    k
-                )
+                .top_k_weighted_u32_pruned_blocks(lists, total_postings, dense_range, k)
                 .unwrap(),
             expected
         );
@@ -6064,6 +6078,43 @@ mod tests {
         assert_eq!(
             top_k_weighted_u32_files(&mut segments, &query, 4).unwrap(),
             idx.top_k_weighted(&memory_query, 4)
+        );
+    }
+
+    #[test]
+    fn raw_segment_dense_scoring_offsets_segment_doc_id_range() {
+        let docs = [
+            RawDocument::new(10_000, &[(10, 2), (20, 1)]),
+            RawDocument::new(10_002, &[(20, 5)]),
+            RawDocument::new(10_003, &[(10, 1)]),
+        ];
+        let bytes = write_u64_u32_segment(&docs).unwrap();
+        let segment = RawSegment::open(&bytes).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("high-base.raw");
+        std::fs::write(&path, &bytes).unwrap();
+        let mut file_segment = RawSegmentFile::open(&path).unwrap();
+
+        assert_eq!(segment.dense_doc_id_range().unwrap(), Some((10_000, 4)));
+        assert_eq!(
+            file_segment.dense_doc_id_range().unwrap(),
+            Some((10_000, 4))
+        );
+        assert_eq!(
+            segment.candidates_any_terms(&[10, 20]).unwrap(),
+            vec![10_000, 10_002, 10_003]
+        );
+        assert_eq!(
+            file_segment.candidates_any_terms(&[10, 20]).unwrap(),
+            vec![10_000, 10_002, 10_003]
+        );
+
+        let query = [(10, 1.0), (20, 1.0)];
+        let expected = vec![(10_002, 5.0), (10_000, 3.0), (10_003, 1.0)];
+        assert_eq!(segment.top_k_weighted_u32(&query, 3).unwrap(), expected);
+        assert_eq!(
+            file_segment.top_k_weighted_u32(&query, 3).unwrap(),
+            expected
         );
     }
 

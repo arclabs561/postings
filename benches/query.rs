@@ -555,6 +555,14 @@ fn bench_raw_segment_queries(c: &mut Criterion) {
         std::fs::write(&path, raw_segment_bytes_from_docs(chunk, start_doc_id)).unwrap();
         multi_file_segments.push(RawSegmentFile::open(path).unwrap());
     }
+    let chunk_size_64 = N_DOCS.div_ceil(64);
+    let mut multi_file_segments_64 = Vec::new();
+    for (chunk_index, chunk) in weighted_docs.chunks(chunk_size_64).enumerate() {
+        let start_doc_id = (chunk_index * chunk_size_64) as u32;
+        let path = raw_dir.path().join(format!("numeric-64-{chunk_index}.raw"));
+        std::fs::write(&path, raw_segment_bytes_from_docs(chunk, start_doc_id)).unwrap();
+        multi_file_segments_64.push(RawSegmentFile::open(path).unwrap());
+    }
     let mut group = c.benchmark_group("raw_segment");
 
     group.bench_function("write_10k_vec", |b| {
@@ -880,6 +888,20 @@ fn bench_raw_segment_queries(c: &mut Criterion) {
 
     group.bench_function("file_top_k_weighted_5_multi_4", |b| {
         let mut segments: Vec<_> = multi_file_segments.iter_mut().collect();
+        b.iter(|| {
+            black_box(
+                top_k_weighted_u32_files(
+                    black_box(segments.as_mut_slice()),
+                    black_box(weighted_terms.as_slice()),
+                    black_box(10),
+                )
+                .unwrap(),
+            );
+        });
+    });
+
+    group.bench_function("file_top_k_weighted_5_multi_64", |b| {
+        let mut segments: Vec<_> = multi_file_segments_64.iter_mut().collect();
         b.iter(|| {
             black_box(
                 top_k_weighted_u32_files(

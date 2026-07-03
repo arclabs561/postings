@@ -9,9 +9,13 @@
   avoiding the encoder's doc-to-term transposition.
 - Added a seekable term-major raw segment writer for local-file style sinks that
   can reserve directories, stream posting blocks once, then backpatch metadata.
+- Added a raw-segment multi-file top-k benchmark for many small segment files.
 
 ### Changed
 
+- Changed raw-segment dense candidate and top-k scratch buffers to use the
+  segment's document-id span instead of allocating from zero to the maximum
+  document id.
 - Changed the term-major raw segment sink writer to stream encoded posting
   blocks instead of buffering the full postings payload before writing.
 
