@@ -6,6 +6,8 @@
 
 - Added `top_k_weighted_u32_files_with_stats` for raw multi-file sparse top-k
   segment-pruning diagnostics.
+- Added borrowed-term positional query helpers:
+  `PosingsIndex::phrase_match_strs` and `near_match_terms_strs`.
 
 ### Changed
 

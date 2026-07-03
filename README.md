@@ -125,8 +125,9 @@ postings = { version = "0.2", features = ["positional"] }
 ```
 
 Then use `postings::positional::PositionalIndex` for phrase/proximity
-evaluation. `PosingsIndex` remains as the historical name from the older
-`posings` crate.
+evaluation. `phrase_match_strs` and `near_match_terms_strs` accept borrowed
+query terms when a parser already holds `&str`s. `PosingsIndex` remains as the
+historical name from the older `posings` crate.
 
 ## Development
 

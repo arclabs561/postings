@@ -304,17 +304,30 @@ impl PosingsIndex {
     ///
     /// Requires positional postings. Complexity depends on term frequencies.
     pub fn phrase_match(&self, phrase: &[String]) -> Vec<DocId> {
+        let phrase: Vec<&str> = phrase.iter().map(String::as_str).collect();
+        self.phrase_match_refs(&phrase)
+    }
+
+    /// Exact phrase match over borrowed term strings.
+    ///
+    /// This avoids requiring callers to allocate `String` values for query terms
+    /// they already hold as borrowed text.
+    pub fn phrase_match_strs(&self, phrase: &[&str]) -> Vec<DocId> {
+        self.phrase_match_refs(phrase)
+    }
+
+    fn phrase_match_refs(&self, phrase: &[&str]) -> Vec<DocId> {
         if phrase.is_empty() {
             return Vec::new();
         }
         if phrase.len() == 1 {
-            let t0 = &phrase[0];
+            let t0 = phrase[0];
             let mut docs: Vec<DocId> = self.docs_with_term(t0).collect();
             docs.sort_unstable();
             return docs;
         }
         if let [a, b, c] = phrase {
-            let terms = [a.as_str(), b.as_str(), c.as_str()];
+            let terms = [*a, *b, *c];
             if terms[0] != terms[1] && terms[0] != terms[2] && terms[1] != terms[2] {
                 return self.phrase_match_three_unique(terms);
             }
@@ -322,8 +335,8 @@ impl PosingsIndex {
 
         // Prefilter docs to those that contain all required terms (including multiplicity).
         let mut required: HashMap<&str, usize> = HashMap::new();
-        for t in phrase {
-            *required.entry(t.as_str()).or_insert(0) += 1;
+        for &t in phrase {
+            *required.entry(t).or_insert(0) += 1;
         }
         let candidates = self.candidates_all_terms(&required);
 
@@ -333,7 +346,7 @@ impl PosingsIndex {
         'doc: for doc_id in candidates {
             let mut anchor_i = 0usize;
             let mut anchor_positions: &[TokenPos] = &[];
-            for (i, term) in phrase.iter().enumerate() {
+            for (i, &term) in phrase.iter().enumerate() {
                 let ps = self.positions(term, doc_id);
                 if ps.is_empty() {
                     continue 'doc;
@@ -348,7 +361,7 @@ impl PosingsIndex {
                 let Some(start) = anchor_pos.checked_sub(anchor_i as u32) else {
                     continue;
                 };
-                for (i, term) in phrase.iter().enumerate() {
+                for (i, &term) in phrase.iter().enumerate() {
                     if i == anchor_i {
                         continue;
                     }
@@ -509,11 +522,24 @@ impl PosingsIndex {
     ///
     /// Supports duplicate terms by requiring multiple occurrences.
     pub fn near_match_terms(&self, terms: &[String], window: u32, ordered: bool) -> Vec<DocId> {
+        let terms: Vec<&str> = terms.iter().map(String::as_str).collect();
+        self.near_match_term_refs(&terms, window, ordered)
+    }
+
+    /// Multi-term proximity over borrowed term strings.
+    ///
+    /// This avoids requiring callers to allocate `String` values for query terms
+    /// they already hold as borrowed text.
+    pub fn near_match_terms_strs(&self, terms: &[&str], window: u32, ordered: bool) -> Vec<DocId> {
+        self.near_match_term_refs(terms, window, ordered)
+    }
+
+    fn near_match_term_refs(&self, terms: &[&str], window: u32, ordered: bool) -> Vec<DocId> {
         if terms.len() < 2 || window == 0 {
             return Vec::new();
         }
         if let [a, b, c] = terms {
-            let terms = [a.as_str(), b.as_str(), c.as_str()];
+            let terms = [*a, *b, *c];
             if terms[0] != terms[1] && terms[0] != terms[2] && terms[1] != terms[2] {
                 return if ordered {
                     self.near_match_three_unique::<true>(terms, window)
@@ -525,8 +551,8 @@ impl PosingsIndex {
 
         // Multiplicity requirements for duplicates.
         let mut required: HashMap<&str, usize> = HashMap::new();
-        for t in terms {
-            *required.entry(t.as_str()).or_insert(0) += 1;
+        for &t in terms {
+            *required.entry(t).or_insert(0) += 1;
         }
 
         let candidates = self.candidates_all_terms(&required);
@@ -717,15 +743,15 @@ fn near_doc_unordered(
     false
 }
 
-fn near_doc_ordered(ix: &PosingsIndex, doc_id: DocId, terms: &[String], window: u32) -> bool {
-    let first = terms[0].as_str();
+fn near_doc_ordered(ix: &PosingsIndex, doc_id: DocId, terms: &[&str], window: u32) -> bool {
+    let first = terms[0];
     let p0 = ix.positions(first, doc_id);
     if p0.is_empty() {
         return false;
     }
     'start: for &start in p0 {
         let mut prev = start;
-        for t in terms.iter().skip(1) {
+        for &t in terms.iter().skip(1) {
             let ps = ix.positions(t, doc_id);
             if ps.is_empty() {
                 continue 'start;
@@ -764,6 +790,18 @@ mod tests {
             .unwrap();
 
         let hits = ix.phrase_match(&["new".into(), "york".into()]);
+        assert_eq!(hits, vec![1]);
+    }
+
+    #[test]
+    fn phrase_match_accepts_borrowed_terms() {
+        let mut ix = PosingsIndex::new();
+        ix.add_document(1, &["new".into(), "york".into(), "city".into()])
+            .unwrap();
+        ix.add_document(2, &["new".into(), "jersey".into(), "york".into()])
+            .unwrap();
+
+        let hits = ix.phrase_match_strs(&["new", "york"]);
         assert_eq!(hits, vec![1]);
     }
 
@@ -848,6 +886,24 @@ mod tests {
         .unwrap();
 
         let hits = ix.near_match_terms(&["a".into(), "b".into(), "c".into()], 4, false);
+        assert_eq!(hits, vec![1]);
+    }
+
+    #[test]
+    fn near_match_terms_accepts_borrowed_terms() {
+        let mut ix = PosingsIndex::new();
+        ix.add_document(
+            1,
+            &["a".into(), "x".into(), "b".into(), "y".into(), "c".into()],
+        )
+        .unwrap();
+        ix.add_document(
+            2,
+            &["a".into(), "x".into(), "b".into(), "y".into(), "z".into()],
+        )
+        .unwrap();
+
+        let hits = ix.near_match_terms_strs(&["a", "b", "c"], 4, false);
         assert_eq!(hits, vec![1]);
     }
 
