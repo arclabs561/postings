@@ -2750,6 +2750,66 @@ mod tests {
     }
 
     #[test]
+    fn block_max_pruning_skips_a_block_and_matches_brute_force() {
+        // Oracle test for the block-skip at top_k_single_raw_term: block 0
+        // (128 entries, weights ~100) fills the top-k, then block 1's max
+        // (weight 3) falls below the threshold and the block is skipped.
+        // The result must still equal an unpruned brute force over the raw
+        // postings; the skip precondition is asserted explicitly so the test
+        // stays pinned to the pruning regime if constants drift.
+        let term: RawTermId = 7;
+        let query_weight = 1.5f32;
+        let k = 10usize;
+
+        let weighted: Vec<Vec<(RawTermId, u32)>> = (0..200u32)
+            .map(|doc_id| {
+                let weight = if doc_id < DEFAULT_BLOCK_SIZE {
+                    100 + (doc_id % 17)
+                } else {
+                    1 + (doc_id % 3)
+                };
+                vec![(term, weight)]
+            })
+            .collect();
+        let docs: Vec<_> = weighted
+            .iter()
+            .enumerate()
+            .map(|(doc_id, terms)| RawDocument::new(doc_id as DocId, terms))
+            .collect();
+        let bytes = write_u64_u32_segment(&docs).unwrap();
+        let segment = RawSegment::open(&bytes).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raw.segment");
+        std::fs::write(&path, &bytes).unwrap();
+        let mut file_segment = RawSegmentFile::open(&path).unwrap();
+
+        // Brute-force oracle from the raw postings, not the pruned scorer.
+        let mut expected: Vec<(DocId, f32)> = collect_postings(&segment, term)
+            .into_iter()
+            .map(|(doc_id, weight)| (doc_id, query_weight * weight as f32))
+            .collect();
+        expected.sort_by(crate::cmp_doc_scores);
+        expected.truncate(k);
+
+        // Skip precondition: two blocks, and block 1's bounded contribution
+        // cannot beat the k-th best score from block 0.
+        let blocks = segment.posting_blocks(term).unwrap();
+        assert_eq!(blocks.len(), 2, "test corpus must span two blocks");
+        let threshold = expected.last().unwrap().1;
+        assert!(
+            query_weight * (blocks[1].max_weight() as f32) < threshold,
+            "block 1 must be prunable for this test to exercise the skip"
+        );
+
+        let query = [(term, query_weight)];
+        assert_eq!(segment.top_k_weighted_u32(&query, k).unwrap(), expected);
+        assert_eq!(
+            file_segment.top_k_weighted_u32(&query, k).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
     fn raw_segment_files_top_k_weighted_matches_in_memory_index() {
         let first = [
             (1, vec![(10, 3), (20, 1)]),
