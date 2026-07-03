@@ -77,6 +77,19 @@ Runnable examples live in [`examples/`](examples/):
 
 - `durable_roundtrip` pairs `postings` with `durability` to build a crash-recoverable inverted index: update events go to a record log, snapshots to a checkpoint, and the index rebuilds from both, the persistence pattern a search engine needs to survive restarts.
 
+## File-backed segments
+
+The `raw-segment` feature exposes `postings::raw`, a numeric-term segment format
+with a byte-backed reader and a file-backed reader. The file reader keeps the
+fixed directories in memory and range-reads posting payloads for the query terms.
+It is the path intended for large lexical and learned-sparse indexes whose
+posting payloads should not be rebuilt into a full `PostingsIndex` on every
+open.
+
+This is not a full index lifecycle by itself: callers still own term-id mapping,
+commit publication, deletes, and compaction. Pair it with `segstore` sidecars or
+a higher-level search crate when those lifecycle guarantees are needed.
+
 ## Features
 
 - `postings/serde`: enable serde for the in-memory structures.
