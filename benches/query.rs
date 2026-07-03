@@ -8,7 +8,8 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use postings::positional::PosingsIndex;
 #[cfg(feature = "raw-segment")]
 use postings::raw::{
-    top_k_weighted_u32_files, write_u64_u32_segment, RawDocument, RawSegment, RawSegmentFile,
+    top_k_weighted_u32_files, write_u64_u32_segment, write_u64_u32_segment_to, RawDocument,
+    RawSegment, RawSegmentFile,
 };
 use postings::{CandidatePlan, PlannerConfig, PostingsIndex};
 
@@ -502,6 +503,13 @@ fn bench_delete(c: &mut Criterion) {
 fn bench_raw_segment_queries(c: &mut Criterion) {
     let (idx, weighted_docs, bytes) = build_raw_numeric_fixture();
     let segment = RawSegment::open(&bytes).unwrap();
+    let writer_docs: Vec<_> = weighted_docs
+        .iter()
+        .take(10_000)
+        .enumerate()
+        .map(|(doc_id, terms)| RawDocument::new(doc_id as u32, terms))
+        .collect();
+    let writer_segment_len = write_u64_u32_segment(&writer_docs).unwrap().len();
     let raw_dir = tempfile::tempdir().unwrap();
     let raw_path = raw_dir.path().join("numeric.raw");
     std::fs::write(&raw_path, &bytes).unwrap();
@@ -526,6 +534,34 @@ fn bench_raw_segment_queries(c: &mut Criterion) {
         multi_file_segments.push(RawSegmentFile::open(path).unwrap());
     }
     let mut group = c.benchmark_group("raw_segment");
+
+    group.bench_function("write_10k_vec", |b| {
+        b.iter(|| {
+            black_box(
+                write_u64_u32_segment(black_box(&writer_docs))
+                    .unwrap()
+                    .len(),
+            );
+        });
+    });
+
+    group.bench_function("write_10k_sink_vec", |b| {
+        b.iter_batched(
+            || Vec::with_capacity(writer_segment_len),
+            |mut out| {
+                write_u64_u32_segment_to(black_box(&writer_docs), &mut out).unwrap();
+                black_box(out.len());
+            },
+            criterion::BatchSize::SmallInput,
+        );
+    });
+
+    group.bench_function("write_10k_sink_discard", |b| {
+        b.iter(|| {
+            let mut out = std::io::sink();
+            write_u64_u32_segment_to(black_box(&writer_docs), &mut out).unwrap();
+        });
+    });
 
     group.bench_function("open", |b| {
         b.iter(|| {
