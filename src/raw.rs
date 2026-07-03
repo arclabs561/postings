@@ -101,6 +101,12 @@ pub enum Error {
         /// Duplicate document id.
         doc_id: DocId,
     },
+    /// Two term posting lists in the input used the same term id.
+    #[error("duplicate raw segment term id: {term_id}")]
+    DuplicateTermId {
+        /// Duplicate term id.
+        term_id: RawTermId,
+    },
     /// A sorted raw segment writer received a smaller document id after a
     /// larger one.
     #[error("raw segment doc ids must be increasing: previous {previous}, current {current}")]
@@ -109,6 +115,30 @@ pub enum Error {
         previous: DocId,
         /// Current document id that violated the ordering requirement.
         current: DocId,
+    },
+    /// A term-major raw segment writer received a smaller term id after a
+    /// larger one.
+    #[error("raw segment term ids must be increasing: previous {previous}, current {current}")]
+    UnsortedTermId {
+        /// Previous term id in the input stream.
+        previous: RawTermId,
+        /// Current term id that violated the ordering requirement.
+        current: RawTermId,
+    },
+    /// A term-major raw segment writer received a term with no postings.
+    #[error("empty raw segment posting list for term {term_id}")]
+    EmptyPostingList {
+        /// Term with no postings.
+        term_id: RawTermId,
+    },
+    /// A term-major raw segment writer received a posting for a document id
+    /// missing from the document-length table.
+    #[error("raw segment posting references unknown doc {doc_id} for term {term_id}")]
+    UnknownDocId {
+        /// Term containing the unknown document id.
+        term_id: RawTermId,
+        /// Posting document id missing from document metadata.
+        doc_id: DocId,
     },
     /// A raw posting used a zero term weight.
     #[error("zero raw segment weight for doc {doc_id}, term {term_id}")]
@@ -252,6 +282,34 @@ impl<'a> RawDocument<'a> {
     }
 }
 
+/// A term-major posting list accepted by the raw segment writer.
+///
+/// Term ids must be strictly increasing across lists. Posting document ids must
+/// be strictly increasing within a list and must exist in the document-length
+/// table supplied to the term-major writer.
+#[derive(Debug, Clone, Copy)]
+pub struct RawTermPostingList<'a> {
+    term_id: RawTermId,
+    postings: &'a [(DocId, u32)],
+}
+
+impl<'a> RawTermPostingList<'a> {
+    /// Create a raw term posting-list view.
+    pub fn new(term_id: RawTermId, postings: &'a [(DocId, u32)]) -> Self {
+        Self { term_id, postings }
+    }
+
+    /// Return the raw term id.
+    pub fn term_id(self) -> RawTermId {
+        self.term_id
+    }
+
+    /// Return the raw `(doc_id, weight)` postings.
+    pub fn postings(self) -> &'a [(DocId, u32)] {
+        self.postings
+    }
+}
+
 /// Header metadata for a raw segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RawSegmentMeta {
@@ -328,7 +386,7 @@ struct RawSegmentSections {
     meta: RawSegmentMeta,
     term_entries: Vec<TermEntry>,
     term_block_directories: Vec<TermBlockDirectory>,
-    doc_entries: Vec<(DocId, u32)>,
+    doc_entries: RawDocumentEntries,
     block_entries: Vec<RawPostingBlockMeta>,
     postings_bytes: Vec<u8>,
     block_crcs: Vec<u32>,
@@ -336,6 +394,7 @@ struct RawSegmentSections {
 }
 
 type RawDocumentMap = BTreeMap<DocId, (u32, BTreeMap<RawTermId, u32>)>;
+type RawDocumentEntries = Vec<(DocId, u32)>;
 
 struct RawBlockScoringList {
     entry: TermEntry,
@@ -3297,6 +3356,22 @@ where
     Ok(raw_segment_sections_to_vec(&sections))
 }
 
+/// Encode sorted document metadata and term-major posting lists into the first
+/// raw `u64` term, `u32` weight segment format.
+///
+/// This is the lowest-level raw writer. It is intended for external sort or
+/// spill/merge pipelines that already have term-major postings. Document ids in
+/// `document_lengths` must be strictly increasing. Term ids in `terms` must be
+/// strictly increasing, and each posting list's document ids must be strictly
+/// increasing and present in `document_lengths`.
+pub fn write_u64_u32_segment_from_term_postings(
+    document_lengths: &[(DocId, u32)],
+    terms: &[RawTermPostingList<'_>],
+) -> Result<Vec<u8>, Error> {
+    let sections = build_u64_u32_segment_sections_from_term_postings(document_lengths, terms)?;
+    Ok(raw_segment_sections_to_vec(&sections))
+}
+
 fn raw_segment_sections_to_vec(sections: &RawSegmentSections) -> Vec<u8> {
     let mut out = Vec::with_capacity(sections.final_len);
     put_header(&mut out, sections.meta);
@@ -3371,6 +3446,24 @@ where
     Ok(())
 }
 
+/// Encode sorted document metadata and term-major posting lists into a
+/// caller-provided raw segment writer.
+///
+/// This only emits segment bytes. Callers still own the file path, atomic
+/// publication, fsync policy, manifest update, deletes, and compaction.
+/// Compared with document-major writers, this avoids the encoder's
+/// whole-corpus document map and term transposition when the caller can provide
+/// already-sorted posting lists.
+pub fn write_u64_u32_segment_from_term_postings_to<W: Write + ?Sized>(
+    document_lengths: &[(DocId, u32)],
+    terms: &[RawTermPostingList<'_>],
+    writer: &mut W,
+) -> Result<(), RawSegmentWriteError> {
+    let sections = build_u64_u32_segment_sections_from_term_postings(document_lengths, terms)?;
+    write_raw_segment_sections_to(&sections, writer)?;
+    Ok(())
+}
+
 fn build_u64_u32_segment_sections(
     documents: &[RawDocument<'_>],
 ) -> Result<RawSegmentSections, Error> {
@@ -3431,6 +3524,103 @@ where
         total_doc_len,
         previous_doc_id.unwrap_or(0),
     )
+}
+
+fn build_u64_u32_segment_sections_from_term_postings(
+    document_lengths: &[(DocId, u32)],
+    terms: &[RawTermPostingList<'_>],
+) -> Result<RawSegmentSections, Error> {
+    let (doc_entries, total_doc_len, max_doc_id) = validate_raw_document_lengths(document_lengths)?;
+    validate_raw_term_posting_lists(&doc_entries, terms)?;
+    build_u64_u32_segment_sections_from_posting_lists(terms, doc_entries, total_doc_len, max_doc_id)
+}
+
+fn validate_raw_document_lengths(
+    document_lengths: &[(DocId, u32)],
+) -> Result<(RawDocumentEntries, u64, DocId), Error> {
+    let mut doc_entries = Vec::with_capacity(document_lengths.len());
+    let mut total_doc_len = 0u64;
+    let mut previous_doc_id = None;
+
+    for &(doc_id, doc_len) in document_lengths {
+        if let Some(previous) = previous_doc_id {
+            match doc_id.cmp(&previous) {
+                std::cmp::Ordering::Less => {
+                    return Err(Error::UnsortedDocId {
+                        previous,
+                        current: doc_id,
+                    });
+                }
+                std::cmp::Ordering::Equal => return Err(Error::DuplicateDocId { doc_id }),
+                std::cmp::Ordering::Greater => {}
+            }
+        }
+        total_doc_len = total_doc_len.saturating_add(doc_len as u64);
+        doc_entries.push((doc_id, doc_len));
+        previous_doc_id = Some(doc_id);
+    }
+
+    Ok((doc_entries, total_doc_len, previous_doc_id.unwrap_or(0)))
+}
+
+fn validate_raw_term_posting_lists(
+    doc_entries: &[(DocId, u32)],
+    terms: &[RawTermPostingList<'_>],
+) -> Result<(), Error> {
+    let mut previous_term_id = None;
+    for term in terms {
+        if let Some(previous) = previous_term_id {
+            match term.term_id.cmp(&previous) {
+                std::cmp::Ordering::Less => {
+                    return Err(Error::UnsortedTermId {
+                        previous,
+                        current: term.term_id,
+                    });
+                }
+                std::cmp::Ordering::Equal => {
+                    return Err(Error::DuplicateTermId {
+                        term_id: term.term_id,
+                    });
+                }
+                std::cmp::Ordering::Greater => {}
+            }
+        }
+        if term.postings.is_empty() {
+            return Err(Error::EmptyPostingList {
+                term_id: term.term_id,
+            });
+        }
+
+        let mut previous_doc_id = None;
+        for (index, &(doc_id, weight)) in term.postings.iter().enumerate() {
+            if let Some(previous) = previous_doc_id {
+                if doc_id <= previous {
+                    return Err(Error::NonIncreasingDocId {
+                        term_id: term.term_id,
+                        index: u32::try_from(index).map_err(|_| Error::TooManyDocuments)?,
+                    });
+                }
+            }
+            if weight == 0 {
+                return Err(Error::ZeroWeight {
+                    doc_id,
+                    term_id: term.term_id,
+                });
+            }
+            if doc_entries
+                .binary_search_by_key(&doc_id, |&(doc_id, _)| doc_id)
+                .is_err()
+            {
+                return Err(Error::UnknownDocId {
+                    term_id: term.term_id,
+                    doc_id,
+                });
+            }
+            previous_doc_id = Some(doc_id);
+        }
+        previous_term_id = Some(term.term_id);
+    }
+    Ok(())
 }
 
 fn collect_raw_documents_from_slice(
@@ -3512,12 +3702,55 @@ fn build_u64_u32_segment_sections_from_docs(
 
 fn build_u64_u32_segment_sections_from_parts(
     postings: BTreeMap<RawTermId, Vec<(DocId, u32)>>,
-    doc_entries: Vec<(DocId, u32)>,
+    doc_entries: RawDocumentEntries,
     total_doc_len: u64,
     max_doc_id: DocId,
 ) -> Result<RawSegmentSections, Error> {
+    build_u64_u32_segment_sections_from_term_iter(
+        postings.len(),
+        || {
+            postings
+                .iter()
+                .map(|(&term_id, postings)| (term_id, postings.as_slice()))
+        },
+        doc_entries,
+        total_doc_len,
+        max_doc_id,
+    )
+}
+
+fn build_u64_u32_segment_sections_from_posting_lists(
+    posting_lists: &[RawTermPostingList<'_>],
+    doc_entries: RawDocumentEntries,
+    total_doc_len: u64,
+    max_doc_id: DocId,
+) -> Result<RawSegmentSections, Error> {
+    build_u64_u32_segment_sections_from_term_iter(
+        posting_lists.len(),
+        || {
+            posting_lists
+                .iter()
+                .map(|term| (term.term_id, term.postings))
+        },
+        doc_entries,
+        total_doc_len,
+        max_doc_id,
+    )
+}
+
+fn build_u64_u32_segment_sections_from_term_iter<'a, I, F>(
+    term_count: usize,
+    terms: F,
+    doc_entries: RawDocumentEntries,
+    total_doc_len: u64,
+    max_doc_id: DocId,
+) -> Result<RawSegmentSections, Error>
+where
+    I: Iterator<Item = (RawTermId, &'a [(DocId, u32)])>,
+    F: Fn() -> I,
+{
     let doc_count = u32::try_from(doc_entries.len()).map_err(|_| Error::TooManyDocuments)?;
-    let term_count = u32::try_from(postings.len()).map_err(|_| Error::TooManyTerms)?;
+    let term_count = u32::try_from(term_count).map_err(|_| Error::TooManyTerms)?;
     let term_dir_offset = HEADER_LEN as u64;
     let term_dir_len = (term_count as u64)
         .checked_mul(TERM_ENTRY_LEN as u64)
@@ -3532,7 +3765,7 @@ fn build_u64_u32_segment_sections_from_parts(
         .checked_add(doc_meta_len)
         .ok_or(Error::SegmentTooLarge)?;
     let mut total_block_count = 0u64;
-    for list in postings.values() {
+    for (_, list) in terms() {
         let len = list.len() as u64;
         total_block_count = total_block_count
             .checked_add(len.div_ceil(DEFAULT_BLOCK_SIZE as u64))
@@ -3546,11 +3779,11 @@ fn build_u64_u32_segment_sections_from_parts(
         .ok_or(Error::SegmentTooLarge)?;
 
     let mut postings_bytes = Vec::new();
-    let mut term_entries = Vec::with_capacity(postings.len());
-    let mut term_block_directories = Vec::with_capacity(postings.len());
+    let mut term_entries = Vec::with_capacity(term_count as usize);
+    let mut term_block_directories = Vec::with_capacity(term_count as usize);
     let mut block_entries = Vec::new();
     let mut block_crcs: Vec<u32> = Vec::new();
-    for (&term_id, list) in &postings {
+    for (term_id, list) in terms() {
         let offset = postings_offset
             .checked_add(u64::try_from(postings_bytes.len()).map_err(|_| Error::SegmentTooLarge)?)
             .ok_or(Error::SegmentTooLarge)?;
@@ -4445,6 +4678,139 @@ mod tests {
         assert_eq!(
             write_u64_u32_segment_sorted_from_iter(duplicate).unwrap_err(),
             Error::DuplicateDocId { doc_id: 5 }
+        );
+    }
+
+    #[test]
+    fn raw_segment_term_postings_writer_matches_slice_writer() {
+        let doc_a = vec![(10, 1), (20, 2), (10, 3)];
+        let doc_b = vec![(10, 1), (30, 1)];
+        let doc_c = vec![(20, 1), (40, 5)];
+        let docs = [
+            RawDocument::new(2, doc_a.as_slice()),
+            RawDocument::new(5, doc_b.as_slice()),
+            RawDocument::new(9, doc_c.as_slice()),
+        ];
+        let doc_lengths = [(2, 6), (5, 2), (9, 6)];
+        let term_10 = [(2, 4), (5, 1)];
+        let term_20 = [(2, 2), (9, 1)];
+        let term_30 = [(5, 1)];
+        let term_40 = [(9, 5)];
+        let terms = [
+            RawTermPostingList::new(10, &term_10),
+            RawTermPostingList::new(20, &term_20),
+            RawTermPostingList::new(30, &term_30),
+            RawTermPostingList::new(40, &term_40),
+        ];
+
+        let expected = write_u64_u32_segment(&docs).unwrap();
+        let from_terms = write_u64_u32_segment_from_term_postings(&doc_lengths, &terms).unwrap();
+        let mut written = Vec::new();
+        write_u64_u32_segment_from_term_postings_to(&doc_lengths, &terms, &mut written).unwrap();
+
+        assert_eq!(from_terms, expected);
+        assert_eq!(written, expected);
+        RawSegment::open(&written).unwrap();
+    }
+
+    #[test]
+    fn raw_segment_term_postings_writer_rejects_invalid_doc_metadata() {
+        let postings = [(1, 1)];
+        let terms = [RawTermPostingList::new(7, &postings)];
+
+        let decreasing_docs = [(5, 1), (2, 1)];
+        assert_eq!(
+            write_u64_u32_segment_from_term_postings(&decreasing_docs, &terms).unwrap_err(),
+            Error::UnsortedDocId {
+                previous: 5,
+                current: 2
+            }
+        );
+
+        let duplicate_docs = [(5, 1), (5, 1)];
+        assert_eq!(
+            write_u64_u32_segment_from_term_postings(&duplicate_docs, &terms).unwrap_err(),
+            Error::DuplicateDocId { doc_id: 5 }
+        );
+    }
+
+    #[test]
+    fn raw_segment_term_postings_writer_rejects_invalid_terms() {
+        let docs = [(1, 1), (2, 1), (3, 1)];
+        let postings = [(1, 1)];
+        let term_7 = RawTermPostingList::new(7, &postings);
+        let term_5 = RawTermPostingList::new(5, &postings);
+        assert_eq!(
+            write_u64_u32_segment_from_term_postings(&docs, &[term_7, term_5]).unwrap_err(),
+            Error::UnsortedTermId {
+                previous: 7,
+                current: 5
+            }
+        );
+        assert_eq!(
+            write_u64_u32_segment_from_term_postings(&docs, &[term_7, term_7]).unwrap_err(),
+            Error::DuplicateTermId { term_id: 7 }
+        );
+
+        let empty: [(DocId, u32); 0] = [];
+        assert_eq!(
+            write_u64_u32_segment_from_term_postings(&docs, &[RawTermPostingList::new(7, &empty)])
+                .unwrap_err(),
+            Error::EmptyPostingList { term_id: 7 }
+        );
+    }
+
+    #[test]
+    fn raw_segment_term_postings_writer_rejects_invalid_postings() {
+        let docs = [(1, 1), (2, 1), (3, 1)];
+
+        let decreasing = [(2, 1), (1, 1)];
+        assert_eq!(
+            write_u64_u32_segment_from_term_postings(
+                &docs,
+                &[RawTermPostingList::new(7, &decreasing)]
+            )
+            .unwrap_err(),
+            Error::NonIncreasingDocId {
+                term_id: 7,
+                index: 1
+            }
+        );
+
+        let duplicate = [(2, 1), (2, 1)];
+        assert_eq!(
+            write_u64_u32_segment_from_term_postings(
+                &docs,
+                &[RawTermPostingList::new(7, &duplicate)]
+            )
+            .unwrap_err(),
+            Error::NonIncreasingDocId {
+                term_id: 7,
+                index: 1
+            }
+        );
+
+        let zero = [(2, 0)];
+        assert_eq!(
+            write_u64_u32_segment_from_term_postings(&docs, &[RawTermPostingList::new(7, &zero)])
+                .unwrap_err(),
+            Error::ZeroWeight {
+                doc_id: 2,
+                term_id: 7
+            }
+        );
+
+        let unknown = [(99, 1)];
+        assert_eq!(
+            write_u64_u32_segment_from_term_postings(
+                &docs,
+                &[RawTermPostingList::new(7, &unknown)]
+            )
+            .unwrap_err(),
+            Error::UnknownDocId {
+                term_id: 7,
+                doc_id: 99
+            }
         );
     }
 
@@ -5638,6 +6004,63 @@ mod tests {
             write_u64_u32_segment_sorted_from_iter_to(raw_docs.iter().copied(), &mut written).unwrap();
 
             prop_assert_eq!(&sorted, &expected);
+            prop_assert_eq!(&written, &expected);
+        }
+
+        #[test]
+        fn raw_segment_term_postings_writer_matches_unsorted_writer_for_random_input(
+            docs in prop::collection::vec(
+                prop::collection::vec((0u8..12, 1u8..4), 0..16),
+                0..24
+            ),
+            stride in prop::sample::select(vec![1u32, 37u32]),
+        ) {
+            let weighted_docs: Vec<Vec<(RawTermId, u32)>> = docs
+                .iter()
+                .map(|doc| {
+                    doc.iter()
+                        .map(|&(term, weight)| (term as RawTermId, weight as u32))
+                        .collect()
+                })
+                .collect();
+            let raw_docs: Vec<RawDocument<'_>> = weighted_docs
+                .iter()
+                .enumerate()
+                .map(|(i, terms)| RawDocument::new((i as DocId) * stride, terms))
+                .collect();
+
+            let mut doc_lengths = Vec::with_capacity(weighted_docs.len());
+            let mut term_storage: BTreeMap<RawTermId, Vec<(DocId, u32)>> = BTreeMap::new();
+            for (i, terms) in weighted_docs.iter().enumerate() {
+                let doc_id = (i as DocId) * stride;
+                let mut doc_len = 0u32;
+                let mut per_doc_terms = BTreeMap::new();
+                for &(term_id, weight) in terms {
+                    doc_len = doc_len.checked_add(weight).unwrap();
+                    *per_doc_terms.entry(term_id).or_insert(0u32) += weight;
+                }
+                doc_lengths.push((doc_id, doc_len));
+                for (term_id, weight) in per_doc_terms {
+                    term_storage.entry(term_id).or_default().push((doc_id, weight));
+                }
+            }
+            let term_lists: Vec<_> = term_storage
+                .iter()
+                .map(|(&term_id, postings)| RawTermPostingList::new(term_id, postings))
+                .collect();
+
+            let expected = write_u64_u32_segment(&raw_docs).unwrap();
+            let term_major =
+                write_u64_u32_segment_from_term_postings(&doc_lengths, &term_lists).unwrap();
+            let mut written = Vec::new();
+            write_u64_u32_segment_from_term_postings_to(
+                &doc_lengths,
+                &term_lists,
+                &mut written,
+            )
+            .unwrap();
+
+            prop_assert_eq!(&term_major, &expected);
             prop_assert_eq!(&written, &expected);
         }
     }

@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added term-major raw segment writer APIs for external sort or spill/merge
+  pipelines that already have sorted document metadata and posting lists,
+  avoiding the encoder's doc-to-term transposition.
+
 ## [0.2.5] - 2026-07-03
 
 ### Added

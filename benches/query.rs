@@ -9,9 +9,10 @@ use postings::positional::PosingsIndex;
 #[cfg(feature = "raw-segment")]
 use postings::raw::{
     top_k_weighted_u32_files, write_u64_u32_segment, write_u64_u32_segment_from_iter,
-    write_u64_u32_segment_from_iter_to, write_u64_u32_segment_sorted_from_iter,
+    write_u64_u32_segment_from_iter_to, write_u64_u32_segment_from_term_postings,
+    write_u64_u32_segment_from_term_postings_to, write_u64_u32_segment_sorted_from_iter,
     write_u64_u32_segment_sorted_from_iter_to, write_u64_u32_segment_to, RawDocument, RawSegment,
-    RawSegmentFile,
+    RawSegmentFile, RawTermPostingList,
 };
 use postings::{CandidatePlan, PlannerConfig, PostingsIndex};
 
@@ -513,6 +514,23 @@ fn bench_raw_segment_queries(c: &mut Criterion) {
         .map(|(doc_id, terms)| RawDocument::new(doc_id as u32, terms))
         .collect();
     let writer_segment_len = write_u64_u32_segment(&writer_docs).unwrap().len();
+    let mut writer_doc_lengths = Vec::with_capacity(writer_docs.len());
+    let mut writer_term_storage: std::collections::BTreeMap<u64, Vec<(u32, u32)>> =
+        std::collections::BTreeMap::new();
+    for doc in &writer_docs {
+        let doc_len: u32 = doc.terms().iter().map(|&(_, weight)| weight).sum();
+        writer_doc_lengths.push((doc.doc_id(), doc_len));
+        for &(term_id, weight) in doc.terms() {
+            writer_term_storage
+                .entry(term_id)
+                .or_default()
+                .push((doc.doc_id(), weight));
+        }
+    }
+    let writer_term_postings: Vec<_> = writer_term_storage
+        .iter()
+        .map(|(&term_id, postings)| RawTermPostingList::new(term_id, postings))
+        .collect();
     let raw_dir = tempfile::tempdir().unwrap();
     let raw_path = raw_dir.path().join("numeric.raw");
     std::fs::write(&raw_path, &bytes).unwrap();
@@ -615,6 +633,35 @@ fn bench_raw_segment_queries(c: &mut Criterion) {
                     .enumerate()
                     .map(|(doc_id, terms)| RawDocument::new(doc_id as u32, terms));
                 write_u64_u32_segment_sorted_from_iter_to(black_box(docs), &mut out).unwrap();
+                black_box(out.len());
+            },
+            criterion::BatchSize::SmallInput,
+        );
+    });
+
+    group.bench_function("write_10k_term_postings_vec", |b| {
+        b.iter(|| {
+            black_box(
+                write_u64_u32_segment_from_term_postings(
+                    black_box(&writer_doc_lengths),
+                    black_box(&writer_term_postings),
+                )
+                .unwrap()
+                .len(),
+            );
+        });
+    });
+
+    group.bench_function("write_10k_term_postings_sink_vec", |b| {
+        b.iter_batched(
+            || Vec::with_capacity(writer_segment_len),
+            |mut out| {
+                write_u64_u32_segment_from_term_postings_to(
+                    black_box(&writer_doc_lengths),
+                    black_box(&writer_term_postings),
+                    &mut out,
+                )
+                .unwrap();
                 black_box(out.len());
             },
             criterion::BatchSize::SmallInput,
