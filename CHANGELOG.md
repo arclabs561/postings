@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-07-03
+
 ### Added
 
 - Added `RawSegment::for_each_posting`,
