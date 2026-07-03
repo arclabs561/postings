@@ -1124,6 +1124,14 @@ impl RawSegmentFile {
         let Some(entry) = self.term_entry(term_id)? else {
             return Ok(Vec::new());
         };
+        if entry.postings_len as u64 > FILE_FULL_POSTINGS_READ_LIMIT {
+            let mut out = Vec::with_capacity(entry.df as usize);
+            self.for_each_posting_in_entry_blocks(entry, |doc_id, weight| {
+                out.push((doc_id, weight));
+            })?;
+            return Ok(out);
+        }
+
         let bytes = self.read_postings_range(entry.postings_offset, entry.postings_len as u64)?;
         let mut out = Vec::with_capacity(entry.df as usize);
         let postings = RawPostings {
