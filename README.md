@@ -11,7 +11,8 @@ sparse retrieval.
 
 ## Data Model & Invariants
 
-- **Doc IDs**: `u32`. Must be dense/contiguous for optimal compression.
+- **Doc IDs**: `u32`. Sparse ids are supported; smaller gaps compress better
+  and dense ids keep dense scratch paths cheap.
 - **Ordering**: Postings lists are always sorted by Doc ID.
 - **Updates**: `PostingsIndex` supports in-memory add/delete. Raw file segments
   are immutable; a store or application manifest owns deletes and compaction.
@@ -127,3 +128,7 @@ evaluation. `PosingsIndex` remains as the historical name from the older
 ```bash
 cargo test
 ```
+
+## License
+
+MIT OR Apache-2.0
