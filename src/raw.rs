@@ -276,6 +276,83 @@ struct RawBlockScoringList {
     full_postings: Option<Vec<u8>>,
 }
 
+struct RawTopKThreshold {
+    ranked: Vec<(DocId, f32)>,
+    k: usize,
+    sorted: bool,
+}
+
+impl RawTopKThreshold {
+    fn new(k: usize) -> Self {
+        Self {
+            ranked: Vec::with_capacity(k),
+            k,
+            sorted: false,
+        }
+    }
+
+    fn update(&mut self, doc_id: DocId, score: f32) {
+        if self.k == 0 || score == 0.0 {
+            return;
+        }
+
+        if let Some(index) = self
+            .ranked
+            .iter()
+            .position(|(ranked_doc_id, _)| *ranked_doc_id == doc_id)
+        {
+            self.ranked[index].1 = score;
+            if self.sorted {
+                self.bubble_up(index);
+            }
+            return;
+        }
+
+        if self.ranked.len() < self.k {
+            self.ranked.push((doc_id, score));
+            self.sorted = false;
+            return;
+        }
+
+        self.sort_if_needed();
+        let candidate = (doc_id, score);
+        if crate::cmp_doc_scores(
+            &candidate,
+            self.ranked.last().expect("top-k buffer is full"),
+        )
+        .is_lt()
+        {
+            let last = self.ranked.len() - 1;
+            self.ranked[last] = candidate;
+            self.bubble_up(last);
+        }
+    }
+
+    fn threshold(&mut self) -> Option<f32> {
+        if self.ranked.len() < self.k {
+            return None;
+        }
+        self.sort_if_needed();
+        self.ranked.last().map(|(_, score)| *score)
+    }
+
+    fn sort_if_needed(&mut self) {
+        if !self.sorted {
+            self.ranked.sort_by(crate::cmp_doc_scores);
+            self.sorted = true;
+        }
+    }
+
+    fn bubble_up(&mut self, mut index: usize) {
+        while index > 0
+            && crate::cmp_doc_scores(&self.ranked[index], &self.ranked[index - 1]).is_lt()
+        {
+            self.ranked.swap(index, index - 1);
+            index -= 1;
+        }
+    }
+}
+
 /// Metadata for one encoded posting block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RawPostingBlockMeta {
@@ -1868,12 +1945,15 @@ impl RawSegmentFile {
     ) -> Result<Vec<(DocId, f32)>, RawSegmentFileError> {
         let mut scores = vec![0.0; dense_slots];
         let mut touched = Vec::with_capacity(total_postings.min(self.meta.doc_count as usize));
-        let mut threshold = None;
+        let mut threshold = RawTopKThreshold::new(k);
 
         for list in lists {
             for &block in &list.blocks {
                 let upper_bound = raw_block_range_upper_bound(block, lists);
-                if threshold.is_some_and(|threshold| upper_bound < threshold) {
+                if threshold
+                    .threshold()
+                    .is_some_and(|threshold| upper_bound < threshold)
+                {
                     continue;
                 }
 
@@ -1887,9 +1967,8 @@ impl RawSegmentFile {
                         touched.push(doc_id);
                     }
                     scores[slot] += contribution;
+                    threshold.update(doc_id, scores[slot]);
                 })?;
-
-                threshold = raw_dense_top_k_threshold(&scores, &touched, k);
             }
         }
 
@@ -1909,23 +1988,26 @@ impl RawSegmentFile {
     ) -> Result<Vec<(DocId, f32)>, RawSegmentFileError> {
         let mut scores: HashMap<DocId, f32> =
             HashMap::with_capacity(total_postings.min(self.meta.doc_count as usize));
-        let mut threshold = None;
+        let mut threshold = RawTopKThreshold::new(k);
 
         for list in lists {
             for &block in &list.blocks {
                 let upper_bound = raw_block_range_upper_bound(block, lists);
-                if threshold.is_some_and(|threshold| upper_bound < threshold) {
+                if threshold
+                    .threshold()
+                    .is_some_and(|threshold| upper_bound < threshold)
+                {
                     continue;
                 }
 
                 self.for_each_scoring_block_posting(list, block, |doc_id, doc_weight| {
                     let contribution = list.query_weight * doc_weight as f32;
                     if contribution != 0.0 {
-                        *scores.entry(doc_id).or_insert(0.0) += contribution;
+                        let score = scores.entry(doc_id).or_insert(0.0);
+                        *score += contribution;
+                        threshold.update(doc_id, *score);
                     }
                 })?;
-
-                threshold = raw_sparse_top_k_threshold(&scores, k);
             }
         }
 
@@ -2708,30 +2790,6 @@ fn max_overlapping_raw_block_weight(
         max_weight = max_weight.max(block.max_weight);
     }
     max_weight
-}
-
-fn raw_dense_top_k_threshold(scores: &[f32], touched: &[DocId], k: usize) -> Option<f32> {
-    if touched.len() < k {
-        return None;
-    }
-    crate::top_k_scored_docs(
-        touched
-            .iter()
-            .copied()
-            .map(|doc_id| (doc_id, scores[doc_id as usize])),
-        k,
-    )
-    .last()
-    .map(|(_, score)| *score)
-}
-
-fn raw_sparse_top_k_threshold(scores: &HashMap<DocId, f32>, k: usize) -> Option<f32> {
-    if scores.len() < k {
-        return None;
-    }
-    crate::top_k_scored_docs(scores.iter().map(|(doc_id, score)| (*doc_id, *score)), k)
-        .last()
-        .map(|(_, score)| *score)
 }
 
 fn normalize_weighted_query_terms(query_terms: &[(RawTermId, f32)]) -> Vec<(RawTermId, f32)> {

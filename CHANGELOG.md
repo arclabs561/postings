@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Sped up raw-segment pruned block top-k scoring by maintaining the current
+  threshold incrementally instead of rescanning all touched documents after each
+  block.
+
 ## [0.2.3] - 2026-07-03
 
 ### Added
