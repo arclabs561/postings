@@ -195,12 +195,7 @@ impl PosingsIndex {
 
     /// Positions for a term in a given doc (empty if absent).
     pub fn positions(&self, term: &str, doc_id: DocId) -> &[TokenPos] {
-        static EMPTY: [TokenPos; 0] = [];
-        self.postings
-            .get(term)
-            .and_then(|m| m.get(&doc_id))
-            .map(|v| v.as_slice())
-            .unwrap_or(&EMPTY)
+        positions_in_docs(self.postings.get(term), doc_id)
     }
 
     /// Candidate docs containing a term.
@@ -372,17 +367,22 @@ impl PosingsIndex {
     }
 
     fn phrase_match_three_unique(&self, terms: [&str; 3]) -> Vec<DocId> {
+        let maps = [
+            self.postings.get(terms[0]),
+            self.postings.get(terms[1]),
+            self.postings.get(terms[2]),
+        ];
         let mut anchor_i = 0usize;
-        let mut anchor_df = self.df(terms[0]);
-        for (i, term) in terms.iter().enumerate().skip(1) {
-            let df = self.df(term);
+        let mut anchor_df = maps[0].map_or(0, |m| m.len());
+        for (i, map) in maps.iter().enumerate().skip(1) {
+            let df = map.map_or(0, |m| m.len());
             if df < anchor_df {
                 anchor_i = i;
                 anchor_df = df;
             }
         }
 
-        let Some(anchor_map) = self.postings.get(terms[anchor_i]) else {
+        let Some(anchor_map) = maps[anchor_i] else {
             return Vec::new();
         };
 
@@ -391,17 +391,17 @@ impl PosingsIndex {
             let positions = match anchor_i {
                 0 => [
                     anchor_positions.as_slice(),
-                    self.positions(terms[1], doc_id),
-                    self.positions(terms[2], doc_id),
+                    positions_in_docs(maps[1], doc_id),
+                    positions_in_docs(maps[2], doc_id),
                 ],
                 1 => [
-                    self.positions(terms[0], doc_id),
+                    positions_in_docs(maps[0], doc_id),
                     anchor_positions.as_slice(),
-                    self.positions(terms[2], doc_id),
+                    positions_in_docs(maps[2], doc_id),
                 ],
                 _ => [
-                    self.positions(terms[0], doc_id),
-                    self.positions(terms[1], doc_id),
+                    positions_in_docs(maps[0], doc_id),
+                    positions_in_docs(maps[1], doc_id),
                     anchor_positions.as_slice(),
                 ],
             };
@@ -465,12 +465,13 @@ impl PosingsIndex {
         let Some(anchor_map) = self.postings.get(anchor) else {
             return Vec::new();
         };
+        let other_map = self.postings.get(other);
         let mut out = Vec::new();
         for (&doc_id, pa) in anchor_map {
             let pb = if anchor == other {
                 pa.as_slice()
             } else {
-                self.positions(other, doc_id)
+                positions_in_docs(other_map, doc_id)
             };
             if pb.is_empty() {
                 continue;
@@ -553,17 +554,22 @@ impl PosingsIndex {
         terms: [&str; 3],
         window: u32,
     ) -> Vec<DocId> {
+        let maps = [
+            self.postings.get(terms[0]),
+            self.postings.get(terms[1]),
+            self.postings.get(terms[2]),
+        ];
         let mut anchor_i = 0usize;
-        let mut anchor_df = self.df(terms[0]);
-        for (i, term) in terms.iter().enumerate().skip(1) {
-            let df = self.df(term);
+        let mut anchor_df = maps[0].map_or(0, |m| m.len());
+        for (i, map) in maps.iter().enumerate().skip(1) {
+            let df = map.map_or(0, |m| m.len());
             if df < anchor_df {
                 anchor_i = i;
                 anchor_df = df;
             }
         }
 
-        let Some(anchor_map) = self.postings.get(terms[anchor_i]) else {
+        let Some(anchor_map) = maps[anchor_i] else {
             return Vec::new();
         };
 
@@ -572,17 +578,17 @@ impl PosingsIndex {
             let positions = match anchor_i {
                 0 => [
                     anchor_positions.as_slice(),
-                    self.positions(terms[1], doc_id),
-                    self.positions(terms[2], doc_id),
+                    positions_in_docs(maps[1], doc_id),
+                    positions_in_docs(maps[2], doc_id),
                 ],
                 1 => [
-                    self.positions(terms[0], doc_id),
+                    positions_in_docs(maps[0], doc_id),
                     anchor_positions.as_slice(),
-                    self.positions(terms[2], doc_id),
+                    positions_in_docs(maps[2], doc_id),
                 ],
                 _ => [
-                    self.positions(terms[0], doc_id),
-                    self.positions(terms[1], doc_id),
+                    positions_in_docs(maps[0], doc_id),
+                    positions_in_docs(maps[1], doc_id),
                     anchor_positions.as_slice(),
                 ],
             };
@@ -601,6 +607,13 @@ impl PosingsIndex {
         out.sort_unstable();
         out
     }
+}
+
+fn positions_in_docs(docs: Option<&HashMap<DocId, Vec<TokenPos>>>, doc_id: DocId) -> &[TokenPos] {
+    static EMPTY: [TokenPos; 0] = [];
+    docs.and_then(|m| m.get(&doc_id))
+        .map(|v| v.as_slice())
+        .unwrap_or(&EMPTY)
 }
 
 fn near_positions_unordered_three(positions: [&[TokenPos]; 3], window: u32) -> bool {
