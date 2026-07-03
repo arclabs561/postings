@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-07-03
+
+### Changed
+
+- Sped up raw-segment posting visitors that include document lengths by
+  scanning document metadata with a forward cursor instead of doing a binary
+  search for every posting. In focused downstream `lexir` BM25 runs, this
+  enabled file-backed two-term raw queries around 292 us and eight-term raw
+  queries around 1.09 ms while preserving duplicate-heavy query performance.
+
 ## [0.2.1] - 2026-07-03
 
 ### Added
