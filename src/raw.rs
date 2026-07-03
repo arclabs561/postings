@@ -1966,6 +1966,7 @@ impl RawSegmentFile {
         let mut scores = vec![0.0; dense_slots];
         let mut touched = Vec::with_capacity(total_postings.min(self.meta.doc_count as usize));
         let mut threshold = RawTopKThreshold::new(k);
+        let mut block_bytes = Vec::new();
 
         for list in lists {
             for &block in &list.blocks {
@@ -1977,18 +1978,23 @@ impl RawSegmentFile {
                     continue;
                 }
 
-                self.for_each_scoring_block_posting(list, block, |doc_id, doc_weight| {
-                    let contribution = list.query_weight * doc_weight as f32;
-                    if contribution == 0.0 {
-                        return;
-                    }
-                    let slot = doc_id as usize;
-                    if scores[slot] == 0.0 {
-                        touched.push(doc_id);
-                    }
-                    scores[slot] += contribution;
-                    threshold.update(doc_id, scores[slot]);
-                })?;
+                self.for_each_scoring_block_posting(
+                    list,
+                    block,
+                    &mut block_bytes,
+                    |doc_id, doc_weight| {
+                        let contribution = list.query_weight * doc_weight as f32;
+                        if contribution == 0.0 {
+                            return;
+                        }
+                        let slot = doc_id as usize;
+                        if scores[slot] == 0.0 {
+                            touched.push(doc_id);
+                        }
+                        scores[slot] += contribution;
+                        threshold.update(doc_id, scores[slot]);
+                    },
+                )?;
             }
         }
 
@@ -2009,6 +2015,7 @@ impl RawSegmentFile {
         let mut scores: HashMap<DocId, f32> =
             HashMap::with_capacity(total_postings.min(self.meta.doc_count as usize));
         let mut threshold = RawTopKThreshold::new(k);
+        let mut block_bytes = Vec::new();
 
         for list in lists {
             for &block in &list.blocks {
@@ -2020,14 +2027,19 @@ impl RawSegmentFile {
                     continue;
                 }
 
-                self.for_each_scoring_block_posting(list, block, |doc_id, doc_weight| {
-                    let contribution = list.query_weight * doc_weight as f32;
-                    if contribution != 0.0 {
-                        let score = scores.entry(doc_id).or_insert(0.0);
-                        *score += contribution;
-                        threshold.update(doc_id, *score);
-                    }
-                })?;
+                self.for_each_scoring_block_posting(
+                    list,
+                    block,
+                    &mut block_bytes,
+                    |doc_id, doc_weight| {
+                        let contribution = list.query_weight * doc_weight as f32;
+                        if contribution != 0.0 {
+                            let score = scores.entry(doc_id).or_insert(0.0);
+                            *score += contribution;
+                            threshold.update(doc_id, *score);
+                        }
+                    },
+                )?;
             }
         }
 
@@ -2038,6 +2050,7 @@ impl RawSegmentFile {
         &mut self,
         list: &RawBlockScoringList,
         block: RawPostingBlockMeta,
+        block_bytes: &mut Vec<u8>,
         visit: impl FnMut(DocId, u32),
     ) -> Result<(), RawSegmentFileError> {
         if let Some(postings) = &list.full_postings {
@@ -2065,11 +2078,14 @@ impl RawSegmentFile {
             return Ok(());
         }
 
-        let bytes =
-            self.read_posting_block_range(block.postings_offset, block.postings_len as u64)?;
+        self.read_posting_block_range_into(
+            block.postings_offset,
+            block.postings_len as u64,
+            block_bytes,
+        )?;
         for_each_posting_in_block(
             list.entry.term_id,
-            &bytes,
+            block_bytes,
             block.base_doc_id,
             block.last_doc_id,
             visit,
@@ -2241,12 +2257,26 @@ impl RawSegmentFile {
         offset: u64,
         len: u64,
     ) -> Result<Vec<u8>, RawSegmentFileError> {
-        checked_range(offset, len, self.file_len, "postings")?;
-        let bytes = read_exact_at_positional(&mut self.file, offset, len)?;
-        if let Some(checksums) = self.decoded_block_checksums()? {
-            verify_block_slice(checksums, offset, &bytes)?;
-        }
+        let mut bytes = Vec::new();
+        self.read_posting_block_range_into(offset, len, &mut bytes)?;
         Ok(bytes)
+    }
+
+    fn read_posting_block_range_into(
+        &mut self,
+        offset: u64,
+        len: u64,
+        bytes: &mut Vec<u8>,
+    ) -> Result<(), RawSegmentFileError> {
+        checked_range(offset, len, self.file_len, "postings")?;
+        let len = usize::try_from(len).map_err(|_| Error::SegmentTooLarge)?;
+        bytes.clear();
+        bytes.resize(len, 0);
+        read_exact_at_positional_into(&mut self.file, offset, bytes)?;
+        if let Some(checksums) = self.decoded_block_checksums()? {
+            verify_block_slice(checksums, offset, bytes)?;
+        }
+        Ok(())
     }
 
     fn decoded_block_checksums(&mut self) -> Result<Option<&[RawBlockChecksum]>, Error> {
@@ -2320,13 +2350,17 @@ impl RawSegmentFile {
         }
 
         let mut decoded = 0u32;
+        let mut block_bytes = Vec::new();
         for block_index in 0..block_directory.block_count {
             let block = self.posting_block_at(entry, block_directory, block_index)?;
-            let bytes =
-                self.read_posting_block_range(block.postings_offset, block.postings_len as u64)?;
+            self.read_posting_block_range_into(
+                block.postings_offset,
+                block.postings_len as u64,
+                &mut block_bytes,
+            )?;
             for_each_posting_in_block(
                 entry.term_id,
-                &bytes,
+                &block_bytes,
                 block.base_doc_id,
                 block.last_doc_id,
                 |doc_id, weight| {
@@ -2406,6 +2440,7 @@ impl RawSegmentFile {
         };
         let mut decoded = 0u32;
         let mut lengths = DocLengthCursor::new(&self.doc_meta, self.meta.doc_count);
+        let mut block_bytes = Vec::new();
         for block in blocks {
             checked_range(
                 block.postings_offset,
@@ -2413,15 +2448,17 @@ impl RawSegmentFile {
                 file_len,
                 "postings",
             )?;
-            let bytes =
-                read_exact_at_positional(file, block.postings_offset, block.postings_len as u64)?;
+            let len = usize::try_from(block.postings_len).map_err(|_| Error::SegmentTooLarge)?;
+            block_bytes.clear();
+            block_bytes.resize(len, 0);
+            read_exact_at_positional_into(file, block.postings_offset, &mut block_bytes)?;
             if let Some(checksums) = block_checksums {
-                verify_block_slice(checksums, block.postings_offset, &bytes)?;
+                verify_block_slice(checksums, block.postings_offset, &block_bytes)?;
             }
             let mut lookup_error = None;
             for_each_posting_in_block(
                 entry.term_id,
-                &bytes,
+                &block_bytes,
                 block.base_doc_id,
                 block.last_doc_id,
                 |doc_id, weight| {
@@ -2468,6 +2505,7 @@ impl RawSegmentFile {
         let mut ranked = Vec::with_capacity(k);
         let mut sorted = false;
         let can_prune_blocks = query_weight > 0.0 && query_weight.is_finite();
+        let mut block_bytes = Vec::new();
         for block_index in 0..block_directory.block_count {
             let block = self.posting_block_at(entry, block_directory, block_index)?;
             if can_prune_blocks && ranked.len() == k {
@@ -2481,11 +2519,14 @@ impl RawSegmentFile {
                 }
             }
 
-            let bytes =
-                self.read_posting_block_range(block.postings_offset, block.postings_len as u64)?;
+            self.read_posting_block_range_into(
+                block.postings_offset,
+                block.postings_len as u64,
+                &mut block_bytes,
+            )?;
             for_each_posting_in_block(
                 entry.term_id,
-                &bytes,
+                &block_bytes,
                 block.base_doc_id,
                 block.last_doc_id,
                 |doc_id, doc_weight| {
@@ -2661,7 +2702,7 @@ fn read_exact_at_positional(
 
 #[cfg(unix)]
 fn read_exact_at_positional_into(
-    file: &File,
+    file: &mut File,
     offset: u64,
     bytes: &mut [u8],
 ) -> std::io::Result<()> {
