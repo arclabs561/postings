@@ -1681,6 +1681,29 @@ impl RawSegmentFile {
     }
 }
 
+/// Return the top `k` documents by sparse inner product across raw segment files.
+///
+/// This composes [`RawSegmentFile::top_k_weighted_u32`] across immutable files
+/// and merges the per-file top-k lists. Segment document ids must already be
+/// globally unique among live documents; deletes and newer-version masking are
+/// owned by the caller's manifest or store layer.
+pub fn top_k_weighted_u32_files(
+    segments: &mut [&mut RawSegmentFile],
+    query_terms: &[(RawTermId, f32)],
+    k: usize,
+) -> Result<Vec<(DocId, f32)>, RawSegmentFileError> {
+    if k == 0 || query_terms.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut candidates = Vec::with_capacity(k.saturating_mul(segments.len()));
+    for segment in segments.iter_mut() {
+        candidates.extend(segment.top_k_weighted_u32(query_terms, k)?);
+    }
+
+    Ok(crate::top_k_scored_docs(candidates, k))
+}
+
 fn read_exact_at(file: &mut File, offset: u64, len: u64) -> Result<Vec<u8>, RawSegmentFileError> {
     let len = usize::try_from(len).map_err(|_| Error::SegmentTooLarge)?;
     let mut bytes = vec![0; len];
@@ -2724,6 +2747,59 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn raw_segment_files_top_k_weighted_matches_in_memory_index() {
+        let first = [
+            (1, vec![(10, 3), (20, 1)]),
+            (2, vec![(20, 5)]),
+            (3, vec![(30, 2)]),
+        ];
+        let second = [
+            (10, vec![(10, 1), (30, 3)]),
+            (11, vec![(30, 2), (40, 2)]),
+            (12, vec![(40, 4)]),
+        ];
+
+        let mut idx: PostingsIndex<RawTermId> = PostingsIndex::new();
+        for (doc_id, terms) in first.iter().chain(second.iter()) {
+            let mut expanded = Vec::new();
+            for &(term_id, weight) in terms {
+                for _ in 0..weight {
+                    expanded.push(term_id);
+                }
+            }
+            idx.add_document(*doc_id, &expanded).unwrap();
+        }
+
+        let first_docs: Vec<_> = first
+            .iter()
+            .map(|(doc_id, terms)| RawDocument::new(*doc_id, terms))
+            .collect();
+        let second_docs: Vec<_> = second
+            .iter()
+            .map(|(doc_id, terms)| RawDocument::new(*doc_id, terms))
+            .collect();
+        let dir = tempfile::tempdir().unwrap();
+        let first_path = dir.path().join("first.raw");
+        let second_path = dir.path().join("second.raw");
+        std::fs::write(&first_path, write_u64_u32_segment(&first_docs).unwrap()).unwrap();
+        std::fs::write(&second_path, write_u64_u32_segment(&second_docs).unwrap()).unwrap();
+        let mut first_segment = RawSegmentFile::open(&first_path).unwrap();
+        let mut second_segment = RawSegmentFile::open(&second_path).unwrap();
+        let mut segments = [&mut first_segment, &mut second_segment];
+
+        let query = vec![(10, 1.5), (30, 2.0), (40, -0.25)];
+        let memory_query: Vec<(&RawTermId, f32)> = query
+            .iter()
+            .map(|(term_id, weight)| (term_id, *weight))
+            .collect();
+
+        assert_eq!(
+            top_k_weighted_u32_files(&mut segments, &query, 4).unwrap(),
+            idx.top_k_weighted(&memory_query, 4)
+        );
     }
 
     #[test]

@@ -86,10 +86,14 @@ It is the path intended for large lexical and learned-sparse indexes whose
 posting payloads should not be rebuilt into a full `PostingsIndex` on every
 open.
 
+`RawSegmentFile::top_k_weighted_u32` scores one raw file by sparse inner product;
+`top_k_weighted_u32_files` merges exact top-k results across raw files when
+document ids are globally unique. Use `lexir::raw` for BM25 over one or more raw
+files.
+
 This is not a full index lifecycle by itself: callers still own term-id mapping,
-commit publication, deletes, and compaction. Use `lexir::raw` for BM25 over
-one or more raw files, and pair raw files with `segstore` sidecars or an
-application manifest when lifecycle guarantees are needed.
+commit publication, deletes, and compaction. Pair raw files with `segstore`
+sidecars or an application manifest when lifecycle guarantees are needed.
 
 ## Features
 
