@@ -714,8 +714,8 @@ fn bench_raw_segment_queries(c: &mut Criterion) {
     });
 
     group.bench_function("file_top_k_weighted_5_multi_4", |b| {
+        let mut segments: Vec<_> = multi_file_segments.iter_mut().collect();
         b.iter(|| {
-            let mut segments: Vec<_> = multi_file_segments.iter_mut().collect();
             black_box(
                 top_k_weighted_u32_files(
                     black_box(segments.as_mut_slice()),

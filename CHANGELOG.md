@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `top_k_weighted_u32_files_with_stats` for raw multi-file sparse top-k
+  segment-pruning diagnostics.
+
 ### Changed
 
 - Sped up raw-segment pruned block top-k scoring by maintaining the current
@@ -9,6 +14,8 @@
   block.
 - Sped up multi-file raw-segment sparse top-k queries by skipping finite
   zero-bound segments before scoring.
+- Changed the multi-file raw sparse top-k benchmark to keep segment-reference
+  construction outside the timed loop.
 - Sped up positional phrase and proximity queries by reusing term posting maps
   inside specialized two- and three-term paths instead of re-hashing term
   strings for every candidate document.

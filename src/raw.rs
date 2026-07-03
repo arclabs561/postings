@@ -35,6 +35,26 @@ const FILE_FULL_POSTINGS_READ_LIMIT: u64 = 1024 * 1024;
 /// A numeric term id in the first raw postings format.
 pub type RawTermId = u64;
 
+/// Segment-level diagnostics for multi-file raw sparse top-k search.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RawTopKSearchStats {
+    /// Raw segment files supplied to the search.
+    pub segments_seen: usize,
+    /// Raw segment files actually scored.
+    pub segments_scored: usize,
+    /// Raw segment files skipped by a zero bound or current top-k threshold.
+    pub segments_pruned: usize,
+}
+
+/// Hits and segment-level diagnostics from multi-file raw sparse top-k search.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RawTopKSearchResult {
+    /// Top-k hits sorted by descending score, then document id.
+    pub hits: Vec<(DocId, f32)>,
+    /// Segment-pruning diagnostics for the search.
+    pub stats: RawTopKSearchStats,
+}
+
 /// Errors returned by raw segment encoding and decoding.
 #[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -2542,6 +2562,84 @@ pub fn top_k_weighted_u32_files(
     Ok(crate::top_k_scored_docs(candidates, k))
 }
 
+/// Return the top `k` documents by sparse inner product across raw segment files
+/// with segment-pruning diagnostics.
+///
+/// Segment document ids must already be globally unique among live documents;
+/// deletes and newer-version masking are owned by the caller's manifest or
+/// store layer.
+pub fn top_k_weighted_u32_files_with_stats(
+    segments: &mut [&mut RawSegmentFile],
+    query_terms: &[(RawTermId, f32)],
+    k: usize,
+) -> Result<RawTopKSearchResult, RawSegmentFileError> {
+    // Keep the hits-only sibling separate so diagnostic counters do not tax the
+    // default multi-file search hot path.
+    let mut stats = RawTopKSearchStats {
+        segments_seen: segments.len(),
+        ..RawTopKSearchStats::default()
+    };
+    if k == 0 || query_terms.is_empty() {
+        return Ok(RawTopKSearchResult {
+            hits: Vec::new(),
+            stats,
+        });
+    }
+
+    let query_terms = normalize_weighted_query_terms(query_terms);
+    if query_terms.is_empty() {
+        return Ok(RawTopKSearchResult {
+            hits: Vec::new(),
+            stats,
+        });
+    }
+
+    let mut candidates = Vec::with_capacity(k.saturating_mul(segments.len()));
+    let can_prune_segments = query_terms
+        .iter()
+        .all(|(_, weight)| *weight >= 0.0 && weight.is_finite());
+
+    if can_prune_segments {
+        let mut order = Vec::with_capacity(segments.len());
+        for (index, segment) in segments.iter().enumerate() {
+            let mut upper_bound = 0.0;
+            for &(term_id, query_weight) in &query_terms {
+                upper_bound += query_weight * segment.max_weight(term_id)? as f32;
+            }
+            if upper_bound > 0.0 || !upper_bound.is_finite() {
+                order.push((index, upper_bound));
+            } else {
+                stats.segments_pruned += 1;
+            }
+        }
+        order.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+
+        let mut threshold = 0.0;
+        for (index, upper_bound) in order {
+            if candidates.len() >= k && upper_bound < threshold {
+                stats.segments_pruned += 1;
+                continue;
+            }
+            stats.segments_scored += 1;
+            candidates.extend(segments[index].top_k_weighted_u32(&query_terms, k)?);
+            if candidates.len() >= k {
+                candidates = crate::top_k_scored_docs(candidates, k);
+                threshold = candidates.last().map_or(0.0, |(_, score)| *score);
+            }
+        }
+    } else {
+        for segment in segments.iter_mut() {
+            stats.segments_scored += 1;
+            candidates.extend(segment.top_k_weighted_u32(&query_terms, k)?);
+        }
+    }
+
+    Ok(RawTopKSearchResult {
+        hits: crate::top_k_scored_docs(candidates, k),
+        stats,
+    })
+}
+
 fn read_exact_at(file: &mut File, offset: u64, len: u64) -> Result<Vec<u8>, RawSegmentFileError> {
     let len = usize::try_from(len).map_err(|_| Error::SegmentTooLarge)?;
     let mut bytes = vec![0; len];
@@ -4500,9 +4598,41 @@ mod tests {
         let mut second_segment = RawSegmentFile::open(&second_path).unwrap();
         let mut segments = [&mut first_segment, &mut second_segment];
 
+        let result = top_k_weighted_u32_files_with_stats(&mut segments, &[(7, 1.0)], 1).unwrap();
+        assert_eq!(result.hits, vec![(1, 5.0)]);
         assert_eq!(
-            top_k_weighted_u32_files(&mut segments, &[(7, 1.0)], 1).unwrap(),
-            vec![(1, 5.0)]
+            result.stats,
+            RawTopKSearchStats {
+                segments_seen: 2,
+                segments_scored: 2,
+                segments_pruned: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn raw_segment_files_report_threshold_pruning() {
+        let first_docs = [RawDocument::new(10, &[(7, 100)])];
+        let second_docs = [RawDocument::new(1, &[(7, 1)])];
+        let dir = tempfile::tempdir().unwrap();
+        let first_path = dir.path().join("first.raw");
+        let second_path = dir.path().join("second.raw");
+        std::fs::write(&first_path, write_u64_u32_segment(&first_docs).unwrap()).unwrap();
+        std::fs::write(&second_path, write_u64_u32_segment(&second_docs).unwrap()).unwrap();
+        let mut first_segment = RawSegmentFile::open(&first_path).unwrap();
+        let mut second_segment = RawSegmentFile::open(&second_path).unwrap();
+        let mut segments = [&mut first_segment, &mut second_segment];
+
+        let result = top_k_weighted_u32_files_with_stats(&mut segments, &[(7, 1.0)], 1).unwrap();
+
+        assert_eq!(result.hits, vec![(10, 100.0)]);
+        assert_eq!(
+            result.stats,
+            RawTopKSearchStats {
+                segments_seen: 2,
+                segments_scored: 1,
+                segments_pruned: 1,
+            }
         );
     }
 
@@ -4519,9 +4649,17 @@ mod tests {
         let mut second_segment = RawSegmentFile::open(&second_path).unwrap();
         let mut segments = [&mut first_segment, &mut second_segment];
 
-        assert!(top_k_weighted_u32_files(&mut segments, &[(99, 1.0)], 10)
-            .unwrap()
-            .is_empty());
+        let result = top_k_weighted_u32_files_with_stats(&mut segments, &[(99, 1.0)], 10).unwrap();
+
+        assert!(result.hits.is_empty());
+        assert_eq!(
+            result.stats,
+            RawTopKSearchStats {
+                segments_seen: 2,
+                segments_scored: 0,
+                segments_pruned: 2,
+            }
+        );
     }
 
     #[test]
