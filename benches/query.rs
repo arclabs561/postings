@@ -9,7 +9,8 @@ use postings::positional::PosingsIndex;
 #[cfg(feature = "raw-segment")]
 use postings::raw::{
     top_k_weighted_u32_files, write_u64_u32_segment, write_u64_u32_segment_from_iter,
-    write_u64_u32_segment_from_iter_to, write_u64_u32_segment_to, RawDocument, RawSegment,
+    write_u64_u32_segment_from_iter_to, write_u64_u32_segment_sorted_from_iter,
+    write_u64_u32_segment_sorted_from_iter_to, write_u64_u32_segment_to, RawDocument, RawSegment,
     RawSegmentFile,
 };
 use postings::{CandidatePlan, PlannerConfig, PostingsIndex};
@@ -583,6 +584,37 @@ fn bench_raw_segment_queries(c: &mut Criterion) {
                     .enumerate()
                     .map(|(doc_id, terms)| RawDocument::new(doc_id as u32, terms));
                 write_u64_u32_segment_from_iter_to(black_box(docs), &mut out).unwrap();
+                black_box(out.len());
+            },
+            criterion::BatchSize::SmallInput,
+        );
+    });
+
+    group.bench_function("write_10k_sorted_iter_vec", |b| {
+        b.iter(|| {
+            let docs = weighted_docs
+                .iter()
+                .take(writer_doc_count)
+                .enumerate()
+                .map(|(doc_id, terms)| RawDocument::new(doc_id as u32, terms));
+            black_box(
+                write_u64_u32_segment_sorted_from_iter(black_box(docs))
+                    .unwrap()
+                    .len(),
+            );
+        });
+    });
+
+    group.bench_function("write_10k_sorted_iter_sink_vec", |b| {
+        b.iter_batched(
+            || Vec::with_capacity(writer_segment_len),
+            |mut out| {
+                let docs = weighted_docs
+                    .iter()
+                    .take(writer_doc_count)
+                    .enumerate()
+                    .map(|(doc_id, terms)| RawDocument::new(doc_id as u32, terms));
+                write_u64_u32_segment_sorted_from_iter_to(black_box(docs), &mut out).unwrap();
                 black_box(out.len());
             },
             criterion::BatchSize::SmallInput,

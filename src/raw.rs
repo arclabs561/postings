@@ -101,6 +101,15 @@ pub enum Error {
         /// Duplicate document id.
         doc_id: DocId,
     },
+    /// A sorted raw segment writer received a smaller document id after a
+    /// larger one.
+    #[error("raw segment doc ids must be increasing: previous {previous}, current {current}")]
+    UnsortedDocId {
+        /// Previous document id in the input stream.
+        previous: DocId,
+        /// Current document id that violated the ordering requirement.
+        current: DocId,
+    },
     /// A raw posting used a zero term weight.
     #[error("zero raw segment weight for doc {doc_id}, term {term_id}")]
     ZeroWeight {
@@ -3272,6 +3281,22 @@ where
     Ok(raw_segment_sections_to_vec(&sections))
 }
 
+/// Encode an increasing-document-id iterator into the first raw `u64` term,
+/// `u32` weight segment format.
+///
+/// This avoids both a caller-side `Vec<RawDocument>` and the encoder's
+/// whole-corpus document map. The encoder still materializes segment
+/// directories and posting payload bytes internally. Input document ids must be
+/// strictly increasing; duplicate ids return [`Error::DuplicateDocId`] and
+/// decreasing ids return [`Error::UnsortedDocId`].
+pub fn write_u64_u32_segment_sorted_from_iter<'a, I>(documents: I) -> Result<Vec<u8>, Error>
+where
+    I: IntoIterator<Item = RawDocument<'a>>,
+{
+    let sections = build_u64_u32_segment_sections_from_sorted_iter(documents)?;
+    Ok(raw_segment_sections_to_vec(&sections))
+}
+
 fn raw_segment_sections_to_vec(sections: &RawSegmentSections) -> Vec<u8> {
     let mut out = Vec::with_capacity(sections.final_len);
     put_header(&mut out, sections.meta);
@@ -3325,6 +3350,27 @@ where
     Ok(())
 }
 
+/// Encode an increasing-document-id iterator into a caller-provided raw segment
+/// writer.
+///
+/// This only emits segment bytes. Callers still own the file path, atomic
+/// publication, fsync policy, manifest update, deletes, and compaction.
+/// Compared with [`write_u64_u32_segment_from_iter_to`], this avoids the
+/// encoder's whole-corpus document map when the caller can provide strictly
+/// increasing document ids.
+pub fn write_u64_u32_segment_sorted_from_iter_to<'a, I, W>(
+    documents: I,
+    writer: &mut W,
+) -> Result<(), RawSegmentWriteError>
+where
+    I: IntoIterator<Item = RawDocument<'a>>,
+    W: Write + ?Sized,
+{
+    let sections = build_u64_u32_segment_sections_from_sorted_iter(documents)?;
+    write_raw_segment_sections_to(&sections, writer)?;
+    Ok(())
+}
+
 fn build_u64_u32_segment_sections(
     documents: &[RawDocument<'_>],
 ) -> Result<RawSegmentSections, Error> {
@@ -3338,6 +3384,53 @@ where
     I: IntoIterator<Item = RawDocument<'a>>,
 {
     build_u64_u32_segment_sections_from_docs(collect_raw_documents_from_iter(documents)?)
+}
+
+fn build_u64_u32_segment_sections_from_sorted_iter<'a, I>(
+    documents: I,
+) -> Result<RawSegmentSections, Error>
+where
+    I: IntoIterator<Item = RawDocument<'a>>,
+{
+    let mut postings: BTreeMap<RawTermId, Vec<(DocId, u32)>> = BTreeMap::new();
+    let mut doc_entries = Vec::new();
+    let mut total_doc_len = 0u64;
+    let mut previous_doc_id = None;
+
+    for doc in documents {
+        if let Some(previous) = previous_doc_id {
+            match doc.doc_id.cmp(&previous) {
+                std::cmp::Ordering::Less => {
+                    return Err(Error::UnsortedDocId {
+                        previous,
+                        current: doc.doc_id,
+                    });
+                }
+                std::cmp::Ordering::Equal => {
+                    return Err(Error::DuplicateDocId { doc_id: doc.doc_id });
+                }
+                std::cmp::Ordering::Greater => {}
+            }
+        }
+
+        let (doc_len, terms) = collect_raw_document_terms(doc.doc_id, doc.terms)?;
+        total_doc_len = total_doc_len.saturating_add(doc_len as u64);
+        doc_entries.push((doc.doc_id, doc_len));
+        for (term_id, weight) in terms {
+            postings
+                .entry(term_id)
+                .or_default()
+                .push((doc.doc_id, weight));
+        }
+        previous_doc_id = Some(doc.doc_id);
+    }
+
+    build_u64_u32_segment_sections_from_parts(
+        postings,
+        doc_entries,
+        total_doc_len,
+        previous_doc_id.unwrap_or(0),
+    )
 }
 
 fn collect_raw_documents_from_slice(
@@ -3371,6 +3464,15 @@ fn insert_raw_document(
         Entry::Occupied(_) => return Err(Error::DuplicateDocId { doc_id }),
     };
 
+    let (doc_len, terms) = collect_raw_document_terms(doc_id, input_terms)?;
+    entry.insert((doc_len, terms));
+    Ok(())
+}
+
+fn collect_raw_document_terms(
+    doc_id: DocId,
+    input_terms: &[(RawTermId, u32)],
+) -> Result<(u32, BTreeMap<RawTermId, u32>), Error> {
     let mut doc_len = 0u32;
     let mut terms: BTreeMap<RawTermId, u32> = BTreeMap::new();
     for &(term_id, weight) in input_terms {
@@ -3386,23 +3488,35 @@ fn insert_raw_document(
             .ok_or(Error::WeightOverflow { doc_id, term_id })?;
     }
 
-    entry.insert((doc_len, terms));
-    Ok(())
+    Ok((doc_len, terms))
 }
 
 fn build_u64_u32_segment_sections_from_docs(
     docs: RawDocumentMap,
 ) -> Result<RawSegmentSections, Error> {
     let mut postings: BTreeMap<RawTermId, Vec<(DocId, u32)>> = BTreeMap::new();
+    let mut doc_entries = Vec::with_capacity(docs.len());
     let mut total_doc_len = 0u64;
+    let mut max_doc_id = 0;
     for (&doc_id, (doc_len, terms)) in &docs {
         total_doc_len = total_doc_len.saturating_add(*doc_len as u64);
+        doc_entries.push((doc_id, *doc_len));
+        max_doc_id = doc_id;
         for (&term_id, &weight) in terms {
             postings.entry(term_id).or_default().push((doc_id, weight));
         }
     }
 
-    let doc_count = u32::try_from(docs.len()).map_err(|_| Error::TooManyDocuments)?;
+    build_u64_u32_segment_sections_from_parts(postings, doc_entries, total_doc_len, max_doc_id)
+}
+
+fn build_u64_u32_segment_sections_from_parts(
+    postings: BTreeMap<RawTermId, Vec<(DocId, u32)>>,
+    doc_entries: Vec<(DocId, u32)>,
+    total_doc_len: u64,
+    max_doc_id: DocId,
+) -> Result<RawSegmentSections, Error> {
+    let doc_count = u32::try_from(doc_entries.len()).map_err(|_| Error::TooManyDocuments)?;
     let term_count = u32::try_from(postings.len()).map_err(|_| Error::TooManyTerms)?;
     let term_dir_offset = HEADER_LEN as u64;
     let term_dir_len = (term_count as u64)
@@ -3512,16 +3626,12 @@ fn build_u64_u32_segment_sections_from_docs(
         .checked_add(FOOTER_LEN as u64)
         .ok_or(Error::SegmentTooLarge)?;
     let final_len = usize::try_from(final_len).map_err(|_| Error::SegmentTooLarge)?;
-    let doc_entries = docs
-        .iter()
-        .map(|(&doc_id, (doc_len, _))| (doc_id, *doc_len))
-        .collect();
 
     Ok(RawSegmentSections {
         meta: RawSegmentMeta {
             term_count,
             doc_count,
-            max_doc_id: docs.keys().next_back().copied().unwrap_or(0),
+            max_doc_id,
             block_size: DEFAULT_BLOCK_SIZE,
             total_doc_len,
             term_dir_offset,
@@ -4288,6 +4398,54 @@ mod tests {
 
         assert_eq!(from_iter, expected);
         assert_eq!(written, expected);
+    }
+
+    #[test]
+    fn raw_segment_sorted_iterator_writer_matches_slice_writer() {
+        let term_docs = [
+            vec![(10, 1), (20, 2), (10, 3)],
+            vec![(10, 1), (30, 1)],
+            vec![(20, 1), (40, 5)],
+        ];
+        let docs = [
+            RawDocument::new(2, term_docs[0].as_slice()),
+            RawDocument::new(5, term_docs[1].as_slice()),
+            RawDocument::new(9, term_docs[2].as_slice()),
+        ];
+
+        let expected = write_u64_u32_segment(&docs).unwrap();
+        let from_iter = write_u64_u32_segment_sorted_from_iter(docs.iter().copied()).unwrap();
+        let mut written = Vec::new();
+        write_u64_u32_segment_sorted_from_iter_to(docs.iter().copied(), &mut written).unwrap();
+
+        assert_eq!(from_iter, expected);
+        assert_eq!(written, expected);
+        RawSegment::open(&written).unwrap();
+    }
+
+    #[test]
+    fn raw_segment_sorted_iterator_rejects_unsorted_doc_ids() {
+        let term = vec![(10, 1)];
+        let decreasing = [
+            RawDocument::new(5, term.as_slice()),
+            RawDocument::new(2, term.as_slice()),
+        ];
+        assert_eq!(
+            write_u64_u32_segment_sorted_from_iter(decreasing).unwrap_err(),
+            Error::UnsortedDocId {
+                previous: 5,
+                current: 2
+            }
+        );
+
+        let duplicate = [
+            RawDocument::new(5, term.as_slice()),
+            RawDocument::new(5, term.as_slice()),
+        ];
+        assert_eq!(
+            write_u64_u32_segment_sorted_from_iter(duplicate).unwrap_err(),
+            Error::DuplicateDocId { doc_id: 5 }
+        );
     }
 
     #[test]

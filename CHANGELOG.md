@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added sorted-document raw segment writer APIs for callers that can provide
+  strictly increasing document ids, reducing encoder memory by avoiding the
+  whole-corpus document map before postings are written.
+
 ## [0.2.4] - 2026-07-03
 
 ### Added
