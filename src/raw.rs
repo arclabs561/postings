@@ -561,6 +561,39 @@ impl<'a> RawSegment<'a> {
         })
     }
 
+    /// Visit decoded postings and document lengths for one encoded block.
+    ///
+    /// Missing terms visit nothing. A present term with an out-of-range block
+    /// index returns the same layout error as [`Self::posting_block_postings`].
+    pub fn for_each_posting_block_with_document_len(
+        &self,
+        term_id: RawTermId,
+        block_index: u32,
+        visit: impl FnMut(DocId, u32, u32),
+    ) -> Result<(), Error> {
+        let Some((entry, block_directory)) = self.term_entry_with_blocks(term_id)? else {
+            return Ok(());
+        };
+        self.validate_block_directory(block_directory)?;
+        let block = self.posting_block_at(entry, block_directory, block_index)?;
+        let range = checked_range(
+            block.postings_offset,
+            block.postings_len as u64,
+            self.bytes.len(),
+            "postings",
+        )?;
+        let bytes = &self.bytes[range];
+        self.verify_block_checksum(block_directory, block_index, block, bytes)?;
+        for_each_posting_in_block_with_document_len(
+            self.doc_meta_bytes()?,
+            self.meta.doc_count,
+            entry.term_id,
+            bytes,
+            block,
+            visit,
+        )
+    }
+
     /// Candidate documents that contain every term id.
     pub fn candidates_all_terms(&self, query_terms: &[RawTermId]) -> Result<Vec<DocId>, Error> {
         if query_terms.is_empty() {
@@ -1474,6 +1507,34 @@ impl RawSegmentFile {
             |doc_id, weight| out.push((doc_id, weight)),
         )?;
         Ok(out)
+    }
+
+    /// Visit decoded postings and document lengths for one encoded block.
+    ///
+    /// Missing terms visit nothing. A present term with an out-of-range block
+    /// index returns the same layout error as [`Self::posting_block_postings`].
+    pub fn for_each_posting_block_with_document_len(
+        &mut self,
+        term_id: RawTermId,
+        block_index: u32,
+        visit: impl FnMut(DocId, u32, u32),
+    ) -> Result<(), RawSegmentFileError> {
+        let Some((entry, block_directory)) = self.term_entry_with_blocks(term_id)? else {
+            return Ok(());
+        };
+        self.validate_block_directory(block_directory)?;
+        let block = self.posting_block_at(entry, block_directory, block_index)?;
+        let bytes =
+            self.read_posting_block_range(block.postings_offset, block.postings_len as u64)?;
+        for_each_posting_in_block_with_document_len(
+            &self.doc_meta,
+            self.meta.doc_count,
+            entry.term_id,
+            &bytes,
+            block,
+            visit,
+        )
+        .map_err(Into::into)
     }
 
     /// Candidate documents that contain every term id.
@@ -2442,6 +2503,26 @@ impl<'a> DocLengthCursor<'a> {
         }
     }
 
+    fn starting_at(doc_meta: &'a [u8], doc_count: u32, min_doc_id: DocId) -> Result<Self, Error> {
+        let mut low = 0u32;
+        let mut high = doc_count;
+        while low < high {
+            let mid = low + ((high - low) / 2);
+            let offset = doc_meta_offset(mid)?;
+            let current = read_u32_at(doc_meta, offset, "doc metadata")?;
+            if current < min_doc_id {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        Ok(Self {
+            doc_meta,
+            doc_count,
+            next: low,
+        })
+    }
+
     fn get(&mut self, doc_id: DocId) -> Result<Option<u32>, Error> {
         while self.next < self.doc_count {
             let offset = doc_meta_offset(self.next)?;
@@ -2491,6 +2572,42 @@ fn doc_meta_offset(index: u32) -> Result<usize, Error> {
             reason: "doc entry offset overflows",
         })?;
     usize::try_from(offset).map_err(|_| Error::SegmentTooLarge)
+}
+
+fn for_each_posting_in_block_with_document_len(
+    doc_meta: &[u8],
+    doc_count: u32,
+    term_id: RawTermId,
+    bytes: &[u8],
+    block: RawPostingBlockMeta,
+    mut visit: impl FnMut(DocId, u32, u32),
+) -> Result<(), Error> {
+    let mut lengths = DocLengthCursor::starting_at(doc_meta, doc_count, block.base_doc_id)?;
+    let mut lookup_error = None;
+    for_each_posting_in_block(
+        term_id,
+        bytes,
+        block.base_doc_id,
+        block.last_doc_id,
+        |doc_id, weight| {
+            if lookup_error.is_some() {
+                return;
+            }
+            match lengths.get(doc_id) {
+                Ok(Some(doc_len)) => visit(doc_id, weight, doc_len),
+                Ok(None) => {
+                    lookup_error = Some(Error::InvalidLayout {
+                        reason: "posting doc id has no document metadata",
+                    });
+                }
+                Err(err) => lookup_error = Some(err),
+            }
+        },
+    )?;
+    if let Some(err) = lookup_error {
+        return Err(err);
+    }
+    Ok(())
 }
 
 fn for_each_posting_in_block(
@@ -3501,6 +3618,24 @@ mod tests {
             .unwrap()
     }
 
+    fn collect_block_with_lens(
+        segment: &RawSegment<'_>,
+        term_id: RawTermId,
+        block_index: u32,
+    ) -> Vec<(DocId, u32, u32)> {
+        let mut out = Vec::new();
+        segment
+            .for_each_posting_block_with_document_len(
+                term_id,
+                block_index,
+                |doc_id, weight, len| {
+                    out.push((doc_id, weight, len));
+                },
+            )
+            .unwrap();
+        out
+    }
+
     fn strip_checksums_for_test(bytes: &[u8]) -> Vec<u8> {
         let meta = parse_header(bytes).unwrap();
         assert!(meta.has_checksums());
@@ -3635,8 +3770,20 @@ mod tests {
         assert_eq!(first_block[0], (0, 1));
         assert_eq!(first_block[127], (127, 1));
         assert_eq!(collect_block(&segment, 7, 1), vec![(128, 1), (129, 1)]);
+        let first_block_with_lens = collect_block_with_lens(&segment, 7, 0);
+        assert_eq!(first_block_with_lens.len(), 128);
+        assert_eq!(first_block_with_lens[0], (0, 1, 1));
+        assert_eq!(first_block_with_lens[127], (127, 1, 1));
+        assert_eq!(
+            collect_block_with_lens(&segment, 7, 1),
+            vec![(128, 1, 1), (129, 1, 1)]
+        );
         assert!(collect_block(&segment, 999, 0).is_empty());
+        assert!(collect_block_with_lens(&segment, 999, 0).is_empty());
         assert!(segment.posting_block_postings(7, 2).is_err());
+        assert!(segment
+            .for_each_posting_block_with_document_len(7, 2, |_, _, _| {})
+            .is_err());
     }
 
     #[test]
@@ -3715,6 +3862,23 @@ mod tests {
             segment.posting_block_postings(10, 0).unwrap(),
             vec![(2, 1), (5, 4)]
         );
+        let mut block_with_lens = Vec::new();
+        segment
+            .for_each_posting_block_with_document_len(10, 0, |doc_id, weight, doc_len| {
+                block_with_lens.push((doc_id, weight, doc_len));
+            })
+            .unwrap();
+        assert_eq!(block_with_lens, vec![(2, 1, 1), (5, 4, 6)]);
+        let mut missing_block_with_lens = Vec::new();
+        segment
+            .for_each_posting_block_with_document_len(999, 0, |doc_id, weight, doc_len| {
+                missing_block_with_lens.push((doc_id, weight, doc_len));
+            })
+            .unwrap();
+        assert!(missing_block_with_lens.is_empty());
+        assert!(segment
+            .for_each_posting_block_with_document_len(10, 1, |_, _, _| {})
+            .is_err());
         assert_eq!(segment.candidates_all_terms(&[10, 20]).unwrap(), vec![5]);
         assert_eq!(
             segment.candidates_any_terms(&[10, 20]).unwrap(),
@@ -3828,6 +3992,15 @@ mod tests {
                 section: "posting block"
             }
         );
+        let err = segment
+            .for_each_posting_block_with_document_len(7, 0, |_, _, _| {})
+            .unwrap_err();
+        assert_eq!(
+            err,
+            Error::ChecksumMismatch {
+                section: "posting block"
+            }
+        );
         assert_eq!(collect_postings(&segment, 11), vec![(9, 2)]);
 
         // File-backed behavior matches: directories are intact, so open
@@ -3840,6 +4013,13 @@ mod tests {
         assert!(
             err.to_string().contains("checksum mismatch"),
             "reading the corrupted block must fail: {err}"
+        );
+        let err = file_segment
+            .for_each_posting_block_with_document_len(7, 0, |_, _, _| {})
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("checksum mismatch"),
+            "reading the corrupted block with doc lengths must fail: {err}"
         );
         assert_eq!(
             file_segment.postings(11).unwrap(),
@@ -3924,6 +4104,21 @@ mod tests {
             .unwrap();
 
         assert_eq!(blocked, collect_postings(&segment, 7));
+
+        for block_index in 0..segment.posting_blocks(7).unwrap().len() as u32 {
+            let expected = collect_block_with_lens(&segment, 7, block_index);
+            let mut got = Vec::new();
+            file_segment
+                .for_each_posting_block_with_document_len(
+                    7,
+                    block_index,
+                    |doc_id, weight, doc_len| {
+                        got.push((doc_id, weight, doc_len));
+                    },
+                )
+                .unwrap();
+            assert_eq!(got, expected, "block {block_index}");
+        }
     }
 
     #[test]
