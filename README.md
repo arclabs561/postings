@@ -4,16 +4,18 @@
 [![Documentation](https://docs.rs/postings/badge.svg)](https://docs.rs/postings)
 [![CI](https://github.com/arclabs561/postings/actions/workflows/ci.yml/badge.svg)](https://github.com/arclabs561/postings/actions/workflows/ci.yml)
 
-Inverted-index postings lists with segment-style updates.
-Supports `u32` term frequencies (classical IR) and `f32` weights
-(SPLADE / learned-sparse retrieval).
+Inverted index postings lists and codecs.
+
+Supports `u32` term frequencies for classical IR and `f32` weights for learned
+sparse retrieval.
 
 ## Data Model & Invariants
 
 - **Doc IDs**: `u32`. Must be dense/contiguous for optimal compression.
 - **Ordering**: Postings lists are always sorted by Doc ID.
 - **Updates**: Segment-based. Deletions are tombstones; updates are delete+add.
-- **Storage**: In-memory by default. Persistence via `durability` (optional).
+- **Storage**: In-memory by default; optional persistence and raw file-backed
+  segment readers.
 
 ## Usage
 
@@ -76,6 +78,8 @@ assert_eq!(ranking[0].0, 1);
 Runnable examples live in [`examples/`](examples/):
 
 - `durable_roundtrip` pairs `postings` with `durability` to build a crash-recoverable inverted index: update events go to a record log, snapshots to a checkpoint, and the index rebuilds from both, the persistence pattern a search engine needs to survive restarts.
+- `splade_weighted` scores a small learned-sparse collection with `f32` weights
+  and verifies top-k sparse inner-product search.
 
 ## File-backed segments
 
@@ -97,12 +101,12 @@ sidecars or an application manifest when lifecycle guarantees are needed.
 
 ## Features
 
-- `postings/serde`: enable serde for the in-memory structures.
-- `postings/persistence`: enable save/load helpers via `durability` + `postcard`.
-- `postings/sbits`: enable succinct monotone sequences (Elias–Fano) under `postings::codec::ef`.
-- `postings/positional`: enable positional postings (`postings::positional::PosingsIndex`).
-- `postings/cnk-compression`: enable optional compressed-candidate helpers under `postings::positional::cnk_candidates`.
-- `postings/raw-segment`: enable the experimental byte- and file-backed raw segment reader.
+- `serde`: enable serde for the in-memory structures.
+- `persistence`: enable save/load helpers via `durability` + `postcard`.
+- `sbits`: enable succinct monotone sequences (Elias-Fano) under `postings::codec::ef`.
+- `positional`: enable positional postings (`postings::positional::PositionalIndex`).
+- `cnk-compression`: enable optional compressed-candidate helpers under `postings::positional::cnk_candidates`.
+- `raw-segment`: enable the experimental byte- and file-backed raw segment reader.
 
 ## Optional: positional postings
 
@@ -113,7 +117,9 @@ Enable positional postings behind a feature flag:
 postings = { version = "0.2", features = ["positional"] }
 ```
 
-Then use `postings::positional::PosingsIndex` for phrase/proximity evaluation.
+Then use `postings::positional::PositionalIndex` for phrase/proximity
+evaluation. `PosingsIndex` remains as the historical name from the older
+`posings` crate.
 
 ## Development
 
