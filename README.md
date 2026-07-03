@@ -94,9 +94,10 @@ It is the path intended for large lexical and learned-sparse indexes whose
 posting payloads should not be rebuilt into a full `PostingsIndex` on every
 open.
 
-Raw segments can be encoded into a `Vec<u8>` or a caller-provided `Write` sink.
-The writer API avoids requiring the final segment as one contiguous allocation
-when the caller wants to stream bytes into its own durability layer.
+Raw segments can be encoded from a slice or document iterator into a `Vec<u8>`
+or a caller-provided `Write` sink. The writer API avoids requiring the final
+segment as one contiguous allocation when the caller wants to stream bytes into
+its own durability layer.
 
 `RawSegmentFile::top_k_weighted_u32` scores one raw file by sparse inner product;
 `top_k_weighted_u32_files` merges exact top-k results across raw files when

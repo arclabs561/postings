@@ -9,6 +9,9 @@
 - Added `write_u64_u32_segment_to` for emitting raw segments into
   caller-provided writers without requiring the final segment as one contiguous
   `Vec<u8>`.
+- Added `write_u64_u32_segment_from_iter` and
+  `write_u64_u32_segment_from_iter_to` so raw segment callers can stream
+  document views into the encoder without first building a `Vec<RawDocument>`.
 - Added borrowed-term positional query helpers:
   `PosingsIndex::phrase_match_strs` and `near_match_terms_strs`.
 

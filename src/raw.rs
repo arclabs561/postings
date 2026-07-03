@@ -6,7 +6,7 @@
 
 use crate::codec::varint;
 use crate::{CandidatePlan, DocId, PlannerConfig};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{btree_map::Entry, BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -325,6 +325,8 @@ struct RawSegmentSections {
     block_crcs: Vec<u32>,
     final_len: usize,
 }
+
+type RawDocumentMap = BTreeMap<DocId, (u32, BTreeMap<RawTermId, u32>)>;
 
 struct RawBlockScoringList {
     entry: TermEntry,
@@ -3254,11 +3256,28 @@ impl Iterator for RawPostingBlockPostings<'_> {
 /// Encode documents into the first raw `u64` term, `u32` weight segment format.
 pub fn write_u64_u32_segment(documents: &[RawDocument<'_>]) -> Result<Vec<u8>, Error> {
     let sections = build_u64_u32_segment_sections(documents)?;
+    Ok(raw_segment_sections_to_vec(&sections))
+}
+
+/// Encode an iterator of documents into the first raw `u64` term, `u32` weight
+/// segment format.
+///
+/// This avoids a caller-side `Vec<RawDocument>`; the encoder still materializes
+/// segment directories and posting payload bytes internally.
+pub fn write_u64_u32_segment_from_iter<'a, I>(documents: I) -> Result<Vec<u8>, Error>
+where
+    I: IntoIterator<Item = RawDocument<'a>>,
+{
+    let sections = build_u64_u32_segment_sections_from_iter(documents)?;
+    Ok(raw_segment_sections_to_vec(&sections))
+}
+
+fn raw_segment_sections_to_vec(sections: &RawSegmentSections) -> Vec<u8> {
     let mut out = Vec::with_capacity(sections.final_len);
     put_header(&mut out, sections.meta);
-    let term_dir_crc = append_term_directory(&mut out, &sections);
-    let doc_meta_crc = append_document_metadata(&mut out, &sections);
-    let block_dir_crc = append_block_directory(&mut out, &sections);
+    let term_dir_crc = append_term_directory(&mut out, sections);
+    let doc_meta_crc = append_document_metadata(&mut out, sections);
+    let block_dir_crc = append_block_directory(&mut out, sections);
     out.extend_from_slice(&sections.postings_bytes);
     put_integrity_section(
         &mut out,
@@ -3271,7 +3290,7 @@ pub fn write_u64_u32_segment(documents: &[RawDocument<'_>]) -> Result<Vec<u8>, E
     put_u32(&mut out, VERSION);
 
     debug_assert_eq!(out.len(), sections.final_len);
-    Ok(out)
+    out
 }
 
 /// Encode documents into a caller-provided raw segment writer.
@@ -3287,39 +3306,93 @@ pub fn write_u64_u32_segment_to<W: Write + ?Sized>(
     Ok(())
 }
 
+/// Encode an iterator of documents into a caller-provided raw segment writer.
+///
+/// This only emits segment bytes. Callers still own the file path, atomic
+/// publication, fsync policy, manifest update, deletes, and compaction.
+/// The encoder still materializes segment directories and posting payload bytes
+/// internally; use this to avoid a caller-side `Vec<RawDocument>`.
+pub fn write_u64_u32_segment_from_iter_to<'a, I, W>(
+    documents: I,
+    writer: &mut W,
+) -> Result<(), RawSegmentWriteError>
+where
+    I: IntoIterator<Item = RawDocument<'a>>,
+    W: Write + ?Sized,
+{
+    let sections = build_u64_u32_segment_sections_from_iter(documents)?;
+    write_raw_segment_sections_to(&sections, writer)?;
+    Ok(())
+}
+
 fn build_u64_u32_segment_sections(
     documents: &[RawDocument<'_>],
 ) -> Result<RawSegmentSections, Error> {
-    let mut docs: BTreeMap<DocId, (u32, BTreeMap<RawTermId, u32>)> = BTreeMap::new();
+    build_u64_u32_segment_sections_from_docs(collect_raw_documents_from_slice(documents)?)
+}
+
+fn build_u64_u32_segment_sections_from_iter<'a, I>(
+    documents: I,
+) -> Result<RawSegmentSections, Error>
+where
+    I: IntoIterator<Item = RawDocument<'a>>,
+{
+    build_u64_u32_segment_sections_from_docs(collect_raw_documents_from_iter(documents)?)
+}
+
+fn collect_raw_documents_from_slice(
+    documents: &[RawDocument<'_>],
+) -> Result<RawDocumentMap, Error> {
+    let mut docs = BTreeMap::new();
     for doc in documents {
-        if docs.contains_key(&doc.doc_id) {
-            return Err(Error::DuplicateDocId { doc_id: doc.doc_id });
-        }
+        insert_raw_document(&mut docs, doc.doc_id, doc.terms)?;
+    }
+    Ok(docs)
+}
 
-        let mut doc_len = 0u32;
-        let mut terms: BTreeMap<RawTermId, u32> = BTreeMap::new();
-        for &(term_id, weight) in doc.terms {
-            if weight == 0 {
-                return Err(Error::ZeroWeight {
-                    doc_id: doc.doc_id,
-                    term_id,
-                });
-            }
-            doc_len = doc_len
-                .checked_add(weight)
-                .ok_or(Error::DocLengthOverflow { doc_id: doc.doc_id })?;
-            let accumulated = terms.entry(term_id).or_insert(0);
-            *accumulated = accumulated
-                .checked_add(weight)
-                .ok_or(Error::WeightOverflow {
-                    doc_id: doc.doc_id,
-                    term_id,
-                })?;
-        }
+fn collect_raw_documents_from_iter<'a, I>(documents: I) -> Result<RawDocumentMap, Error>
+where
+    I: IntoIterator<Item = RawDocument<'a>>,
+{
+    let mut docs = BTreeMap::new();
+    for doc in documents {
+        insert_raw_document(&mut docs, doc.doc_id, doc.terms)?;
+    }
+    Ok(docs)
+}
 
-        docs.insert(doc.doc_id, (doc_len, terms));
+fn insert_raw_document(
+    docs: &mut RawDocumentMap,
+    doc_id: DocId,
+    input_terms: &[(RawTermId, u32)],
+) -> Result<(), Error> {
+    let entry = match docs.entry(doc_id) {
+        Entry::Vacant(entry) => entry,
+        Entry::Occupied(_) => return Err(Error::DuplicateDocId { doc_id }),
+    };
+
+    let mut doc_len = 0u32;
+    let mut terms: BTreeMap<RawTermId, u32> = BTreeMap::new();
+    for &(term_id, weight) in input_terms {
+        if weight == 0 {
+            return Err(Error::ZeroWeight { doc_id, term_id });
+        }
+        doc_len = doc_len
+            .checked_add(weight)
+            .ok_or(Error::DocLengthOverflow { doc_id })?;
+        let accumulated = terms.entry(term_id).or_insert(0);
+        *accumulated = accumulated
+            .checked_add(weight)
+            .ok_or(Error::WeightOverflow { doc_id, term_id })?;
     }
 
+    entry.insert((doc_len, terms));
+    Ok(())
+}
+
+fn build_u64_u32_segment_sections_from_docs(
+    docs: RawDocumentMap,
+) -> Result<RawSegmentSections, Error> {
     let mut postings: BTreeMap<RawTermId, Vec<(DocId, u32)>> = BTreeMap::new();
     let mut total_doc_len = 0u64;
     for (&doc_id, (doc_len, terms)) in &docs {
@@ -4190,6 +4263,31 @@ mod tests {
 
         assert_eq!(written, expected);
         RawSegment::open(&written).unwrap();
+    }
+
+    #[test]
+    fn raw_segment_iterator_writer_matches_slice_writer() {
+        let term_docs = [vec![(10, 1), (20, 2), (10, 3)], vec![(10, 1), (30, 1)]];
+        let docs = [
+            RawDocument::new(2, term_docs[0].as_slice()),
+            RawDocument::new(5, term_docs[1].as_slice()),
+        ];
+
+        let expected = write_u64_u32_segment(&docs).unwrap();
+        let iter = term_docs
+            .iter()
+            .enumerate()
+            .map(|(doc_id, terms)| RawDocument::new((doc_id as DocId) * 3 + 2, terms));
+        let from_iter = write_u64_u32_segment_from_iter(iter).unwrap();
+        let mut written = Vec::new();
+        let iter = term_docs
+            .iter()
+            .enumerate()
+            .map(|(doc_id, terms)| RawDocument::new((doc_id as DocId) * 3 + 2, terms));
+        write_u64_u32_segment_from_iter_to(iter, &mut written).unwrap();
+
+        assert_eq!(from_iter, expected);
+        assert_eq!(written, expected);
     }
 
     #[test]
