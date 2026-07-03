@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-02
+
 ### Added
 
 - Added a raw-segment reader design for the first larger-than-memory postings

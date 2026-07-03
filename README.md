@@ -19,7 +19,7 @@ Supports `u32` term frequencies (classical IR) and `f32` weights
 
 ```toml
 [dependencies]
-postings = "0.1"
+postings = "0.2"
 ```
 
 Example (index + candidates):
@@ -92,7 +92,7 @@ Enable positional postings behind a feature flag:
 
 ```toml
 [dependencies]
-postings = { version = "0.1", features = ["positional"] }
+postings = { version = "0.2", features = ["positional"] }
 ```
 
 Then use `postings::positional::PosingsIndex` for phrase/proximity evaluation.
