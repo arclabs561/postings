@@ -13,7 +13,8 @@ sparse retrieval.
 
 - **Doc IDs**: `u32`. Must be dense/contiguous for optimal compression.
 - **Ordering**: Postings lists are always sorted by Doc ID.
-- **Updates**: Segment-based. Deletions are tombstones; updates are delete+add.
+- **Updates**: `PostingsIndex` supports in-memory add/delete. Raw file segments
+  are immutable; a store or application manifest owns deletes and compaction.
 - **Storage**: In-memory by default; optional persistence and raw file-backed
   segment readers.
 
