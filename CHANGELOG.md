@@ -10,6 +10,8 @@
 - Added a seekable term-major raw segment writer for local-file style sinks that
   can reserve directories, stream posting blocks once, then backpatch metadata.
 - Added a raw-segment multi-file top-k benchmark for many small segment files.
+- Added `RawSegment::doc_id_range` and `RawSegmentFile::doc_id_range` for
+  consumers that need a compact segment-local document-id span.
 
 ### Changed
 

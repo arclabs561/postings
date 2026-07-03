@@ -615,6 +615,15 @@ impl<'a> RawSegment<'a> {
         self.meta.doc_count
     }
 
+    /// Lowest and highest document ids in the segment, or `None` when empty.
+    pub fn doc_id_range(&self) -> Result<Option<(DocId, DocId)>, Error> {
+        doc_id_range_in_doc_meta(
+            self.doc_meta_bytes()?,
+            self.meta.doc_count,
+            self.meta.max_doc_id,
+        )
+    }
+
     /// Average document length in the segment.
     pub fn avg_doc_len(&self) -> f32 {
         self.meta.avg_doc_len()
@@ -1601,6 +1610,11 @@ impl RawSegmentFile {
     /// Number of documents in the segment.
     pub fn num_docs(&self) -> u32 {
         self.meta.doc_count
+    }
+
+    /// Lowest and highest document ids in the segment, or `None` when empty.
+    pub fn doc_id_range(&self) -> Result<Option<(DocId, DocId)>, Error> {
+        doc_id_range_in_doc_meta(&self.doc_meta, self.meta.doc_count, self.meta.max_doc_id)
     }
 
     /// Average document length in the segment.
@@ -2931,11 +2945,11 @@ fn dense_doc_id_range_in_doc_meta(
     doc_count: u32,
     max_doc_id: DocId,
 ) -> Result<Option<(DocId, usize)>, Error> {
-    if doc_count == 0 {
+    let Some((min_doc_id, max_doc_id)) = doc_id_range_in_doc_meta(doc_meta, doc_count, max_doc_id)?
+    else {
         return Ok(None);
-    }
+    };
 
-    let min_doc_id = read_u32_at(doc_meta, 0, "doc metadata")?;
     let span = max_doc_id
         .checked_sub(min_doc_id)
         .ok_or(Error::InvalidLayout {
@@ -2946,6 +2960,24 @@ fn dense_doc_id_range_in_doc_meta(
         .and_then(|span| span.checked_add(1))
         .ok_or(Error::SegmentTooLarge)?;
     Ok(Some((min_doc_id, dense_slots)))
+}
+
+fn doc_id_range_in_doc_meta(
+    doc_meta: &[u8],
+    doc_count: u32,
+    max_doc_id: DocId,
+) -> Result<Option<(DocId, DocId)>, Error> {
+    if doc_count == 0 {
+        return Ok(None);
+    }
+
+    let min_doc_id = read_u32_at(doc_meta, 0, "doc metadata")?;
+    if max_doc_id < min_doc_id {
+        return Err(Error::InvalidLayout {
+            reason: "max doc id precedes first document metadata",
+        });
+    }
+    Ok(Some((min_doc_id, max_doc_id)))
 }
 
 #[inline]
@@ -5062,6 +5094,7 @@ mod tests {
         assert_eq!(segment.num_docs(), 3);
         assert_eq!(segment.meta().term_count(), 3);
         assert_eq!(segment.meta().max_doc_id(), 9);
+        assert_eq!(segment.doc_id_range().unwrap(), Some((2, 9)));
         assert_eq!(segment.meta().total_doc_len(), 9);
         assert_eq!(segment.avg_doc_len(), 3.0);
         assert_eq!(segment.document_len(5).unwrap(), Some(6));
@@ -5536,6 +5569,7 @@ mod tests {
 
         assert_eq!(segment.num_docs(), 3);
         assert_eq!(segment.meta().term_count(), 2);
+        assert_eq!(segment.doc_id_range().unwrap(), Some((2, 9)));
         assert_eq!(segment.document_len(5).unwrap(), Some(6));
         assert_eq!(segment.document_len(999).unwrap(), None);
         let mut document_lengths = Vec::new();
