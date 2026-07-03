@@ -563,6 +563,24 @@ fn bench_raw_segment_queries(c: &mut Criterion) {
         });
     });
 
+    group.bench_function("postings_decode_common_with_lens", |b| {
+        b.iter(|| {
+            let mut checksum = 0u64;
+            segment
+                .for_each_posting_with_document_len(
+                    black_box(common_term),
+                    |doc_id, weight, len| {
+                        checksum = checksum
+                            .wrapping_add(doc_id as u64)
+                            .wrapping_add(weight as u64)
+                            .wrapping_add(len as u64);
+                    },
+                )
+                .unwrap();
+            black_box(checksum);
+        });
+    });
+
     group.bench_function("postings_decode_common_block_0", |b| {
         b.iter(|| {
             let postings = segment
@@ -578,6 +596,24 @@ fn bench_raw_segment_queries(c: &mut Criterion) {
         b.iter(|| {
             let postings = file_segment.postings(black_box(common_term)).unwrap();
             black_box(postings.len());
+        });
+    });
+
+    group.bench_function("file_postings_decode_common_with_lens", |b| {
+        b.iter(|| {
+            let mut checksum = 0u64;
+            file_segment
+                .for_each_posting_with_document_len(
+                    black_box(common_term),
+                    |doc_id, weight, len| {
+                        checksum = checksum
+                            .wrapping_add(doc_id as u64)
+                            .wrapping_add(weight as u64)
+                            .wrapping_add(len as u64);
+                    },
+                )
+                .unwrap();
+            black_box(checksum);
         });
     });
 

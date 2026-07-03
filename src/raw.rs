@@ -423,12 +423,16 @@ impl<'a> RawSegment<'a> {
         term_id: RawTermId,
         mut visit: impl FnMut(DocId, u32, u32),
     ) -> Result<(), Error> {
+        let Some(entry) = self.term_entry(term_id)? else {
+            return Ok(());
+        };
+        let mut lengths = DocLengthCursor::new(self.doc_meta_bytes()?, self.meta.doc_count);
         let mut lookup_error = None;
-        self.for_each_posting(term_id, |doc_id, weight| {
+        self.for_each_posting_in_entry(entry, |doc_id, weight| {
             if lookup_error.is_some() {
                 return;
             }
-            match self.document_len(doc_id) {
+            match lengths.get(doc_id) {
                 Ok(Some(doc_len)) => visit(doc_id, weight, doc_len),
                 Ok(None) => {
                     lookup_error = Some(Error::InvalidLayout {
@@ -883,6 +887,21 @@ impl<'a> RawSegment<'a> {
                 reason: "doc entry offset overflows",
             })?;
         usize::try_from(offset).map_err(|_| Error::SegmentTooLarge)
+    }
+
+    fn doc_meta_bytes(&self) -> Result<&'a [u8], Error> {
+        let len = (self.meta.doc_count as u64)
+            .checked_mul(DOC_ENTRY_LEN as u64)
+            .ok_or(Error::InvalidLayout {
+                reason: "doc metadata length overflows",
+            })?;
+        let range = checked_range(
+            self.meta.doc_meta_offset,
+            len,
+            self.bytes.len(),
+            "doc metadata",
+        )?;
+        Ok(&self.bytes[range])
     }
 
     fn posting_doc_ids(&self, entry: TermEntry) -> Result<Vec<DocId>, Error> {
@@ -1743,6 +1762,7 @@ impl RawSegmentFile {
         }
 
         let bytes = self.read_postings_range(entry.postings_offset, entry.postings_len as u64)?;
+        let mut lengths = DocLengthCursor::new(&self.doc_meta, self.meta.doc_count);
         let postings = RawPostings {
             term_id: entry.term_id,
             bytes: &bytes,
@@ -1754,10 +1774,9 @@ impl RawSegmentFile {
         };
         for posting in postings {
             let (doc_id, weight) = posting?;
-            let doc_len = document_len_in_doc_meta(&self.doc_meta, self.meta.doc_count, doc_id)?
-                .ok_or(Error::InvalidLayout {
-                    reason: "posting doc id has no document metadata",
-                })?;
+            let doc_len = lengths.get(doc_id)?.ok_or(Error::InvalidLayout {
+                reason: "posting doc id has no document metadata",
+            })?;
             visit(doc_id, weight, doc_len);
         }
         Ok(())
@@ -1782,11 +1801,24 @@ impl RawSegmentFile {
             .into());
         }
 
-        let mut decoded = 0u32;
+        let mut blocks = Vec::with_capacity(block_directory.block_count as usize);
         for block_index in 0..block_directory.block_count {
-            let block = self.posting_block_at(entry, block_directory, block_index)?;
+            blocks.push(self.posting_block_at(entry, block_directory, block_index)?);
+        }
+
+        let mut decoded = 0u32;
+        let file_len = self.file_len;
+        let file = &mut self.file;
+        let mut lengths = DocLengthCursor::new(&self.doc_meta, self.meta.doc_count);
+        for block in blocks {
+            checked_range(
+                block.postings_offset,
+                block.postings_len as u64,
+                file_len,
+                "postings",
+            )?;
             let bytes =
-                self.read_posting_block_range(block.postings_offset, block.postings_len as u64)?;
+                read_exact_at_positional(file, block.postings_offset, block.postings_len as u64)?;
             let mut lookup_error = None;
             for_each_posting_in_block(
                 entry.term_id,
@@ -1798,7 +1830,7 @@ impl RawSegmentFile {
                         return;
                     }
                     decoded = decoded.saturating_add(1);
-                    match document_len_in_doc_meta(&self.doc_meta, self.meta.doc_count, doc_id) {
+                    match lengths.get(doc_id) {
                         Ok(Some(doc_len)) => visit(doc_id, weight, doc_len),
                         Ok(None) => {
                             lookup_error = Some(Error::InvalidLayout {
@@ -1936,6 +1968,41 @@ fn read_exact_at_positional_into(
     file.read_exact(bytes)
 }
 
+struct DocLengthCursor<'a> {
+    doc_meta: &'a [u8],
+    doc_count: u32,
+    next: u32,
+}
+
+impl<'a> DocLengthCursor<'a> {
+    fn new(doc_meta: &'a [u8], doc_count: u32) -> Self {
+        Self {
+            doc_meta,
+            doc_count,
+            next: 0,
+        }
+    }
+
+    fn get(&mut self, doc_id: DocId) -> Result<Option<u32>, Error> {
+        while self.next < self.doc_count {
+            let offset = doc_meta_offset(self.next)?;
+            let current = read_u32_at(self.doc_meta, offset, "doc metadata")?;
+            match current.cmp(&doc_id) {
+                std::cmp::Ordering::Less => self.next += 1,
+                std::cmp::Ordering::Equal => {
+                    return Ok(Some(read_u32_at(
+                        self.doc_meta,
+                        offset + 4,
+                        "doc metadata",
+                    )?));
+                }
+                std::cmp::Ordering::Greater => return Ok(None),
+            }
+        }
+        Ok(None)
+    }
+}
+
 fn document_len_in_doc_meta(
     doc_meta: &[u8],
     doc_count: u32,
@@ -1945,13 +2012,7 @@ fn document_len_in_doc_meta(
     let mut high = doc_count;
     while low < high {
         let mid = low + ((high - low) / 2);
-        let offset =
-            (mid as u64)
-                .checked_mul(DOC_ENTRY_LEN as u64)
-                .ok_or(Error::InvalidLayout {
-                    reason: "doc entry offset overflows",
-                })?;
-        let offset = usize::try_from(offset).map_err(|_| Error::SegmentTooLarge)?;
+        let offset = doc_meta_offset(mid)?;
         let mid_doc_id = read_u32_at(doc_meta, offset, "doc metadata")?;
         match mid_doc_id.cmp(&doc_id) {
             std::cmp::Ordering::Less => low = mid + 1,
@@ -1962,6 +2023,15 @@ fn document_len_in_doc_meta(
         }
     }
     Ok(None)
+}
+
+fn doc_meta_offset(index: u32) -> Result<usize, Error> {
+    let offset = (index as u64)
+        .checked_mul(DOC_ENTRY_LEN as u64)
+        .ok_or(Error::InvalidLayout {
+            reason: "doc entry offset overflows",
+        })?;
+    usize::try_from(offset).map_err(|_| Error::SegmentTooLarge)
 }
 
 fn for_each_posting_in_block(
