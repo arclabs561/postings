@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added raw-segment content checksums behind the `raw-segment` feature. New
+  writes include directory CRC32s plus per-posting-block CRC32s; readers keep
+  accepting legacy flag-zero raw segments and file-backed readers verify posting
+  blocks lazily as ranges are read.
+
 ## [0.2.2] - 2026-07-03
 
 ### Changed

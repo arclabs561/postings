@@ -20,6 +20,14 @@ const DOC_ENTRY_LEN: usize = 8;
 const BLOCK_ENTRY_LEN: usize = 24;
 const FOOTER_LEN: usize = 12;
 const DEFAULT_BLOCK_SIZE: u32 = 128;
+/// Header flag bit: the segment carries a content-integrity section (section
+/// CRC32s + one CRC32 per posting block) between the postings region and the
+/// footer. Readers that predate this flag reject it via `UnsupportedFlags`,
+/// so they can never silently misread a checksummed segment.
+const FLAG_CHECKSUMS: u32 = 1;
+/// Fixed prefix of the integrity section: term-dir, doc-meta, and block-dir
+/// CRC32s, in that order, followed by one CRC32 per block in directory order.
+const INTEGRITY_HEADER_LEN: usize = 12;
 // Keep normal local-file queries on one read, but cap pathological high-DF term
 // payloads so file-backed traversal cannot allocate an entire huge posting list.
 const FILE_FULL_POSTINGS_READ_LIMIT: u64 = 1024 * 1024;
@@ -60,6 +68,12 @@ pub enum Error {
     InvalidLayout {
         /// Description of the violated layout invariant.
         reason: &'static str,
+    },
+    /// Stored content checksum did not match the recomputed value.
+    #[error("raw segment checksum mismatch in {section}")]
+    ChecksumMismatch {
+        /// Section whose recomputed CRC32 disagreed with the stored one.
+        section: &'static str,
     },
     /// Two documents in the input used the same id.
     #[error("duplicate raw segment doc id: {doc_id}")]
@@ -195,6 +209,13 @@ pub struct RawSegmentMeta {
     doc_meta_offset: u64,
     postings_offset: u64,
     footer_offset: u64,
+    flags: u32,
+}
+
+impl RawSegmentMeta {
+    fn has_checksums(self) -> bool {
+        self.flags & FLAG_CHECKSUMS != 0
+    }
 }
 
 impl RawSegmentMeta {
@@ -320,6 +341,49 @@ impl<'a> RawSegment<'a> {
             return Err(Error::UnsupportedVersion {
                 version: footer_version,
             });
+        }
+
+        // With all bytes resident, verify every checksum once at open; the
+        // read paths then stay untouched. File-backed opens verify blocks
+        // lazily instead (a full pass would defeat out-of-core reads).
+        if meta.has_checksums() {
+            let (integrity_offset, block_count, integrity_len) = integrity_layout(meta)?;
+            let integrity =
+                &bytes[checked_range(integrity_offset, integrity_len, bytes.len(), "integrity")?];
+            let term_dir_len = (meta.term_count as u64)
+                .checked_mul(TERM_ENTRY_LEN as u64)
+                .ok_or(Error::SegmentTooLarge)?;
+            let term_dir = &bytes[checked_range(
+                meta.term_dir_offset,
+                term_dir_len,
+                bytes.len(),
+                "term directory",
+            )?];
+            let doc_meta_len = (meta.doc_count as u64)
+                .checked_mul(DOC_ENTRY_LEN as u64)
+                .ok_or(Error::SegmentTooLarge)?;
+            let doc_meta = &bytes[checked_range(
+                meta.doc_meta_offset,
+                doc_meta_len,
+                bytes.len(),
+                "doc metadata",
+            )?];
+            let block_dir_start = doc_meta_end(meta)?;
+            let block_dir_len = block_count
+                .checked_mul(BLOCK_ENTRY_LEN as u64)
+                .ok_or(Error::SegmentTooLarge)?;
+            let block_dir = &bytes[checked_range(
+                block_dir_start,
+                block_dir_len,
+                bytes.len(),
+                "block directory",
+            )?];
+            verify_directory_checksums(term_dir, doc_meta, block_dir, integrity)?;
+            let map = block_checksum_map(block_dir, integrity, block_count)?;
+            for (&offset, &(len, _)) in &map {
+                let range = checked_range(offset, len as u64, bytes.len(), "postings")?;
+                verify_block_slice(&map, offset, &bytes[range])?;
+            }
         }
 
         Ok(Self { bytes, meta })
@@ -1055,6 +1119,36 @@ pub struct RawSegmentFile {
     term_dir: Vec<u8>,
     doc_meta: Vec<u8>,
     block_dir: Vec<u8>,
+    block_checksums: Option<BlockChecksums>,
+}
+
+#[derive(Debug)]
+struct BlockChecksums {
+    encoded: Vec<u8>,
+    decoded: Option<Vec<RawBlockChecksum>>,
+}
+
+impl BlockChecksums {
+    fn new(integrity: &[u8]) -> Self {
+        Self {
+            encoded: integrity[INTEGRITY_HEADER_LEN..].to_vec(),
+            decoded: None,
+        }
+    }
+
+    fn get(&mut self, block_dir: &[u8]) -> Result<&[RawBlockChecksum], Error> {
+        if self.decoded.is_none() {
+            self.decoded = Some(block_checksum_list(block_dir, &self.encoded)?);
+        }
+        Ok(self.decoded.as_deref().expect("decoded above"))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RawBlockChecksum {
+    offset: u64,
+    len: u32,
+    crc: u32,
 }
 
 impl RawSegmentFile {
@@ -1108,6 +1202,23 @@ impl RawSegmentFile {
         let doc_meta = read_exact_at(&mut file, meta.doc_meta_offset, doc_meta_len)?;
         let block_dir = read_exact_at(&mut file, block_dir_start, block_dir_len)?;
 
+        // Directories are resident, so verify them at open; posting blocks
+        // verify lazily per range read via the checksum map.
+        let block_checksums = if meta.has_checksums() {
+            let (integrity_offset, block_count, integrity_len) = integrity_layout(meta)?;
+            let integrity = read_exact_at(&mut file, integrity_offset, integrity_len)?;
+            verify_directory_checksums(&term_dir, &doc_meta, &block_dir, &integrity)?;
+            if integrity.len() != INTEGRITY_HEADER_LEN + block_count as usize * 4 {
+                return Err(Error::InvalidLayout {
+                    reason: "integrity section length mismatch",
+                }
+                .into());
+            }
+            Some(BlockChecksums::new(&integrity))
+        } else {
+            None
+        };
+
         Ok(Self {
             file,
             file_len,
@@ -1115,6 +1226,7 @@ impl RawSegmentFile {
             term_dir,
             doc_meta,
             block_dir,
+            block_checksums,
         })
     }
 
@@ -1847,7 +1959,11 @@ impl RawSegmentFile {
         len: u64,
     ) -> Result<Vec<u8>, RawSegmentFileError> {
         checked_range(offset, len, self.file_len, "postings")?;
-        read_exact_at_positional(&mut self.file, offset, len)
+        let bytes = read_exact_at_positional(&mut self.file, offset, len)?;
+        if let Some(map) = &self.block_crcs {
+            verify_span_blocks(map, offset, &bytes)?;
+        }
+        Ok(bytes)
     }
 
     fn read_posting_block_range(
@@ -1856,7 +1972,11 @@ impl RawSegmentFile {
         len: u64,
     ) -> Result<Vec<u8>, RawSegmentFileError> {
         checked_range(offset, len, self.file_len, "postings")?;
-        read_exact_at_positional(&mut self.file, offset, len)
+        let bytes = read_exact_at_positional(&mut self.file, offset, len)?;
+        if let Some(map) = &self.block_crcs {
+            verify_block_slice(map, offset, &bytes)?;
+        }
+        Ok(bytes)
     }
 
     fn posting_doc_ids(&mut self, entry: TermEntry) -> Result<Vec<DocId>, RawSegmentFileError> {
@@ -2004,6 +2124,7 @@ impl RawSegmentFile {
         let mut decoded = 0u32;
         let file_len = self.file_len;
         let file = &mut self.file;
+        let block_crcs = self.block_crcs.as_ref();
         let mut lengths = DocLengthCursor::new(&self.doc_meta, self.meta.doc_count);
         for block in blocks {
             checked_range(
@@ -2014,6 +2135,9 @@ impl RawSegmentFile {
             )?;
             let bytes =
                 read_exact_at_positional(file, block.postings_offset, block.postings_len as u64)?;
+            if let Some(map) = block_crcs {
+                verify_block_slice(map, block.postings_offset, &bytes)?;
+            }
             let mut lookup_error = None;
             for_each_posting_in_block(
                 entry.term_id,
@@ -2718,6 +2842,7 @@ pub fn write_u64_u32_segment(documents: &[RawDocument<'_>]) -> Result<Vec<u8>, E
     let mut term_entries = Vec::with_capacity(postings.len());
     let mut term_block_directories = Vec::with_capacity(postings.len());
     let mut block_entries = Vec::new();
+    let mut block_crcs: Vec<u32> = Vec::new();
     for (&term_id, list) in &postings {
         let offset = postings_offset
             .checked_add(u64::try_from(postings_bytes.len()).map_err(|_| Error::SegmentTooLarge)?)
@@ -2763,6 +2888,7 @@ pub fn write_u64_u32_segment(documents: &[RawDocument<'_>]) -> Result<Vec<u8>, E
                     .map_err(|_| Error::SegmentTooLarge)?,
                 max_weight: block_max_weight,
             });
+            block_crcs.push(crc32fast::hash(&postings_bytes[block_start_len..]));
         }
         let postings_len =
             u32::try_from(postings_bytes.len() - start_len).map_err(|_| Error::SegmentTooLarge)?;
@@ -2781,8 +2907,13 @@ pub fn write_u64_u32_segment(documents: &[RawDocument<'_>]) -> Result<Vec<u8>, E
         });
     }
 
+    let integrity_len = (block_crcs.len() as u64)
+        .checked_mul(4)
+        .and_then(|crcs| crcs.checked_add(INTEGRITY_HEADER_LEN as u64))
+        .ok_or(Error::SegmentTooLarge)?;
     let footer_offset = postings_offset
         .checked_add(u64::try_from(postings_bytes.len()).map_err(|_| Error::SegmentTooLarge)?)
+        .and_then(|end| end.checked_add(integrity_len))
         .ok_or(Error::SegmentTooLarge)?;
     let final_len = footer_offset
         .checked_add(FOOTER_LEN as u64)
@@ -2802,6 +2933,7 @@ pub fn write_u64_u32_segment(documents: &[RawDocument<'_>]) -> Result<Vec<u8>, E
             doc_meta_offset,
             postings_offset,
             footer_offset,
+            flags: FLAG_CHECKSUMS,
         },
     );
     for (entry, block_directory) in term_entries.into_iter().zip(term_block_directories) {
@@ -2826,6 +2958,20 @@ pub fn write_u64_u32_segment(documents: &[RawDocument<'_>]) -> Result<Vec<u8>, E
         put_u32(&mut out, block.max_weight);
     }
     out.extend_from_slice(&postings_bytes);
+    // Integrity section: directory CRCs over the exact bytes just written,
+    // then one CRC per posting block in directory order.
+    let term_dir_end = usize::try_from(doc_meta_offset).map_err(|_| Error::SegmentTooLarge)?;
+    let doc_meta_end = usize::try_from(block_dir_offset).map_err(|_| Error::SegmentTooLarge)?;
+    let block_dir_end = usize::try_from(postings_offset).map_err(|_| Error::SegmentTooLarge)?;
+    let term_dir_crc = crc32fast::hash(&out[HEADER_LEN..term_dir_end]);
+    let doc_meta_crc = crc32fast::hash(&out[term_dir_end..doc_meta_end]);
+    let block_dir_crc = crc32fast::hash(&out[doc_meta_end..block_dir_end]);
+    put_u32(&mut out, term_dir_crc);
+    put_u32(&mut out, doc_meta_crc);
+    put_u32(&mut out, block_dir_crc);
+    for crc in block_crcs {
+        put_u32(&mut out, crc);
+    }
     out.extend_from_slice(FOOTER_MAGIC);
     put_u32(&mut out, VERSION);
 
@@ -2836,7 +2982,7 @@ pub fn write_u64_u32_segment(documents: &[RawDocument<'_>]) -> Result<Vec<u8>, E
 fn put_header(out: &mut Vec<u8>, meta: RawSegmentMeta) {
     out.extend_from_slice(MAGIC);
     put_u32(out, VERSION);
-    put_u32(out, 0);
+    put_u32(out, meta.flags);
     put_u32(out, meta.term_count);
     put_u32(out, meta.doc_count);
     put_u32(out, meta.max_doc_id);
@@ -2862,7 +3008,7 @@ fn parse_header(bytes: &[u8]) -> Result<RawSegmentMeta, Error> {
         return Err(Error::UnsupportedVersion { version });
     }
     let flags = read_u32_at(bytes, 12, "header")?;
-    if flags != 0 {
+    if flags & !FLAG_CHECKSUMS != 0 {
         return Err(Error::UnsupportedFlags { flags });
     }
 
@@ -2876,6 +3022,7 @@ fn parse_header(bytes: &[u8]) -> Result<RawSegmentMeta, Error> {
         doc_meta_offset: read_u64_at(bytes, 48, "header")?,
         postings_offset: read_u64_at(bytes, 56, "header")?,
         footer_offset: read_u64_at(bytes, 64, "header")?,
+        flags,
     })
 }
 
@@ -2885,6 +3032,156 @@ fn put_u32(out: &mut Vec<u8>, value: u32) {
 
 fn put_u64(out: &mut Vec<u8>, value: u64) {
     out.extend_from_slice(&value.to_le_bytes());
+}
+
+/// Locate the integrity section for a checksummed segment:
+/// `(offset, block_count, len)`. The section sits immediately before the
+/// footer and its length is fully derived from header fields, so no header
+/// layout changed when checksums were introduced.
+fn integrity_layout(meta: RawSegmentMeta) -> Result<(u64, u64, u64), Error> {
+    let block_dir_start = doc_meta_end(meta)?;
+    let block_dir_len =
+        meta.postings_offset
+            .checked_sub(block_dir_start)
+            .ok_or(Error::InvalidLayout {
+                reason: "block directory must follow doc metadata",
+            })?;
+    if block_dir_len % BLOCK_ENTRY_LEN as u64 != 0 {
+        return Err(Error::InvalidLayout {
+            reason: "block directory length is not a multiple of the entry size",
+        });
+    }
+    let block_count = block_dir_len / BLOCK_ENTRY_LEN as u64;
+    let integrity_len = block_count
+        .checked_mul(4)
+        .and_then(|crcs| crcs.checked_add(INTEGRITY_HEADER_LEN as u64))
+        .ok_or(Error::SegmentTooLarge)?;
+    let integrity_offset =
+        meta.footer_offset
+            .checked_sub(integrity_len)
+            .ok_or(Error::InvalidLayout {
+                reason: "integrity section does not fit before the footer",
+            })?;
+    if integrity_offset < meta.postings_offset {
+        return Err(Error::InvalidLayout {
+            reason: "integrity section overlaps the postings region",
+        });
+    }
+    Ok((integrity_offset, block_count, integrity_len))
+}
+
+fn verify_directory_checksums(
+    term_dir: &[u8],
+    doc_meta: &[u8],
+    block_dir: &[u8],
+    integrity: &[u8],
+) -> Result<(), Error> {
+    let sections: [(&[u8], &'static str, usize); 3] = [
+        (term_dir, "term directory", 0),
+        (doc_meta, "doc metadata", 4),
+        (block_dir, "block directory", 8),
+    ];
+    for (bytes, section, at) in sections {
+        let want = read_u32_at(integrity, at, "integrity")?;
+        if crc32fast::hash(bytes) != want {
+            return Err(Error::ChecksumMismatch { section });
+        }
+    }
+    Ok(())
+}
+
+/// Per-block checksums keyed by the block's postings byte offset, so range
+/// reads can verify by the offset they already hold.
+fn block_checksum_list(
+    block_dir: &[u8],
+    block_crcs: &[u8],
+) -> Result<Vec<RawBlockChecksum>, Error> {
+    if block_dir.len() % BLOCK_ENTRY_LEN != 0 {
+        return Err(Error::InvalidLayout {
+            reason: "block directory length is not a multiple of the entry size",
+        });
+    }
+    let block_count = block_dir.len() / BLOCK_ENTRY_LEN;
+    if block_crcs.len() != block_count * 4 {
+        return Err(Error::InvalidLayout {
+            reason: "integrity section length mismatch",
+        });
+    }
+    let mut checksums = Vec::with_capacity(block_count);
+    for i in 0..block_count {
+        let entry = i * BLOCK_ENTRY_LEN;
+        let offset = read_u64_at(block_dir, entry + 8, "block directory")?;
+        let len = read_u32_at(block_dir, entry + 16, "block directory")?;
+        let crc = read_u32_at(block_crcs, i * 4, "integrity")?;
+        checksums.push(RawBlockChecksum { offset, len, crc });
+    }
+    checksums.sort_unstable_by_key(|checksum| checksum.offset);
+    Ok(checksums)
+}
+
+/// Verify one block's bytes against its stored checksum.
+fn verify_block_slice(
+    checksums: &[RawBlockChecksum],
+    offset: u64,
+    bytes: &[u8],
+) -> Result<(), Error> {
+    match checksums.binary_search_by_key(&offset, |checksum| checksum.offset) {
+        Ok(index) if checksums[index].len as usize == bytes.len() => {
+            if crc32fast::hash(bytes) != checksums[index].crc {
+                return Err(Error::ChecksumMismatch {
+                    section: "posting block",
+                });
+            }
+            Ok(())
+        }
+        Ok(_) => Err(Error::InvalidLayout {
+            reason: "posting block read does not match block bounds",
+        }),
+        Err(_) => Err(Error::InvalidLayout {
+            reason: "posting block has no checksum entry",
+        }),
+    }
+}
+
+/// Verify every checksummed block tiling the span `[offset, offset + len)`.
+/// Whole-term reads span consecutive blocks; each is verified against its own
+/// checksum and the span must be fully covered.
+fn verify_span_blocks(
+    checksums: &[RawBlockChecksum],
+    offset: u64,
+    bytes: &[u8],
+) -> Result<(), Error> {
+    let end = offset
+        .checked_add(bytes.len() as u64)
+        .ok_or(Error::SegmentTooLarge)?;
+    let mut covered = 0u64;
+    let start = checksums.partition_point(|checksum| checksum.offset < offset);
+    for checksum in &checksums[start..] {
+        if checksum.offset >= end {
+            break;
+        }
+        let rel = usize::try_from(checksum.offset - offset).map_err(|_| Error::SegmentTooLarge)?;
+        let block_end = rel
+            .checked_add(checksum.len as usize)
+            .ok_or(Error::SegmentTooLarge)?;
+        if block_end > bytes.len() {
+            return Err(Error::InvalidLayout {
+                reason: "posting block exceeds the read span",
+            });
+        }
+        if crc32fast::hash(&bytes[rel..block_end]) != checksum.crc {
+            return Err(Error::ChecksumMismatch {
+                section: "posting block",
+            });
+        }
+        covered = covered.saturating_add(checksum.len as u64);
+    }
+    if covered != bytes.len() as u64 {
+        return Err(Error::InvalidLayout {
+            reason: "posting span is not fully covered by checksummed blocks",
+        });
+    }
+    Ok(())
 }
 
 fn validate_layout(bytes: &[u8], meta: RawSegmentMeta) -> Result<(), Error> {
@@ -3097,6 +3394,22 @@ mod tests {
             .unwrap()
     }
 
+    fn strip_checksums_for_test(bytes: &[u8]) -> Vec<u8> {
+        let meta = parse_header(bytes).unwrap();
+        assert!(meta.has_checksums());
+        let (integrity_offset, _, _) = integrity_layout(meta).unwrap();
+        let integrity_offset = usize::try_from(integrity_offset).unwrap();
+        let footer_offset = usize::try_from(meta.footer_offset).unwrap();
+
+        let mut legacy = Vec::with_capacity(integrity_offset + FOOTER_LEN);
+        legacy.extend_from_slice(&bytes[..integrity_offset]);
+        legacy.extend_from_slice(&bytes[footer_offset..footer_offset + FOOTER_LEN]);
+        legacy[12..16].copy_from_slice(&0u32.to_le_bytes());
+        legacy[64..72].copy_from_slice(&(integrity_offset as u64).to_le_bytes());
+        RawSegment::open(&legacy).unwrap();
+        legacy
+    }
+
     #[test]
     fn raw_segment_roundtrips_numeric_terms() {
         let doc_a = vec![(10, 1), (20, 2), (10, 3)];
@@ -3111,6 +3424,7 @@ mod tests {
         let bytes = write_u64_u32_segment(&docs).unwrap();
         let segment = RawSegment::open(&bytes).unwrap();
 
+        assert!(segment.meta().has_checksums());
         assert_eq!(segment.num_docs(), 3);
         assert_eq!(segment.meta().term_count(), 3);
         assert_eq!(segment.meta().max_doc_id(), 9);
@@ -3176,6 +3490,17 @@ mod tests {
         assert_eq!(segment.candidates_all_terms(&[20]).unwrap(), vec![5, 9]);
         assert_eq!(segment.candidates_all_terms(&[10, 10]).unwrap(), vec![2, 5]);
         assert!(segment.candidates_all_terms(&[999]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn raw_segment_reads_legacy_unchecksummed_fixture() {
+        let bytes = include_bytes!("../tests/fixtures/raw_v3_flags0.segment");
+        let segment = RawSegment::open(bytes).unwrap();
+
+        assert!(!segment.meta().has_checksums());
+        assert_eq!(segment.num_docs(), 3);
+        assert_eq!(segment.term_ids().unwrap(), vec![7, 9, 11]);
+        assert_eq!(collect_postings(&segment, 7), vec![(1, 3), (4, 1)]);
     }
 
     #[test]
@@ -3300,6 +3625,126 @@ mod tests {
                 .unwrap(),
             CandidatePlan::Candidates(vec![2, 5, 9])
         );
+    }
+
+    fn checksum_test_segment() -> Vec<u8> {
+        let terms_a = vec![(7u64, 3u32), (9, 1)];
+        let terms_b = vec![(7u64, 1u32)];
+        let terms_c = vec![(9u64, 5u32), (11, 2)];
+        let docs = vec![
+            RawDocument::new(1, &terms_a),
+            RawDocument::new(4, &terms_b),
+            RawDocument::new(9, &terms_c),
+        ];
+        write_u64_u32_segment(&docs).unwrap()
+    }
+
+    #[test]
+    fn pre_checksum_segments_still_open_and_read() {
+        // Fixture written by the pre-checksum writer (flags = 0): readers must
+        // keep accepting it, skipping verification.
+        let bytes: &[u8] = include_bytes!("../tests/fixtures/raw_v3_flags0.segment");
+        let segment = RawSegment::open(bytes).unwrap();
+        assert!(!segment.meta().has_checksums());
+        assert_eq!(segment.num_docs(), 3);
+        assert_eq!(collect_postings(&segment, 7), vec![(1, 3), (4, 1)]);
+        assert_eq!(collect_postings(&segment, 9), vec![(1, 1), (9, 5)]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v3.segment");
+        std::fs::write(&path, bytes).unwrap();
+        let mut file_segment = RawSegmentFile::open(&path).unwrap();
+        assert_eq!(file_segment.postings(7).unwrap(), vec![(1, 3), (4, 1)]);
+    }
+
+    #[test]
+    fn new_segments_carry_checksums_and_round_trip() {
+        let bytes = checksum_test_segment();
+        let meta = parse_header(&bytes).unwrap();
+        assert!(meta.has_checksums());
+        let segment = RawSegment::open(&bytes).unwrap();
+        assert_eq!(collect_postings(&segment, 7), vec![(1, 3), (4, 1)]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v4.segment");
+        std::fs::write(&path, &bytes).unwrap();
+        let mut file_segment = RawSegmentFile::open(&path).unwrap();
+        assert_eq!(file_segment.postings(9).unwrap(), vec![(1, 1), (9, 5)]);
+    }
+
+    #[test]
+    fn corrupt_directory_sections_fail_at_open() {
+        let clean = checksum_test_segment();
+        let meta = parse_header(&clean).unwrap();
+        let sections = [
+            (meta.term_dir_offset as usize, "term directory"),
+            (meta.doc_meta_offset as usize, "doc metadata"),
+            (doc_meta_end(meta).unwrap() as usize, "block directory"),
+        ];
+        for (offset, section) in sections {
+            let mut corrupt = clean.clone();
+            corrupt[offset] ^= 0xFF;
+            let err = RawSegment::open(&corrupt).unwrap_err();
+            assert_eq!(
+                err,
+                Error::ChecksumMismatch { section },
+                "byte-backed open must reject a corrupt {section}"
+            );
+
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("corrupt.segment");
+            std::fs::write(&path, &corrupt).unwrap();
+            let err = RawSegmentFile::open(&path).unwrap_err();
+            assert!(
+                err.to_string().contains("checksum mismatch"),
+                "file-backed open must reject a corrupt {section}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn corrupt_posting_block_fails_reads_but_spares_siblings() {
+        let clean = checksum_test_segment();
+        let meta = parse_header(&clean).unwrap();
+        // First postings byte belongs to term 7's block (terms are written in
+        // ascending id order).
+        let mut corrupt = clean.clone();
+        corrupt[meta.postings_offset as usize] ^= 0xFF;
+
+        // Byte-backed verifies everything at open.
+        let err = RawSegment::open(&corrupt).unwrap_err();
+        assert_eq!(
+            err,
+            Error::ChecksumMismatch {
+                section: "posting block"
+            }
+        );
+
+        // File-backed opens fine (directories are intact) and fails only when
+        // the corrupted block is actually read; an untouched sibling block
+        // still reads.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corrupt.segment");
+        std::fs::write(&path, &corrupt).unwrap();
+        let mut file_segment = RawSegmentFile::open(&path).unwrap();
+        let err = file_segment.postings(7).unwrap_err();
+        assert!(
+            err.to_string().contains("checksum mismatch"),
+            "reading the corrupted block must fail: {err}"
+        );
+        assert_eq!(
+            file_segment.postings(11).unwrap(),
+            vec![(9, 2)],
+            "a block the corruption did not touch must still read"
+        );
+    }
+
+    #[test]
+    fn unknown_header_flag_bits_are_rejected() {
+        let mut bytes = checksum_test_segment();
+        bytes[12] |= 0x2;
+        let err = RawSegment::open(&bytes).unwrap_err();
+        assert!(matches!(err, Error::UnsupportedFlags { .. }));
     }
 
     #[test]
@@ -3758,7 +4203,7 @@ mod tests {
             .map(|doc_id| RawDocument::new(doc_id, term.as_slice()))
             .collect();
 
-        let mut bytes = write_u64_u32_segment(&docs).unwrap();
+        let mut bytes = strip_checksums_for_test(&write_u64_u32_segment(&docs).unwrap());
         let segment = RawSegment::open(&bytes).unwrap();
         let second_block = doc_meta_end(segment.meta()).unwrap() as usize + BLOCK_ENTRY_LEN;
         bytes[second_block + 4..second_block + 8].copy_from_slice(&128u32.to_le_bytes());
@@ -3776,7 +4221,7 @@ mod tests {
     fn raw_segment_validates_block_metadata_lazily() {
         let terms = vec![(1, 1)];
         let docs = vec![RawDocument::new(1, &terms)];
-        let mut bytes = write_u64_u32_segment(&docs).unwrap();
+        let mut bytes = strip_checksums_for_test(&write_u64_u32_segment(&docs).unwrap());
         bytes[HEADER_LEN + 40..HEADER_LEN + 48].copy_from_slice(&0u64.to_le_bytes());
 
         let segment = RawSegment::open(&bytes).unwrap();
@@ -3813,10 +4258,67 @@ mod tests {
     }
 
     #[test]
+    fn raw_segment_rejects_checksummed_directory_corruption() {
+        let terms = vec![(1, 1)];
+        let docs = vec![RawDocument::new(1, &terms)];
+        let mut bytes = write_u64_u32_segment(&docs).unwrap();
+        bytes[HEADER_LEN] ^= 0x01;
+
+        assert_eq!(
+            RawSegment::open(&bytes).unwrap_err(),
+            Error::ChecksumMismatch {
+                section: "term directory"
+            }
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raw.segment");
+        std::fs::write(&path, &bytes).unwrap();
+        match RawSegmentFile::open(&path).unwrap_err() {
+            RawSegmentFileError::Segment {
+                source:
+                    Error::ChecksumMismatch {
+                        section: "term directory",
+                    },
+            } => {}
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn raw_segment_file_rejects_checksummed_posting_corruption_lazily() {
+        let terms = vec![(7, 3)];
+        let docs = vec![RawDocument::new(3, &terms)];
+        let mut bytes = write_u64_u32_segment(&docs).unwrap();
+        let segment = RawSegment::open(&bytes).unwrap();
+        let entry = segment.term_entry(7).unwrap().unwrap();
+        bytes[entry.postings_offset as usize] ^= 0x01;
+
+        assert_eq!(
+            RawSegment::open(&bytes).unwrap_err(),
+            Error::ChecksumMismatch {
+                section: "posting block"
+            }
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raw.segment");
+        std::fs::write(&path, &bytes).unwrap();
+        let mut file_segment = RawSegmentFile::open(&path).unwrap();
+        match file_segment.postings(7).unwrap_err() {
+            RawSegmentFileError::Segment {
+                source:
+                    Error::ChecksumMismatch {
+                        section: "posting block",
+                    },
+            } => {}
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
     fn raw_segment_rejects_corrupt_posting_varint() {
         let terms = vec![(7, 1)];
         let docs = vec![RawDocument::new(3, &terms)];
-        let mut bytes = write_u64_u32_segment(&docs).unwrap();
+        let mut bytes = strip_checksums_for_test(&write_u64_u32_segment(&docs).unwrap());
         let segment = RawSegment::open(&bytes).unwrap();
         let entry = segment.term_entry(7).unwrap().unwrap();
         let offset = entry.postings_offset as usize;
@@ -3838,7 +4340,7 @@ mod tests {
     fn raw_segment_rejects_corrupt_zero_weight_posting() {
         let terms = vec![(7, 1)];
         let docs = vec![RawDocument::new(3, &terms)];
-        let mut bytes = write_u64_u32_segment(&docs).unwrap();
+        let mut bytes = strip_checksums_for_test(&write_u64_u32_segment(&docs).unwrap());
         let segment = RawSegment::open(&bytes).unwrap();
         let entry = segment.term_entry(7).unwrap().unwrap();
         let offset = entry.postings_offset as usize;
@@ -3865,7 +4367,7 @@ mod tests {
             RawDocument::new(2, &term_b),
             RawDocument::new(100, &term_c),
         ];
-        let mut bytes = write_u64_u32_segment(&docs).unwrap();
+        let mut bytes = strip_checksums_for_test(&write_u64_u32_segment(&docs).unwrap());
         let segment = RawSegment::open(&bytes).unwrap();
         let entry = segment.term_entry(2).unwrap().unwrap();
         let offset = entry.postings_offset as usize;
