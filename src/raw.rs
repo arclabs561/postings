@@ -2313,6 +2313,8 @@ fn for_each_posting_in_block(
 }
 
 fn raw_block_range_upper_bound(block: RawPostingBlockMeta, lists: &[RawBlockScoringList]) -> f32 {
+    // Use the max contribution from every query term over the same document
+    // range. A current-block-only follower bound can understate exact top-k.
     lists
         .iter()
         .map(|list| {
@@ -3503,6 +3505,89 @@ mod tests {
 
         assert_eq!(
             file_segment.top_k_weighted_u32(&query, k).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn multi_term_block_pruning_uses_overlapping_range_max() {
+        let k = 10usize;
+        let query = [(10, 1.0), (20, 1.0)];
+        let weighted_terms: Vec<Vec<(RawTermId, u32)>> = (0..328u32)
+            .map(|doc_id| {
+                let mut terms = Vec::new();
+                if doc_id < 256 {
+                    let weight = if doc_id < DEFAULT_BLOCK_SIZE {
+                        100
+                    } else if (200..210).contains(&doc_id) {
+                        20
+                    } else {
+                        1
+                    };
+                    terms.push((10, weight));
+                }
+                if doc_id >= 200 {
+                    terms.push((20, 90));
+                }
+                terms
+            })
+            .collect();
+        let docs: Vec<_> = weighted_terms
+            .iter()
+            .enumerate()
+            .map(|(doc_id, terms)| RawDocument::new(doc_id as DocId, terms))
+            .collect();
+        let bytes = write_u64_u32_segment(&docs).unwrap();
+        let segment = RawSegment::open(&bytes).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raw.segment");
+        std::fs::write(&path, &bytes).unwrap();
+        let mut file_segment = RawSegmentFile::open(&path).unwrap();
+
+        let expected = segment.top_k_weighted_u32(&query, k).unwrap();
+        assert_eq!(
+            expected,
+            (200u32..210u32)
+                .map(|doc_id| (doc_id, 110.0f32))
+                .collect::<Vec<_>>()
+        );
+
+        let query_terms = normalize_weighted_query_terms(&query);
+        let mut lists = Vec::with_capacity(query_terms.len());
+        let mut total_postings = 0usize;
+        for (term_id, query_weight) in query_terms {
+            let Some((entry, block_directory)) =
+                file_segment.term_entry_with_blocks(term_id).unwrap()
+            else {
+                panic!("test term should be present");
+            };
+            total_postings = total_postings.saturating_add(entry.df as usize);
+            lists.push((entry, block_directory, query_weight));
+        }
+        let scoring_lists = file_segment
+            .prepare_raw_block_scoring_lists(lists.clone())
+            .unwrap();
+        assert!(
+            raw_block_range_upper_bound(scoring_lists[0].blocks[1], &scoring_lists) >= 110.0,
+            "the term-10 second block needs the overlapping term-20 max"
+        );
+
+        let dense_slots = usize::try_from(file_segment.meta.max_doc_id)
+            .ok()
+            .and_then(|max_doc_id| max_doc_id.checked_add(1))
+            .unwrap_or(usize::MAX);
+        let dense_limit = crate::dense_scratch_limit(file_segment.meta.doc_count as usize);
+
+        assert_eq!(
+            file_segment
+                .top_k_weighted_u32_pruned_blocks(
+                    lists,
+                    total_postings,
+                    dense_slots,
+                    dense_limit,
+                    k
+                )
+                .unwrap(),
             expected
         );
     }
