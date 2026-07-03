@@ -3254,14 +3254,19 @@ impl Iterator for RawPostingBlockPostings<'_> {
 /// Encode documents into the first raw `u64` term, `u32` weight segment format.
 pub fn write_u64_u32_segment(documents: &[RawDocument<'_>]) -> Result<Vec<u8>, Error> {
     let sections = build_u64_u32_segment_sections(documents)?;
-    let buffers = build_raw_segment_section_buffers(&sections);
     let mut out = Vec::with_capacity(sections.final_len);
-    out.extend_from_slice(&buffers.header);
-    out.extend_from_slice(&buffers.term_dir);
-    out.extend_from_slice(&buffers.doc_meta);
-    out.extend_from_slice(&buffers.block_dir);
+    put_header(&mut out, sections.meta);
+    let term_dir_crc = append_term_directory(&mut out, &sections);
+    let doc_meta_crc = append_document_metadata(&mut out, &sections);
+    let block_dir_crc = append_block_directory(&mut out, &sections);
     out.extend_from_slice(&sections.postings_bytes);
-    out.extend_from_slice(&buffers.integrity);
+    put_integrity_section(
+        &mut out,
+        term_dir_crc,
+        doc_meta_crc,
+        block_dir_crc,
+        &sections.block_crcs,
+    );
     out.extend_from_slice(FOOTER_MAGIC);
     put_u32(&mut out, VERSION);
 
@@ -3462,98 +3467,174 @@ fn build_u64_u32_segment_sections(
     })
 }
 
-struct RawSegmentSectionBuffers {
-    header: Vec<u8>,
-    term_dir: Vec<u8>,
-    doc_meta: Vec<u8>,
-    block_dir: Vec<u8>,
-    integrity: Vec<u8>,
-}
-
-fn build_raw_segment_section_buffers(sections: &RawSegmentSections) -> RawSegmentSectionBuffers {
-    let mut header = Vec::with_capacity(HEADER_LEN);
-    put_header(&mut header, sections.meta);
-
-    let mut term_dir = Vec::with_capacity(sections.term_entries.len() * TERM_ENTRY_LEN);
+fn append_term_directory(out: &mut Vec<u8>, sections: &RawSegmentSections) -> u32 {
+    let start = out.len();
     for (entry, block_directory) in sections
         .term_entries
         .iter()
         .zip(&sections.term_block_directories)
     {
-        put_u64(&mut term_dir, entry.term_id);
-        put_u32(&mut term_dir, entry.df);
-        put_u32(&mut term_dir, entry.max_weight);
-        put_u64(&mut term_dir, entry.total_weight);
-        put_u64(&mut term_dir, entry.postings_offset);
-        put_u32(&mut term_dir, entry.postings_len);
-        put_u32(&mut term_dir, block_directory.block_count);
-        put_u64(&mut term_dir, block_directory.blocks_offset);
+        put_term_directory_entry(out, entry, block_directory);
     }
-
-    let mut doc_meta = Vec::with_capacity(sections.doc_entries.len() * DOC_ENTRY_LEN);
-    for &(doc_id, doc_len) in &sections.doc_entries {
-        put_u32(&mut doc_meta, doc_id);
-        put_u32(&mut doc_meta, doc_len);
-    }
-
-    let mut block_dir = Vec::with_capacity(sections.block_entries.len() * BLOCK_ENTRY_LEN);
-    for block in &sections.block_entries {
-        put_u32(&mut block_dir, block.base_doc_id);
-        put_u32(&mut block_dir, block.last_doc_id);
-        put_u64(&mut block_dir, block.postings_offset);
-        put_u32(&mut block_dir, block.postings_len);
-        put_u32(&mut block_dir, block.max_weight);
-    }
-
-    let mut integrity = Vec::with_capacity(INTEGRITY_HEADER_LEN + sections.block_crcs.len() * 4);
-    put_u32(&mut integrity, crc32fast::hash(&term_dir));
-    put_u32(&mut integrity, crc32fast::hash(&doc_meta));
-    put_u32(&mut integrity, crc32fast::hash(&block_dir));
-    for &crc in &sections.block_crcs {
-        put_u32(&mut integrity, crc);
-    }
-
-    debug_assert_eq!(header.len(), HEADER_LEN);
-    debug_assert_eq!(term_dir.len(), sections.term_entries.len() * TERM_ENTRY_LEN);
-    debug_assert_eq!(doc_meta.len(), sections.doc_entries.len() * DOC_ENTRY_LEN);
     debug_assert_eq!(
-        block_dir.len(),
+        out.len() - start,
+        sections.term_entries.len() * TERM_ENTRY_LEN
+    );
+    crc32fast::hash(&out[start..])
+}
+
+fn append_document_metadata(out: &mut Vec<u8>, sections: &RawSegmentSections) -> u32 {
+    let start = out.len();
+    for &(doc_id, doc_len) in &sections.doc_entries {
+        put_document_metadata_entry(out, doc_id, doc_len);
+    }
+    debug_assert_eq!(
+        out.len() - start,
+        sections.doc_entries.len() * DOC_ENTRY_LEN
+    );
+    crc32fast::hash(&out[start..])
+}
+
+fn append_block_directory(out: &mut Vec<u8>, sections: &RawSegmentSections) -> u32 {
+    let start = out.len();
+    for block in &sections.block_entries {
+        put_block_directory_entry(out, block);
+    }
+    debug_assert_eq!(
+        out.len() - start,
         sections.block_entries.len() * BLOCK_ENTRY_LEN
     );
-    debug_assert_eq!(
-        header.len()
-            + term_dir.len()
-            + doc_meta.len()
-            + block_dir.len()
-            + sections.postings_bytes.len()
-            + integrity.len()
-            + FOOTER_LEN,
-        sections.final_len
-    );
+    crc32fast::hash(&out[start..])
+}
 
-    RawSegmentSectionBuffers {
-        header,
-        term_dir,
-        doc_meta,
-        block_dir,
-        integrity,
+fn put_term_directory_entry(
+    out: &mut Vec<u8>,
+    entry: &TermEntry,
+    block_directory: &TermBlockDirectory,
+) {
+    let start = out.len();
+    put_u64(out, entry.term_id);
+    put_u32(out, entry.df);
+    put_u32(out, entry.max_weight);
+    put_u64(out, entry.total_weight);
+    put_u64(out, entry.postings_offset);
+    put_u32(out, entry.postings_len);
+    put_u32(out, block_directory.block_count);
+    put_u64(out, block_directory.blocks_offset);
+    debug_assert_eq!(out.len() - start, TERM_ENTRY_LEN);
+}
+
+fn put_document_metadata_entry(out: &mut Vec<u8>, doc_id: DocId, doc_len: u32) {
+    let start = out.len();
+    put_u32(out, doc_id);
+    put_u32(out, doc_len);
+    debug_assert_eq!(out.len() - start, DOC_ENTRY_LEN);
+}
+
+fn put_block_directory_entry(out: &mut Vec<u8>, block: &RawPostingBlockMeta) {
+    let start = out.len();
+    put_u32(out, block.base_doc_id);
+    put_u32(out, block.last_doc_id);
+    put_u64(out, block.postings_offset);
+    put_u32(out, block.postings_len);
+    put_u32(out, block.max_weight);
+    debug_assert_eq!(out.len() - start, BLOCK_ENTRY_LEN);
+}
+
+fn put_integrity_section(
+    out: &mut Vec<u8>,
+    term_dir_crc: u32,
+    doc_meta_crc: u32,
+    block_dir_crc: u32,
+    block_crcs: &[u32],
+) {
+    let start = out.len();
+    put_u32(out, term_dir_crc);
+    put_u32(out, doc_meta_crc);
+    put_u32(out, block_dir_crc);
+    for &crc in block_crcs {
+        put_u32(out, crc);
     }
+    debug_assert_eq!(
+        out.len() - start,
+        INTEGRITY_HEADER_LEN + block_crcs.len() * 4
+    );
 }
 
 fn write_raw_segment_sections_to<W: Write + ?Sized>(
     sections: &RawSegmentSections,
     writer: &mut W,
 ) -> std::io::Result<()> {
-    let buffers = build_raw_segment_section_buffers(sections);
-    writer.write_all(&buffers.header)?;
-    writer.write_all(&buffers.term_dir)?;
-    writer.write_all(&buffers.doc_meta)?;
-    writer.write_all(&buffers.block_dir)?;
+    let mut header = Vec::with_capacity(HEADER_LEN);
+    put_header(&mut header, sections.meta);
+    writer.write_all(&header)?;
+
+    let term_dir_crc = write_term_directory_to(writer, sections)?;
+    let doc_meta_crc = write_document_metadata_to(writer, sections)?;
+    let block_dir_crc = write_block_directory_to(writer, sections)?;
     writer.write_all(&sections.postings_bytes)?;
-    writer.write_all(&buffers.integrity)?;
+
+    let mut integrity = Vec::with_capacity(INTEGRITY_HEADER_LEN + sections.block_crcs.len() * 4);
+    put_integrity_section(
+        &mut integrity,
+        term_dir_crc,
+        doc_meta_crc,
+        block_dir_crc,
+        &sections.block_crcs,
+    );
+    writer.write_all(&integrity)?;
     writer.write_all(FOOTER_MAGIC)?;
     writer.write_all(&VERSION.to_le_bytes())?;
     Ok(())
+}
+
+fn write_term_directory_to<W: Write + ?Sized>(
+    writer: &mut W,
+    sections: &RawSegmentSections,
+) -> std::io::Result<u32> {
+    let mut hasher = crc32fast::Hasher::new();
+    let mut entry_bytes = Vec::with_capacity(TERM_ENTRY_LEN);
+    for (entry, block_directory) in sections
+        .term_entries
+        .iter()
+        .zip(&sections.term_block_directories)
+    {
+        entry_bytes.clear();
+        put_term_directory_entry(&mut entry_bytes, entry, block_directory);
+        hasher.update(&entry_bytes);
+        writer.write_all(&entry_bytes)?;
+    }
+    Ok(hasher.finalize())
+}
+
+fn write_document_metadata_to<W: Write + ?Sized>(
+    writer: &mut W,
+    sections: &RawSegmentSections,
+) -> std::io::Result<u32> {
+    let mut hasher = crc32fast::Hasher::new();
+    let mut entry_bytes = Vec::with_capacity(DOC_ENTRY_LEN);
+    for &(doc_id, doc_len) in &sections.doc_entries {
+        entry_bytes.clear();
+        put_document_metadata_entry(&mut entry_bytes, doc_id, doc_len);
+        hasher.update(&entry_bytes);
+        writer.write_all(&entry_bytes)?;
+    }
+    Ok(hasher.finalize())
+}
+
+fn write_block_directory_to<W: Write + ?Sized>(
+    writer: &mut W,
+    sections: &RawSegmentSections,
+) -> std::io::Result<u32> {
+    let mut hasher = crc32fast::Hasher::new();
+    let mut entry_bytes = Vec::with_capacity(BLOCK_ENTRY_LEN);
+    for block in &sections.block_entries {
+        entry_bytes.clear();
+        put_block_directory_entry(&mut entry_bytes, block);
+        hasher.update(&entry_bytes);
+        writer.write_all(&entry_bytes)?;
+    }
+    Ok(hasher.finalize())
 }
 
 fn put_header(out: &mut Vec<u8>, meta: RawSegmentMeta) {

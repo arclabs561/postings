@@ -14,6 +14,8 @@
 
 ### Changed
 
+- Reduced raw-segment writer peak memory by hashing and writing fixed
+  directories incrementally instead of building full directory byte buffers.
 - Reduced raw-segment file-backed block scoring allocations by reusing one
   encoded-block buffer during block traversal.
 - Sped up raw-segment pruned block top-k scoring by maintaining the current
