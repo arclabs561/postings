@@ -87,8 +87,9 @@ posting payloads should not be rebuilt into a full `PostingsIndex` on every
 open.
 
 This is not a full index lifecycle by itself: callers still own term-id mapping,
-commit publication, deletes, and compaction. Pair it with `segstore` sidecars or
-a higher-level search crate when those lifecycle guarantees are needed.
+commit publication, deletes, and compaction. Use `lexir::raw` for BM25 over
+one or more raw files, and pair raw files with `segstore` sidecars or an
+application manifest when lifecycle guarantees are needed.
 
 ## Features
 
