@@ -248,6 +248,13 @@ struct TermBlockDirectory {
     blocks_offset: u64,
 }
 
+struct RawBlockScoringList {
+    entry: TermEntry,
+    query_weight: f32,
+    blocks: Vec<RawPostingBlockMeta>,
+    full_postings: Option<Vec<u8>>,
+}
+
 /// Metadata for one encoded posting block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RawPostingBlockMeta {
@@ -1415,6 +1422,7 @@ impl RawSegmentFile {
 
         let mut lists = Vec::with_capacity(query_terms.len());
         let mut total_postings = 0usize;
+        let mut has_large_blocked_list = false;
         for (term_id, query_weight) in query_terms {
             let Some((entry, block_directory)) = self.term_entry_with_blocks(term_id)? else {
                 continue;
@@ -1423,6 +1431,8 @@ impl RawSegmentFile {
                 continue;
             }
             total_postings = total_postings.saturating_add(entry.df as usize);
+            has_large_blocked_list |= entry.postings_len as u64 > FILE_FULL_POSTINGS_READ_LIMIT
+                && block_directory.block_count > 1;
             lists.push((entry, block_directory, query_weight));
         }
         if lists.is_empty() {
@@ -1439,6 +1449,20 @@ impl RawSegmentFile {
             .and_then(|max_doc_id| max_doc_id.checked_add(1))
             .unwrap_or(usize::MAX);
         let dense_limit = crate::dense_scratch_limit(self.meta.doc_count as usize);
+        if has_large_blocked_list
+            && lists
+                .iter()
+                .all(|(_, _, query_weight)| *query_weight >= 0.0 && query_weight.is_finite())
+        {
+            return self.top_k_weighted_u32_pruned_blocks(
+                lists,
+                total_postings,
+                dense_slots,
+                dense_limit,
+                k,
+            );
+        }
+
         if dense_slots <= dense_limit {
             let mut scores = vec![0.0; dense_slots];
             let mut touched = Vec::with_capacity(total_postings.min(self.meta.doc_count as usize));
@@ -1498,6 +1522,177 @@ impl RawSegmentFile {
         }
 
         Ok(crate::top_k_scored_docs(scores, k))
+    }
+
+    fn top_k_weighted_u32_pruned_blocks(
+        &mut self,
+        lists: Vec<(TermEntry, TermBlockDirectory, f32)>,
+        total_postings: usize,
+        dense_slots: usize,
+        dense_limit: usize,
+        k: usize,
+    ) -> Result<Vec<(DocId, f32)>, RawSegmentFileError> {
+        let scoring_lists = self.prepare_raw_block_scoring_lists(lists)?;
+        if dense_slots <= dense_limit {
+            return self.top_k_weighted_u32_pruned_blocks_dense(
+                &scoring_lists,
+                total_postings,
+                dense_slots,
+                k,
+            );
+        }
+
+        self.top_k_weighted_u32_pruned_blocks_sparse(&scoring_lists, total_postings, k)
+    }
+
+    fn prepare_raw_block_scoring_lists(
+        &mut self,
+        lists: Vec<(TermEntry, TermBlockDirectory, f32)>,
+    ) -> Result<Vec<RawBlockScoringList>, RawSegmentFileError> {
+        let mut scoring_lists = Vec::with_capacity(lists.len());
+        for (entry, block_directory, query_weight) in lists {
+            self.validate_block_directory(block_directory)?;
+            if entry.df != 0 && block_directory.block_count == 0 {
+                return Err(Error::InvalidLayout {
+                    reason: "nonempty term has no posting blocks",
+                }
+                .into());
+            }
+
+            let mut blocks = Vec::with_capacity(block_directory.block_count as usize);
+            for block_index in 0..block_directory.block_count {
+                blocks.push(self.posting_block_at(entry, block_directory, block_index)?);
+            }
+
+            let full_postings = if entry.postings_len as u64 <= FILE_FULL_POSTINGS_READ_LIMIT {
+                Some(self.read_postings_range(entry.postings_offset, entry.postings_len as u64)?)
+            } else {
+                None
+            };
+            scoring_lists.push(RawBlockScoringList {
+                entry,
+                query_weight,
+                blocks,
+                full_postings,
+            });
+        }
+        Ok(scoring_lists)
+    }
+
+    fn top_k_weighted_u32_pruned_blocks_dense(
+        &mut self,
+        lists: &[RawBlockScoringList],
+        total_postings: usize,
+        dense_slots: usize,
+        k: usize,
+    ) -> Result<Vec<(DocId, f32)>, RawSegmentFileError> {
+        let mut scores = vec![0.0; dense_slots];
+        let mut touched = Vec::with_capacity(total_postings.min(self.meta.doc_count as usize));
+        let mut threshold = None;
+
+        for list in lists {
+            for &block in &list.blocks {
+                let upper_bound = raw_block_range_upper_bound(block, lists);
+                if threshold.is_some_and(|threshold| upper_bound < threshold) {
+                    continue;
+                }
+
+                self.for_each_scoring_block_posting(list, block, |doc_id, doc_weight| {
+                    let contribution = list.query_weight * doc_weight as f32;
+                    if contribution == 0.0 {
+                        return;
+                    }
+                    let slot = doc_id as usize;
+                    if scores[slot] == 0.0 {
+                        touched.push(doc_id);
+                    }
+                    scores[slot] += contribution;
+                })?;
+
+                threshold = raw_dense_top_k_threshold(&scores, &touched, k);
+            }
+        }
+
+        Ok(crate::top_k_scored_docs(
+            touched
+                .into_iter()
+                .map(|doc_id| (doc_id, scores[doc_id as usize])),
+            k,
+        ))
+    }
+
+    fn top_k_weighted_u32_pruned_blocks_sparse(
+        &mut self,
+        lists: &[RawBlockScoringList],
+        total_postings: usize,
+        k: usize,
+    ) -> Result<Vec<(DocId, f32)>, RawSegmentFileError> {
+        let mut scores: HashMap<DocId, f32> =
+            HashMap::with_capacity(total_postings.min(self.meta.doc_count as usize));
+        let mut threshold = None;
+
+        for list in lists {
+            for &block in &list.blocks {
+                let upper_bound = raw_block_range_upper_bound(block, lists);
+                if threshold.is_some_and(|threshold| upper_bound < threshold) {
+                    continue;
+                }
+
+                self.for_each_scoring_block_posting(list, block, |doc_id, doc_weight| {
+                    let contribution = list.query_weight * doc_weight as f32;
+                    if contribution != 0.0 {
+                        *scores.entry(doc_id).or_insert(0.0) += contribution;
+                    }
+                })?;
+
+                threshold = raw_sparse_top_k_threshold(&scores, k);
+            }
+        }
+
+        Ok(crate::top_k_scored_docs(scores, k))
+    }
+
+    fn for_each_scoring_block_posting(
+        &mut self,
+        list: &RawBlockScoringList,
+        block: RawPostingBlockMeta,
+        visit: impl FnMut(DocId, u32),
+    ) -> Result<(), RawSegmentFileError> {
+        if let Some(postings) = &list.full_postings {
+            let start = block
+                .postings_offset
+                .checked_sub(list.entry.postings_offset)
+                .ok_or(Error::InvalidLayout {
+                    reason: "block posting range is outside cached postings",
+                })?;
+            let start = usize::try_from(start).map_err(|_| Error::SegmentTooLarge)?;
+            let len = usize::try_from(block.postings_len).map_err(|_| Error::SegmentTooLarge)?;
+            let end = start.checked_add(len).ok_or(Error::InvalidLayout {
+                reason: "block posting range overflows cached postings",
+            })?;
+            let bytes = postings.get(start..end).ok_or(Error::InvalidLayout {
+                reason: "block posting range is outside cached postings",
+            })?;
+            for_each_posting_in_block(
+                list.entry.term_id,
+                bytes,
+                block.base_doc_id,
+                block.last_doc_id,
+                visit,
+            )?;
+            return Ok(());
+        }
+
+        let bytes =
+            self.read_posting_block_range(block.postings_offset, block.postings_len as u64)?;
+        for_each_posting_in_block(
+            list.entry.term_id,
+            &bytes,
+            block.base_doc_id,
+            block.last_doc_id,
+            visit,
+        )?;
+        Ok(())
     }
 
     fn term_entry(&self, term_id: RawTermId) -> Result<Option<TermEntry>, Error> {
@@ -2115,6 +2310,54 @@ fn for_each_posting_in_block(
         });
     }
     Ok(())
+}
+
+fn raw_block_range_upper_bound(block: RawPostingBlockMeta, lists: &[RawBlockScoringList]) -> f32 {
+    lists
+        .iter()
+        .map(|list| {
+            list.query_weight * max_overlapping_raw_block_weight(&list.blocks, block) as f32
+        })
+        .sum()
+}
+
+fn max_overlapping_raw_block_weight(
+    blocks: &[RawPostingBlockMeta],
+    target: RawPostingBlockMeta,
+) -> u32 {
+    let start = blocks.partition_point(|block| block.last_doc_id < target.base_doc_id);
+    let mut max_weight = 0u32;
+    for block in &blocks[start..] {
+        if block.base_doc_id > target.last_doc_id {
+            break;
+        }
+        max_weight = max_weight.max(block.max_weight);
+    }
+    max_weight
+}
+
+fn raw_dense_top_k_threshold(scores: &[f32], touched: &[DocId], k: usize) -> Option<f32> {
+    if touched.len() < k {
+        return None;
+    }
+    crate::top_k_scored_docs(
+        touched
+            .iter()
+            .copied()
+            .map(|doc_id| (doc_id, scores[doc_id as usize])),
+        k,
+    )
+    .last()
+    .map(|(_, score)| *score)
+}
+
+fn raw_sparse_top_k_threshold(scores: &HashMap<DocId, f32>, k: usize) -> Option<f32> {
+    if scores.len() < k {
+        return None;
+    }
+    crate::top_k_scored_docs(scores.iter().map(|(doc_id, score)| (*doc_id, *score)), k)
+        .last()
+        .map(|(_, score)| *score)
 }
 
 fn normalize_weighted_query_terms(query_terms: &[(RawTermId, f32)]) -> Vec<(RawTermId, f32)> {
@@ -3181,6 +3424,83 @@ mod tests {
 
         let query = [(term, query_weight)];
         assert_eq!(segment.top_k_weighted_u32(&query, k).unwrap(), expected);
+        assert_eq!(
+            file_segment.top_k_weighted_u32(&query, k).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn multi_term_block_max_pruning_matches_byte_backed() {
+        let k = 10usize;
+        let query = [(10, 1.0), (20, 1.0)];
+        let weighted_terms: Vec<Vec<(RawTermId, u32)>> = (0..260u32)
+            .map(|doc_id| {
+                let first_block = doc_id < DEFAULT_BLOCK_SIZE;
+                let term_10 = if first_block {
+                    1_000 + (doc_id % 11)
+                } else {
+                    1
+                };
+                let term_20 = if first_block { 700 + (doc_id % 7) } else { 1 };
+                vec![(10, term_10), (20, term_20)]
+            })
+            .collect();
+        let docs: Vec<_> = weighted_terms
+            .iter()
+            .enumerate()
+            .map(|(doc_id, terms)| RawDocument::new(doc_id as DocId, terms))
+            .collect();
+        let bytes = write_u64_u32_segment(&docs).unwrap();
+        let segment = RawSegment::open(&bytes).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raw.segment");
+        std::fs::write(&path, &bytes).unwrap();
+        let mut file_segment = RawSegmentFile::open(&path).unwrap();
+
+        let expected = segment.top_k_weighted_u32(&query, k).unwrap();
+        let threshold = expected.last().unwrap().1;
+        let term_10_blocks = segment.posting_blocks(10).unwrap();
+        let term_20_blocks = segment.posting_blocks(20).unwrap();
+        assert!(term_10_blocks.len() > 1);
+        assert_eq!(term_10_blocks.len(), term_20_blocks.len());
+        assert!(
+            term_10_blocks[1].max_weight() as f32 + (term_20_blocks[1].max_weight() as f32)
+                < threshold,
+            "later aligned blocks must be prunable for this test"
+        );
+
+        let query_terms = normalize_weighted_query_terms(&query);
+        let mut lists = Vec::with_capacity(query_terms.len());
+        let mut total_postings = 0usize;
+        for (term_id, query_weight) in query_terms {
+            let Some((entry, block_directory)) =
+                file_segment.term_entry_with_blocks(term_id).unwrap()
+            else {
+                panic!("test term should be present");
+            };
+            total_postings = total_postings.saturating_add(entry.df as usize);
+            lists.push((entry, block_directory, query_weight));
+        }
+        let dense_slots = usize::try_from(file_segment.meta.max_doc_id)
+            .ok()
+            .and_then(|max_doc_id| max_doc_id.checked_add(1))
+            .unwrap_or(usize::MAX);
+        let dense_limit = crate::dense_scratch_limit(file_segment.meta.doc_count as usize);
+
+        assert_eq!(
+            file_segment
+                .top_k_weighted_u32_pruned_blocks(
+                    lists,
+                    total_postings,
+                    dense_slots,
+                    dense_limit,
+                    k
+                )
+                .unwrap(),
+            expected
+        );
+
         assert_eq!(
             file_segment.top_k_weighted_u32(&query, k).unwrap(),
             expected

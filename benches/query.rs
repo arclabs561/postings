@@ -150,6 +150,33 @@ fn build_raw_numeric_fixture() -> (PostingsIndex<u64>, RawWeightedDocs, Vec<u8>)
     (idx, weighted_docs, bytes)
 }
 
+#[cfg(feature = "raw-segment")]
+fn build_raw_prunable_top_k_fixture() -> (tempfile::TempDir, RawSegmentFile, Vec<(u64, f32)>) {
+    const PRUNABLE_DOCS: u32 = 180_000;
+
+    let weighted_docs: Vec<Vec<(u64, u32)>> = (0..PRUNABLE_DOCS)
+        .map(|doc_id| {
+            if doc_id < 128 {
+                vec![(1, 2_000_000_000), (2, 1_000_000_000)]
+            } else {
+                vec![(1, 300_000_000), (2, 100_000_000)]
+            }
+        })
+        .collect();
+    let raw_docs: Vec<_> = weighted_docs
+        .iter()
+        .enumerate()
+        .map(|(doc_id, terms)| RawDocument::new(doc_id as u32, terms))
+        .collect();
+    let bytes = write_u64_u32_segment(&raw_docs).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("prunable.raw");
+    std::fs::write(&path, bytes).unwrap();
+    let segment = RawSegmentFile::open(&path).unwrap();
+
+    (dir, segment, vec![(1, 1.0), (2, 1.0)])
+}
+
 fn build_delete_index(n_docs: u32, common_terms: usize) -> PostingsIndex<String> {
     let mut idx: PostingsIndex<String> = PostingsIndex::new();
     for doc_id in 0..n_docs {
@@ -696,6 +723,29 @@ fn bench_raw_segment_queries(c: &mut Criterion) {
                     black_box(10),
                 )
                 .unwrap(),
+            );
+        });
+    });
+
+    group.bench_function("file_top_k_weighted_2_prunable_blocks", |b| {
+        let (_dir, mut prunable_segment, prunable_terms) = build_raw_prunable_top_k_fixture();
+        b.iter(|| {
+            black_box(
+                prunable_segment
+                    .top_k_weighted_u32(black_box(prunable_terms.as_slice()), black_box(10))
+                    .unwrap(),
+            );
+        });
+    });
+
+    group.bench_function("file_top_k_weighted_2_forced_exact_blocks", |b| {
+        let (_dir, mut exact_segment, _) = build_raw_prunable_top_k_fixture();
+        let exact_terms = [(1, 1.0), (2, -1.0)];
+        b.iter(|| {
+            black_box(
+                exact_segment
+                    .top_k_weighted_u32(black_box(exact_terms.as_slice()), black_box(10))
+                    .unwrap(),
             );
         });
     });
