@@ -393,8 +393,25 @@ struct RawSegmentSections {
     final_len: usize,
 }
 
+struct RawSegmentStreamPlan {
+    meta: RawSegmentMeta,
+    term_entries: Vec<TermEntry>,
+    term_block_directories: Vec<TermBlockDirectory>,
+    doc_entries: RawDocumentEntries,
+    block_entries: Vec<RawPostingBlockMeta>,
+    final_len: usize,
+}
+
 type RawDocumentMap = BTreeMap<DocId, (u32, BTreeMap<RawTermId, u32>)>;
 type RawDocumentEntries = Vec<(DocId, u32)>;
+
+struct EncodedRawPostingBlock {
+    base_doc_id: DocId,
+    last_doc_id: DocId,
+    postings_len: u32,
+    max_weight: u32,
+    total_weight: u64,
+}
 
 struct RawBlockScoringList {
     entry: TermEntry,
@@ -3459,9 +3476,34 @@ pub fn write_u64_u32_segment_from_term_postings_to<W: Write + ?Sized>(
     terms: &[RawTermPostingList<'_>],
     writer: &mut W,
 ) -> Result<(), RawSegmentWriteError> {
-    let sections = build_u64_u32_segment_sections_from_term_postings(document_lengths, terms)?;
-    write_raw_segment_sections_to(&sections, writer)?;
+    let plan = build_u64_u32_segment_stream_plan_from_term_postings(document_lengths, terms)?;
+    write_raw_segment_stream_plan_to(&plan, terms, writer)?;
     Ok(())
+}
+
+/// Encode sorted document metadata and term-major posting lists into a
+/// seekable raw segment writer.
+///
+/// This has the same byte format and validation rules as
+/// [`write_u64_u32_segment_from_term_postings_to`]. For local files or other
+/// seekable sinks, it reserves the header and directories, streams encoded
+/// posting blocks once, then seeks back to publish the metadata. That avoids
+/// both the full postings-payload buffer and the generic sink writer's
+/// measurement pass.
+pub fn write_u64_u32_segment_from_term_postings_seekable_to<W: Write + Seek + ?Sized>(
+    document_lengths: &[(DocId, u32)],
+    terms: &[RawTermPostingList<'_>],
+    writer: &mut W,
+) -> Result<(), RawSegmentWriteError> {
+    let (doc_entries, total_doc_len, max_doc_id) = validate_raw_document_lengths(document_lengths)?;
+    validate_raw_term_posting_lists(&doc_entries, terms)?;
+    write_raw_segment_term_postings_seekable_to(
+        &doc_entries,
+        total_doc_len,
+        max_doc_id,
+        terms,
+        writer,
+    )
 }
 
 fn build_u64_u32_segment_sections(
@@ -3533,6 +3575,190 @@ fn build_u64_u32_segment_sections_from_term_postings(
     let (doc_entries, total_doc_len, max_doc_id) = validate_raw_document_lengths(document_lengths)?;
     validate_raw_term_posting_lists(&doc_entries, terms)?;
     build_u64_u32_segment_sections_from_posting_lists(terms, doc_entries, total_doc_len, max_doc_id)
+}
+
+fn build_u64_u32_segment_stream_plan_from_term_postings(
+    document_lengths: &[(DocId, u32)],
+    terms: &[RawTermPostingList<'_>],
+) -> Result<RawSegmentStreamPlan, Error> {
+    let (doc_entries, total_doc_len, max_doc_id) = validate_raw_document_lengths(document_lengths)?;
+    validate_raw_term_posting_lists(&doc_entries, terms)?;
+    build_u64_u32_segment_stream_plan_from_posting_lists(
+        terms,
+        doc_entries,
+        total_doc_len,
+        max_doc_id,
+    )
+}
+
+fn write_raw_segment_term_postings_seekable_to<W: Write + Seek + ?Sized>(
+    doc_entries: &[(DocId, u32)],
+    total_doc_len: u64,
+    max_doc_id: DocId,
+    terms: &[RawTermPostingList<'_>],
+    writer: &mut W,
+) -> Result<(), RawSegmentWriteError> {
+    let doc_count = u32::try_from(doc_entries.len()).map_err(|_| Error::TooManyDocuments)?;
+    let term_count = u32::try_from(terms.len()).map_err(|_| Error::TooManyTerms)?;
+    let term_dir_offset = HEADER_LEN as u64;
+    let term_dir_len = (term_count as u64)
+        .checked_mul(TERM_ENTRY_LEN as u64)
+        .ok_or(Error::SegmentTooLarge)?;
+    let doc_meta_offset = term_dir_offset
+        .checked_add(term_dir_len)
+        .ok_or(Error::SegmentTooLarge)?;
+    let doc_meta_len = (doc_count as u64)
+        .checked_mul(DOC_ENTRY_LEN as u64)
+        .ok_or(Error::SegmentTooLarge)?;
+    let block_dir_offset = doc_meta_offset
+        .checked_add(doc_meta_len)
+        .ok_or(Error::SegmentTooLarge)?;
+    let total_block_count = terms.iter().try_fold(0u64, |count, term| {
+        count
+            .checked_add((term.postings.len() as u64).div_ceil(DEFAULT_BLOCK_SIZE as u64))
+            .ok_or(Error::SegmentTooLarge)
+    })?;
+    let block_dir_len = total_block_count
+        .checked_mul(BLOCK_ENTRY_LEN as u64)
+        .ok_or(Error::SegmentTooLarge)?;
+    let postings_offset = block_dir_offset
+        .checked_add(block_dir_len)
+        .ok_or(Error::SegmentTooLarge)?;
+
+    let segment_start = writer.stream_position()?;
+    write_zeroes_to(
+        writer,
+        (HEADER_LEN as u64)
+            .checked_add(term_dir_len)
+            .ok_or(Error::SegmentTooLarge)?,
+    )?;
+    let doc_meta_crc = write_document_metadata_to(writer, doc_entries)?;
+    write_zeroes_to(writer, block_dir_len)?;
+
+    let mut term_entries = Vec::with_capacity(term_count as usize);
+    let mut term_block_directories = Vec::with_capacity(term_count as usize);
+    let mut block_entries = Vec::new();
+    let mut block_crcs = Vec::new();
+    let mut scratch = Vec::new();
+    let mut postings_len_total = 0u64;
+
+    for term in terms {
+        let term_postings_offset = postings_offset
+            .checked_add(postings_len_total)
+            .ok_or(Error::SegmentTooLarge)?;
+        let blocks_offset = block_dir_offset
+            .checked_add(
+                u64::try_from(block_entries.len()).map_err(|_| Error::SegmentTooLarge)?
+                    * BLOCK_ENTRY_LEN as u64,
+            )
+            .ok_or(Error::SegmentTooLarge)?;
+        let term_start_len = postings_len_total;
+        let mut prev_doc_id = 0;
+        let mut first_posting = true;
+        let mut max_weight = 0u32;
+        let mut total_weight = 0u64;
+
+        for chunk in term.postings.chunks(DEFAULT_BLOCK_SIZE as usize) {
+            scratch.clear();
+            let block = append_encoded_raw_posting_block(
+                chunk,
+                &mut first_posting,
+                &mut prev_doc_id,
+                &mut scratch,
+            )?;
+            let block_postings_offset = postings_offset
+                .checked_add(postings_len_total)
+                .ok_or(Error::SegmentTooLarge)?;
+            postings_len_total = postings_len_total
+                .checked_add(block.postings_len as u64)
+                .ok_or(Error::SegmentTooLarge)?;
+            max_weight = max_weight.max(block.max_weight);
+            total_weight = total_weight.saturating_add(block.total_weight);
+            block_entries.push(RawPostingBlockMeta {
+                base_doc_id: block.base_doc_id,
+                last_doc_id: block.last_doc_id,
+                postings_offset: block_postings_offset,
+                postings_len: block.postings_len,
+                max_weight: block.max_weight,
+            });
+            block_crcs.push(crc32fast::hash(&scratch));
+            writer.write_all(&scratch)?;
+        }
+
+        let postings_len = u32::try_from(postings_len_total - term_start_len)
+            .map_err(|_| Error::SegmentTooLarge)?;
+        term_entries.push(TermEntry {
+            term_id: term.term_id,
+            df: u32::try_from(term.postings.len()).map_err(|_| Error::TooManyDocuments)?,
+            max_weight,
+            total_weight,
+            postings_offset: term_postings_offset,
+            postings_len,
+        });
+        term_block_directories.push(TermBlockDirectory {
+            block_count: u32::try_from(term.postings.len().div_ceil(DEFAULT_BLOCK_SIZE as usize))
+                .map_err(|_| Error::TooManyDocuments)?,
+            blocks_offset,
+        });
+    }
+
+    let integrity_offset = postings_offset
+        .checked_add(postings_len_total)
+        .ok_or(Error::SegmentTooLarge)?;
+    let integrity_len = (block_crcs.len() as u64)
+        .checked_mul(4)
+        .and_then(|crcs| crcs.checked_add(INTEGRITY_HEADER_LEN as u64))
+        .ok_or(Error::SegmentTooLarge)?;
+    let footer_offset = integrity_offset
+        .checked_add(integrity_len)
+        .ok_or(Error::SegmentTooLarge)?;
+    let final_len = footer_offset
+        .checked_add(FOOTER_LEN as u64)
+        .ok_or(Error::SegmentTooLarge)?;
+    let final_len_usize = usize::try_from(final_len).map_err(|_| Error::SegmentTooLarge)?;
+    let meta = RawSegmentMeta {
+        term_count,
+        doc_count,
+        max_doc_id,
+        block_size: DEFAULT_BLOCK_SIZE,
+        total_doc_len,
+        term_dir_offset,
+        doc_meta_offset,
+        postings_offset,
+        footer_offset,
+        flags: FLAG_CHECKSUMS,
+    };
+
+    debug_assert_eq!(writer.stream_position()? - segment_start, integrity_offset);
+    writer.seek(SeekFrom::Start(segment_start))?;
+    write_header_to(writer, meta)?;
+    let term_dir_crc = write_term_directory_to(writer, &term_entries, &term_block_directories)?;
+    writer.seek(SeekFrom::Start(segment_position(
+        segment_start,
+        block_dir_offset,
+    )?))?;
+    let block_dir_crc = write_block_directory_to(writer, &block_entries)?;
+    writer.seek(SeekFrom::Start(segment_position(
+        segment_start,
+        integrity_offset,
+    )?))?;
+
+    let mut integrity = Vec::with_capacity(INTEGRITY_HEADER_LEN + block_crcs.len() * 4);
+    put_integrity_section(
+        &mut integrity,
+        term_dir_crc,
+        doc_meta_crc,
+        block_dir_crc,
+        &block_crcs,
+    );
+    writer.write_all(&integrity)?;
+    writer.write_all(FOOTER_MAGIC)?;
+    writer.write_all(&VERSION.to_le_bytes())?;
+    debug_assert_eq!(
+        writer.stream_position()? - segment_start,
+        final_len_usize as u64
+    );
+    Ok(())
 }
 
 fn validate_raw_document_lengths(
@@ -3738,6 +3964,130 @@ fn build_u64_u32_segment_sections_from_posting_lists(
     )
 }
 
+fn build_u64_u32_segment_stream_plan_from_posting_lists(
+    posting_lists: &[RawTermPostingList<'_>],
+    doc_entries: RawDocumentEntries,
+    total_doc_len: u64,
+    max_doc_id: DocId,
+) -> Result<RawSegmentStreamPlan, Error> {
+    let doc_count = u32::try_from(doc_entries.len()).map_err(|_| Error::TooManyDocuments)?;
+    let term_count = u32::try_from(posting_lists.len()).map_err(|_| Error::TooManyTerms)?;
+    let term_dir_offset = HEADER_LEN as u64;
+    let term_dir_len = (term_count as u64)
+        .checked_mul(TERM_ENTRY_LEN as u64)
+        .ok_or(Error::SegmentTooLarge)?;
+    let doc_meta_offset = term_dir_offset
+        .checked_add(term_dir_len)
+        .ok_or(Error::SegmentTooLarge)?;
+    let doc_meta_len = (doc_count as u64)
+        .checked_mul(DOC_ENTRY_LEN as u64)
+        .ok_or(Error::SegmentTooLarge)?;
+    let block_dir_offset = doc_meta_offset
+        .checked_add(doc_meta_len)
+        .ok_or(Error::SegmentTooLarge)?;
+    let total_block_count = posting_lists.iter().try_fold(0u64, |count, term| {
+        count
+            .checked_add((term.postings.len() as u64).div_ceil(DEFAULT_BLOCK_SIZE as u64))
+            .ok_or(Error::SegmentTooLarge)
+    })?;
+    let block_dir_len = total_block_count
+        .checked_mul(BLOCK_ENTRY_LEN as u64)
+        .ok_or(Error::SegmentTooLarge)?;
+    let postings_offset = block_dir_offset
+        .checked_add(block_dir_len)
+        .ok_or(Error::SegmentTooLarge)?;
+
+    let mut term_entries = Vec::with_capacity(term_count as usize);
+    let mut term_block_directories = Vec::with_capacity(term_count as usize);
+    let mut block_entries = Vec::new();
+    let mut postings_len_total = 0u64;
+
+    for term in posting_lists {
+        let term_postings_offset = postings_offset
+            .checked_add(postings_len_total)
+            .ok_or(Error::SegmentTooLarge)?;
+        let blocks_offset = block_dir_offset
+            .checked_add(
+                u64::try_from(block_entries.len()).map_err(|_| Error::SegmentTooLarge)?
+                    * BLOCK_ENTRY_LEN as u64,
+            )
+            .ok_or(Error::SegmentTooLarge)?;
+        let term_start_len = postings_len_total;
+        let mut prev_doc_id = 0;
+        let mut first_posting = true;
+        let mut max_weight = 0u32;
+        let mut total_weight = 0u64;
+
+        for chunk in term.postings.chunks(DEFAULT_BLOCK_SIZE as usize) {
+            let block = measure_raw_posting_block(chunk, &mut first_posting, &mut prev_doc_id)?;
+            let block_postings_offset = postings_offset
+                .checked_add(postings_len_total)
+                .ok_or(Error::SegmentTooLarge)?;
+            postings_len_total = postings_len_total
+                .checked_add(block.postings_len as u64)
+                .ok_or(Error::SegmentTooLarge)?;
+            max_weight = max_weight.max(block.max_weight);
+            total_weight = total_weight.saturating_add(block.total_weight);
+            block_entries.push(RawPostingBlockMeta {
+                base_doc_id: block.base_doc_id,
+                last_doc_id: block.last_doc_id,
+                postings_offset: block_postings_offset,
+                postings_len: block.postings_len,
+                max_weight: block.max_weight,
+            });
+        }
+
+        let postings_len = u32::try_from(postings_len_total - term_start_len)
+            .map_err(|_| Error::SegmentTooLarge)?;
+        term_entries.push(TermEntry {
+            term_id: term.term_id,
+            df: u32::try_from(term.postings.len()).map_err(|_| Error::TooManyDocuments)?,
+            max_weight,
+            total_weight,
+            postings_offset: term_postings_offset,
+            postings_len,
+        });
+        term_block_directories.push(TermBlockDirectory {
+            block_count: u32::try_from(term.postings.len().div_ceil(DEFAULT_BLOCK_SIZE as usize))
+                .map_err(|_| Error::TooManyDocuments)?,
+            blocks_offset,
+        });
+    }
+
+    let integrity_len = total_block_count
+        .checked_mul(4)
+        .and_then(|crcs| crcs.checked_add(INTEGRITY_HEADER_LEN as u64))
+        .ok_or(Error::SegmentTooLarge)?;
+    let footer_offset = postings_offset
+        .checked_add(postings_len_total)
+        .and_then(|end| end.checked_add(integrity_len))
+        .ok_or(Error::SegmentTooLarge)?;
+    let final_len = footer_offset
+        .checked_add(FOOTER_LEN as u64)
+        .ok_or(Error::SegmentTooLarge)?;
+    let final_len = usize::try_from(final_len).map_err(|_| Error::SegmentTooLarge)?;
+
+    Ok(RawSegmentStreamPlan {
+        meta: RawSegmentMeta {
+            term_count,
+            doc_count,
+            max_doc_id,
+            block_size: DEFAULT_BLOCK_SIZE,
+            total_doc_len,
+            term_dir_offset,
+            doc_meta_offset,
+            postings_offset,
+            footer_offset,
+            flags: FLAG_CHECKSUMS,
+        },
+        term_entries,
+        term_block_directories,
+        doc_entries,
+        block_entries,
+        final_len,
+    })
+}
+
 fn build_u64_u32_segment_sections_from_term_iter<'a, I, F>(
     term_count: usize,
     terms: F,
@@ -3799,34 +4149,25 @@ where
         let mut max_weight = 0u32;
         let mut total_weight = 0u64;
         for chunk in list.chunks(DEFAULT_BLOCK_SIZE as usize) {
-            let block_base_doc_id = prev_doc_id;
             let block_start_len = postings_bytes.len();
-            let mut block_max_weight = 0u32;
-            for &(doc_id, weight) in chunk {
-                let gap = if first_posting {
-                    first_posting = false;
-                    doc_id
-                } else {
-                    doc_id - prev_doc_id
-                };
-                varint::encode_u32(gap, &mut postings_bytes);
-                varint::encode_u32(weight, &mut postings_bytes);
-                prev_doc_id = doc_id;
-                max_weight = max_weight.max(weight);
-                block_max_weight = block_max_weight.max(weight);
-                total_weight = total_weight.saturating_add(weight as u64);
-            }
+            let block = append_encoded_raw_posting_block(
+                chunk,
+                &mut first_posting,
+                &mut prev_doc_id,
+                &mut postings_bytes,
+            )?;
+            max_weight = max_weight.max(block.max_weight);
+            total_weight = total_weight.saturating_add(block.total_weight);
             block_entries.push(RawPostingBlockMeta {
-                base_doc_id: block_base_doc_id,
-                last_doc_id: prev_doc_id,
+                base_doc_id: block.base_doc_id,
+                last_doc_id: block.last_doc_id,
                 postings_offset: postings_offset
                     .checked_add(
                         u64::try_from(block_start_len).map_err(|_| Error::SegmentTooLarge)?,
                     )
                     .ok_or(Error::SegmentTooLarge)?,
-                postings_len: u32::try_from(postings_bytes.len() - block_start_len)
-                    .map_err(|_| Error::SegmentTooLarge)?,
-                max_weight: block_max_weight,
+                postings_len: block.postings_len,
+                max_weight: block.max_weight,
             });
             block_crcs.push(crc32fast::hash(&postings_bytes[block_start_len..]));
         }
@@ -3881,6 +4222,85 @@ where
         block_crcs,
         final_len,
     })
+}
+
+fn append_encoded_raw_posting_block(
+    chunk: &[(DocId, u32)],
+    first_posting: &mut bool,
+    prev_doc_id: &mut DocId,
+    out: &mut Vec<u8>,
+) -> Result<EncodedRawPostingBlock, Error> {
+    let start_len = out.len();
+    let base_doc_id = *prev_doc_id;
+    let mut max_weight = 0u32;
+    let mut total_weight = 0u64;
+
+    for &(doc_id, weight) in chunk {
+        let gap = if *first_posting {
+            *first_posting = false;
+            doc_id
+        } else {
+            doc_id - *prev_doc_id
+        };
+        varint::encode_u32(gap, out);
+        varint::encode_u32(weight, out);
+        *prev_doc_id = doc_id;
+        max_weight = max_weight.max(weight);
+        total_weight = total_weight.saturating_add(weight as u64);
+    }
+
+    Ok(EncodedRawPostingBlock {
+        base_doc_id,
+        last_doc_id: *prev_doc_id,
+        postings_len: u32::try_from(out.len() - start_len).map_err(|_| Error::SegmentTooLarge)?,
+        max_weight,
+        total_weight,
+    })
+}
+
+fn measure_raw_posting_block(
+    chunk: &[(DocId, u32)],
+    first_posting: &mut bool,
+    prev_doc_id: &mut DocId,
+) -> Result<EncodedRawPostingBlock, Error> {
+    let base_doc_id = *prev_doc_id;
+    let mut postings_len = 0u32;
+    let mut max_weight = 0u32;
+    let mut total_weight = 0u64;
+
+    for &(doc_id, weight) in chunk {
+        let gap = if *first_posting {
+            *first_posting = false;
+            doc_id
+        } else {
+            doc_id - *prev_doc_id
+        };
+        postings_len = postings_len
+            .checked_add(varint_u32_len(gap))
+            .and_then(|len| len.checked_add(varint_u32_len(weight)))
+            .ok_or(Error::SegmentTooLarge)?;
+        *prev_doc_id = doc_id;
+        max_weight = max_weight.max(weight);
+        total_weight = total_weight.saturating_add(weight as u64);
+    }
+
+    Ok(EncodedRawPostingBlock {
+        base_doc_id,
+        last_doc_id: *prev_doc_id,
+        postings_len,
+        max_weight,
+        total_weight,
+    })
+}
+
+fn varint_u32_len(value: u32) -> u32 {
+    match value {
+        0..=0x7f => 1,
+        0x80..=0x3fff => 2,
+        0x4000..=0x1f_ffff => 3,
+        0x20_0000..=0x0fff_ffff => 4,
+        _ => 5,
+    }
 }
 
 fn append_term_directory(out: &mut Vec<u8>, sections: &RawSegmentSections) -> u32 {
@@ -3981,13 +4401,14 @@ fn write_raw_segment_sections_to<W: Write + ?Sized>(
     sections: &RawSegmentSections,
     writer: &mut W,
 ) -> std::io::Result<()> {
-    let mut header = Vec::with_capacity(HEADER_LEN);
-    put_header(&mut header, sections.meta);
-    writer.write_all(&header)?;
-
-    let term_dir_crc = write_term_directory_to(writer, sections)?;
-    let doc_meta_crc = write_document_metadata_to(writer, sections)?;
-    let block_dir_crc = write_block_directory_to(writer, sections)?;
+    write_header_to(writer, sections.meta)?;
+    let term_dir_crc = write_term_directory_to(
+        writer,
+        &sections.term_entries,
+        &sections.term_block_directories,
+    )?;
+    let doc_meta_crc = write_document_metadata_to(writer, &sections.doc_entries)?;
+    let block_dir_crc = write_block_directory_to(writer, &sections.block_entries)?;
     writer.write_all(&sections.postings_bytes)?;
 
     let mut integrity = Vec::with_capacity(INTEGRITY_HEADER_LEN + sections.block_crcs.len() * 4);
@@ -4004,17 +4425,70 @@ fn write_raw_segment_sections_to<W: Write + ?Sized>(
     Ok(())
 }
 
+fn write_raw_segment_stream_plan_to<W: Write + ?Sized>(
+    plan: &RawSegmentStreamPlan,
+    terms: &[RawTermPostingList<'_>],
+    writer: &mut W,
+) -> Result<(), RawSegmentWriteError> {
+    debug_assert_eq!(
+        plan.final_len as u64,
+        plan.meta.footer_offset + FOOTER_LEN as u64
+    );
+    write_header_to(writer, plan.meta)?;
+    let term_dir_crc =
+        write_term_directory_to(writer, &plan.term_entries, &plan.term_block_directories)?;
+    let doc_meta_crc = write_document_metadata_to(writer, &plan.doc_entries)?;
+    let block_dir_crc = write_block_directory_to(writer, &plan.block_entries)?;
+    let block_crcs = write_term_posting_payloads_to(writer, terms, &plan.block_entries)?;
+
+    let mut integrity = Vec::with_capacity(INTEGRITY_HEADER_LEN + block_crcs.len() * 4);
+    put_integrity_section(
+        &mut integrity,
+        term_dir_crc,
+        doc_meta_crc,
+        block_dir_crc,
+        &block_crcs,
+    );
+    writer.write_all(&integrity)?;
+    writer.write_all(FOOTER_MAGIC)?;
+    writer.write_all(&VERSION.to_le_bytes())?;
+    Ok(())
+}
+
+fn write_header_to<W: Write + ?Sized>(writer: &mut W, meta: RawSegmentMeta) -> std::io::Result<()> {
+    let mut header = Vec::with_capacity(HEADER_LEN);
+    put_header(&mut header, meta);
+    writer.write_all(&header)
+}
+
+fn write_zeroes_to<W: Write + ?Sized>(writer: &mut W, mut len: u64) -> std::io::Result<()> {
+    const ZEROES: [u8; 4096] = [0; 4096];
+    while len > 0 {
+        let chunk_len = if len > ZEROES.len() as u64 {
+            ZEROES.len()
+        } else {
+            len as usize
+        };
+        writer.write_all(&ZEROES[..chunk_len])?;
+        len -= chunk_len as u64;
+    }
+    Ok(())
+}
+
+fn segment_position(segment_start: u64, offset: u64) -> Result<u64, Error> {
+    segment_start
+        .checked_add(offset)
+        .ok_or(Error::SegmentTooLarge)
+}
+
 fn write_term_directory_to<W: Write + ?Sized>(
     writer: &mut W,
-    sections: &RawSegmentSections,
+    term_entries: &[TermEntry],
+    term_block_directories: &[TermBlockDirectory],
 ) -> std::io::Result<u32> {
     let mut hasher = crc32fast::Hasher::new();
     let mut entry_bytes = Vec::with_capacity(TERM_ENTRY_LEN);
-    for (entry, block_directory) in sections
-        .term_entries
-        .iter()
-        .zip(&sections.term_block_directories)
-    {
+    for (entry, block_directory) in term_entries.iter().zip(term_block_directories) {
         entry_bytes.clear();
         put_term_directory_entry(&mut entry_bytes, entry, block_directory);
         hasher.update(&entry_bytes);
@@ -4025,11 +4499,11 @@ fn write_term_directory_to<W: Write + ?Sized>(
 
 fn write_document_metadata_to<W: Write + ?Sized>(
     writer: &mut W,
-    sections: &RawSegmentSections,
+    doc_entries: &[(DocId, u32)],
 ) -> std::io::Result<u32> {
     let mut hasher = crc32fast::Hasher::new();
     let mut entry_bytes = Vec::with_capacity(DOC_ENTRY_LEN);
-    for &(doc_id, doc_len) in &sections.doc_entries {
+    for &(doc_id, doc_len) in doc_entries {
         entry_bytes.clear();
         put_document_metadata_entry(&mut entry_bytes, doc_id, doc_len);
         hasher.update(&entry_bytes);
@@ -4040,17 +4514,51 @@ fn write_document_metadata_to<W: Write + ?Sized>(
 
 fn write_block_directory_to<W: Write + ?Sized>(
     writer: &mut W,
-    sections: &RawSegmentSections,
+    block_entries: &[RawPostingBlockMeta],
 ) -> std::io::Result<u32> {
     let mut hasher = crc32fast::Hasher::new();
     let mut entry_bytes = Vec::with_capacity(BLOCK_ENTRY_LEN);
-    for block in &sections.block_entries {
+    for block in block_entries {
         entry_bytes.clear();
         put_block_directory_entry(&mut entry_bytes, block);
         hasher.update(&entry_bytes);
         writer.write_all(&entry_bytes)?;
     }
     Ok(hasher.finalize())
+}
+
+fn write_term_posting_payloads_to<W: Write + ?Sized>(
+    writer: &mut W,
+    terms: &[RawTermPostingList<'_>],
+    block_entries: &[RawPostingBlockMeta],
+) -> Result<Vec<u32>, RawSegmentWriteError> {
+    let mut scratch = Vec::new();
+    let mut planned_blocks = block_entries.iter();
+    let mut block_crcs = Vec::with_capacity(block_entries.len());
+    for term in terms {
+        let mut prev_doc_id = 0;
+        let mut first_posting = true;
+        for chunk in term.postings.chunks(DEFAULT_BLOCK_SIZE as usize) {
+            scratch.clear();
+            let block = append_encoded_raw_posting_block(
+                chunk,
+                &mut first_posting,
+                &mut prev_doc_id,
+                &mut scratch,
+            )?;
+            let planned = planned_blocks
+                .next()
+                .expect("raw segment stream plan missing block metadata");
+            debug_assert_eq!(block.base_doc_id, planned.base_doc_id);
+            debug_assert_eq!(block.last_doc_id, planned.last_doc_id);
+            debug_assert_eq!(block.postings_len, planned.postings_len);
+            debug_assert_eq!(block.max_weight, planned.max_weight);
+            block_crcs.push(crc32fast::hash(&scratch));
+            writer.write_all(&scratch)?;
+        }
+    }
+    debug_assert!(planned_blocks.next().is_none());
+    Ok(block_crcs)
 }
 
 fn put_header(out: &mut Vec<u8>, meta: RawSegmentMeta) {
@@ -4707,10 +5215,69 @@ mod tests {
         let from_terms = write_u64_u32_segment_from_term_postings(&doc_lengths, &terms).unwrap();
         let mut written = Vec::new();
         write_u64_u32_segment_from_term_postings_to(&doc_lengths, &terms, &mut written).unwrap();
+        let mut seekable = std::io::Cursor::new(Vec::new());
+        write_u64_u32_segment_from_term_postings_seekable_to(&doc_lengths, &terms, &mut seekable)
+            .unwrap();
+        let mut prefixed_seekable = std::io::Cursor::new(vec![0xaa; 13]);
+        prefixed_seekable.seek(SeekFrom::End(0)).unwrap();
+        write_u64_u32_segment_from_term_postings_seekable_to(
+            &doc_lengths,
+            &terms,
+            &mut prefixed_seekable,
+        )
+        .unwrap();
+        let prefixed = prefixed_seekable.into_inner();
 
         assert_eq!(from_terms, expected);
         assert_eq!(written, expected);
+        assert_eq!(seekable.into_inner(), expected);
+        assert_eq!(&prefixed[..13], &[0xaa; 13]);
+        assert_eq!(&prefixed[13..], expected);
         RawSegment::open(&written).unwrap();
+        RawSegment::open(&prefixed[13..]).unwrap();
+    }
+
+    #[test]
+    fn raw_segment_term_postings_writer_streams_posting_blocks_to_sink() {
+        struct WriteLimit {
+            bytes: Vec<u8>,
+            max_write_len: usize,
+            largest_write_len: usize,
+        }
+
+        impl Write for WriteLimit {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                if buf.len() > self.max_write_len {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "write exceeded test limit",
+                    ));
+                }
+                self.largest_write_len = self.largest_write_len.max(buf.len());
+                self.bytes.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let doc_lengths: Vec<_> = (1..=300).map(|doc_id| (doc_id, 1)).collect();
+        let postings: Vec<_> = (1..=300).map(|doc_id| (doc_id, 1)).collect();
+        let terms = [RawTermPostingList::new(7, &postings)];
+        let expected = write_u64_u32_segment_from_term_postings(&doc_lengths, &terms).unwrap();
+        let mut writer = WriteLimit {
+            bytes: Vec::new(),
+            max_write_len: 300,
+            largest_write_len: 0,
+        };
+
+        write_u64_u32_segment_from_term_postings_to(&doc_lengths, &terms, &mut writer).unwrap();
+
+        assert_eq!(writer.bytes, expected);
+        assert!(writer.largest_write_len <= 300);
+        RawSegment::open(&writer.bytes).unwrap();
     }
 
     #[test]

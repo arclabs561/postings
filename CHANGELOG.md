@@ -7,6 +7,13 @@
 - Added term-major raw segment writer APIs for external sort or spill/merge
   pipelines that already have sorted document metadata and posting lists,
   avoiding the encoder's doc-to-term transposition.
+- Added a seekable term-major raw segment writer for local-file style sinks that
+  can reserve directories, stream posting blocks once, then backpatch metadata.
+
+### Changed
+
+- Changed the term-major raw segment sink writer to stream encoded posting
+  blocks instead of buffering the full postings payload before writing.
 
 ## [0.2.5] - 2026-07-03
 

@@ -10,6 +10,7 @@ use postings::positional::PosingsIndex;
 use postings::raw::{
     top_k_weighted_u32_files, write_u64_u32_segment, write_u64_u32_segment_from_iter,
     write_u64_u32_segment_from_iter_to, write_u64_u32_segment_from_term_postings,
+    write_u64_u32_segment_from_term_postings_seekable_to,
     write_u64_u32_segment_from_term_postings_to, write_u64_u32_segment_sorted_from_iter,
     write_u64_u32_segment_sorted_from_iter_to, write_u64_u32_segment_to, RawDocument, RawSegment,
     RawSegmentFile, RawTermPostingList,
@@ -663,6 +664,22 @@ fn bench_raw_segment_queries(c: &mut Criterion) {
                 )
                 .unwrap();
                 black_box(out.len());
+            },
+            criterion::BatchSize::SmallInput,
+        );
+    });
+
+    group.bench_function("write_10k_term_postings_seekable_cursor", |b| {
+        b.iter_batched(
+            || std::io::Cursor::new(Vec::with_capacity(writer_segment_len)),
+            |mut out| {
+                write_u64_u32_segment_from_term_postings_seekable_to(
+                    black_box(&writer_doc_lengths),
+                    black_box(&writer_term_postings),
+                    &mut out,
+                )
+                .unwrap();
+                black_box(out.get_ref().len());
             },
             criterion::BatchSize::SmallInput,
         );

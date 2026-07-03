@@ -95,13 +95,15 @@ posting payloads should not be rebuilt into a full `PostingsIndex` on every
 open.
 
 Raw segments can be encoded from a slice, document iterator, sorted document
-iterator, or term-major posting lists into a `Vec<u8>` or a caller-provided
-`Write` sink. The writer API avoids requiring the final segment as one
-contiguous allocation when the caller wants to stream bytes into its own
+iterator, or term-major posting lists into a `Vec<u8>`, caller-provided `Write`
+sink, or seekable writer. The writer API avoids requiring the final segment as
+one contiguous allocation when the caller wants to stream bytes into its own
 durability layer. When document ids are already strictly increasing, the
 sorted-iterator writer also avoids the encoder's whole-corpus document map
 before postings are written. When an external sorter or merge already has
-term-major lists, the term-major writer avoids doc-to-term transposition too.
+term-major lists, the term-major writer avoids doc-to-term transposition too;
+the seekable term-major writer also avoids a second payload pass for local-file
+style sinks.
 
 `RawSegmentFile::top_k_weighted_u32` scores one raw file by sparse inner product;
 `top_k_weighted_u32_files` merges exact top-k results across raw files when
