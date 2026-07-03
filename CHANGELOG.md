@@ -6,6 +6,9 @@
 
 - Added `top_k_weighted_u32_files_with_stats` for raw multi-file sparse top-k
   segment-pruning diagnostics.
+- Added `write_u64_u32_segment_to` for emitting raw segments into
+  caller-provided writers without requiring the final segment as one contiguous
+  `Vec<u8>`.
 - Added borrowed-term positional query helpers:
   `PosingsIndex::phrase_match_strs` and `near_match_terms_strs`.
 
