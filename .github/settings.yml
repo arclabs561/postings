@@ -2,7 +2,7 @@
 # https://github.com/repository-settings/app
 
 repository:
-  description: "Inverted index postings lists and codecs"
+  description: "Inverted-index postings lists and codecs"
   homepage: "https://docs.rs/postings"
   private: false
   has_issues: true

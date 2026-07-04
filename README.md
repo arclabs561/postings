@@ -4,7 +4,7 @@
 [![Documentation](https://docs.rs/postings/badge.svg)](https://docs.rs/postings)
 [![CI](https://github.com/arclabs561/postings/actions/workflows/ci.yml/badge.svg)](https://github.com/arclabs561/postings/actions/workflows/ci.yml)
 
-Inverted index postings lists and codecs.
+Inverted-index postings lists and codecs.
 
 Supports `u32` term frequencies for classical IR and `f32` weights for learned
 sparse retrieval.

@@ -5,13 +5,13 @@ edition = "2021"
 rust-version = "1.80"
 license = "MIT OR Apache-2.0"
 authors = ["Arc <attobop@gmail.com>"]
-description = "Inverted-index postings lists with segment-style updates. Supports u32 TF (classical) and f32 weights (SPLADE/learned sparse)."
+description = "Inverted-index postings lists and codecs."
 repository = "https://github.com/arclabs561/postings"
 homepage = "https://github.com/arclabs561/postings"
 documentation = "https://github.com/arclabs561/postings#readme"
 publish = true
 readme = "README.md"
-keywords = ["search", "postings", "inverted-index", "search"]
+keywords = ["search", "postings", "inverted-index", "codec"]
 categories = ["text-processing", "algorithms"]
 
 [workspace]
