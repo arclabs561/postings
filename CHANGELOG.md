@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.2.9] - 2026-07-04
+
 ### Added
 
 - Added partitioned raw-file top-k benchmark coverage to make segment-pruning
