@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.2.12] - 2026-07-04
+
 ### Added
 
 - Added sorted positional shard export helpers for document lengths and borrowed
