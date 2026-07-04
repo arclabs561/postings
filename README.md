@@ -121,7 +121,8 @@ style sinks.
 document ids are globally unique. The file-backed scorer uses block metadata for
 bounded reads and safe top-k pruning where the query weights make that possible.
 Use `top_k_weighted_u32_files_with_stats` when you need searched/pruned segment
-counts for profiling.
+counts for profiling. Segment pruning is layout-sensitive, so measure it against
+representative segment construction before treating it as a storage win.
 Use `lexir::raw` for BM25 over one or more raw files.
 
 This is not a full index lifecycle by itself: callers still own term-id mapping,

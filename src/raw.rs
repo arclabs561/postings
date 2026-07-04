@@ -6422,6 +6422,40 @@ mod tests {
     }
 
     #[test]
+    fn raw_segment_files_prune_disjoint_vocab_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut opened = Vec::new();
+
+        for segment_index in 0..4 {
+            let term_base = (segment_index * 100) as RawTermId;
+            let doc_base = (segment_index * 10) as DocId;
+            let first_terms = [(term_base, 10), (term_base + 1, 1)];
+            let second_terms = [(term_base, 5)];
+            let docs = [
+                RawDocument::new(doc_base, &first_terms),
+                RawDocument::new(doc_base + 1, &second_terms),
+            ];
+            let path = dir.path().join(format!("segment-{segment_index}.raw"));
+            std::fs::write(&path, write_u64_u32_segment(&docs).unwrap()).unwrap();
+            opened.push(RawSegmentFile::open(&path).unwrap());
+        }
+
+        let mut segments: Vec<_> = opened.iter_mut().collect();
+        let result =
+            top_k_weighted_u32_files_with_stats(&mut segments, &[(0, 1.0), (1, 0.5)], 2).unwrap();
+
+        assert_eq!(result.hits, vec![(0, 10.5), (1, 5.0)]);
+        assert_eq!(
+            result.stats,
+            RawTopKSearchStats {
+                segments_seen: 4,
+                segments_scored: 1,
+                segments_pruned: 3,
+            }
+        );
+    }
+
+    #[test]
     fn raw_segment_file_rejects_short_header_as_raw_error() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("short.segment");

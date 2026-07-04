@@ -5,7 +5,8 @@
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use postings::raw::{
-    top_k_weighted_u32_files, write_u64_u32_segment, RawDocument, RawSegmentFile, RawTermId,
+    top_k_weighted_u32_files, top_k_weighted_u32_files_with_stats, write_u64_u32_segment,
+    RawDocument, RawSegmentFile, RawTermId,
 };
 use std::collections::BTreeMap;
 
@@ -13,6 +14,9 @@ const N_DOCS: usize = 50_000;
 const VOCAB_SIZE: usize = 10_000;
 const TERMS_PER_DOC: usize = 100;
 const SEGMENTS: usize = 64;
+const PARTITIONED_DOCS_PER_SEGMENT: usize = 512;
+const PARTITIONED_VOCAB_PER_SEGMENT: usize = 512;
+const PARTITIONED_TERMS_PER_DOC: usize = 32;
 
 type WeightedDocs = Vec<Vec<(RawTermId, u32)>>;
 
@@ -86,8 +90,56 @@ fn build_fixture() -> (
     (dir, segments, weighted_terms)
 }
 
+fn build_partitioned_fixture() -> (
+    tempfile::TempDir,
+    Vec<RawSegmentFile>,
+    Vec<(RawTermId, f32)>,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut segments = Vec::new();
+
+    for segment_index in 0..SEGMENTS {
+        let term_base = (segment_index * PARTITIONED_VOCAB_PER_SEGMENT) as RawTermId;
+        let doc_base = (segment_index * PARTITIONED_DOCS_PER_SEGMENT) as u32;
+        let mut docs = Vec::with_capacity(PARTITIONED_DOCS_PER_SEGMENT);
+
+        for doc_offset in 0..PARTITIONED_DOCS_PER_SEGMENT {
+            let mut terms = BTreeMap::new();
+            for term_offset in 0..PARTITIONED_TERMS_PER_DOC {
+                let local_term =
+                    (doc_offset * 37 + term_offset * 17) % PARTITIONED_VOCAB_PER_SEGMENT;
+                let weight = 1 + ((doc_offset + term_offset + segment_index) % 7) as u32;
+                terms.insert(term_base + local_term as RawTermId, weight);
+            }
+            docs.push(terms.into_iter().collect());
+        }
+
+        let path = dir.path().join(format!("partitioned-{segment_index}.raw"));
+        std::fs::write(&path, raw_segment_bytes_from_docs(&docs, doc_base)).unwrap();
+        segments.push(RawSegmentFile::open(path).unwrap());
+    }
+
+    let weighted_terms = (0..5)
+        .map(|i| (i as RawTermId, 1.0 + (i as f32 * 0.1)))
+        .collect();
+    (dir, segments, weighted_terms)
+}
+
 fn bench_multi_file_top_k(c: &mut Criterion) {
     let (_dir, mut segments, weighted_terms) = build_fixture();
+    let (_partitioned_dir, mut partitioned_segments, partitioned_weighted_terms) =
+        build_partitioned_fixture();
+
+    {
+        let mut segment_refs: Vec<_> = partitioned_segments.iter_mut().collect();
+        let result =
+            top_k_weighted_u32_files_with_stats(&mut segment_refs, &partitioned_weighted_terms, 10)
+                .unwrap();
+        assert_eq!(result.stats.segments_seen, SEGMENTS);
+        assert_eq!(result.stats.segments_scored, 1);
+        assert_eq!(result.stats.segments_pruned, SEGMENTS - 1);
+    }
+
     let mut group = c.benchmark_group("raw_file_topk");
     group.bench_function("multi_64", |b| {
         let mut segment_refs: Vec<_> = segments.iter_mut().collect();
@@ -96,6 +148,32 @@ fn bench_multi_file_top_k(c: &mut Criterion) {
                 top_k_weighted_u32_files(
                     black_box(segment_refs.as_mut_slice()),
                     black_box(weighted_terms.as_slice()),
+                    black_box(10),
+                )
+                .unwrap(),
+            );
+        });
+    });
+    group.bench_function("multi_64_with_stats", |b| {
+        let mut segment_refs: Vec<_> = segments.iter_mut().collect();
+        b.iter(|| {
+            black_box(
+                top_k_weighted_u32_files_with_stats(
+                    black_box(segment_refs.as_mut_slice()),
+                    black_box(weighted_terms.as_slice()),
+                    black_box(10),
+                )
+                .unwrap(),
+            );
+        });
+    });
+    group.bench_function("partitioned_multi_64_with_stats", |b| {
+        let mut segment_refs: Vec<_> = partitioned_segments.iter_mut().collect();
+        b.iter(|| {
+            black_box(
+                top_k_weighted_u32_files_with_stats(
+                    black_box(segment_refs.as_mut_slice()),
+                    black_box(partitioned_weighted_terms.as_slice()),
                     black_box(10),
                 )
                 .unwrap(),

@@ -4,6 +4,8 @@
 
 ### Added
 
+- Added partitioned raw-file top-k benchmark coverage to make segment-pruning
+  wins visible when term vocabularies are segment-local.
 - Added a `raw_segment_file` example for writing immutable raw impact files and
   querying them with file-backed multi-segment top-k search.
 
