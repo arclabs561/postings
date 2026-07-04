@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.2.6] - 2026-07-03
+
 ### Added
 
 - Added term-major raw segment writer APIs for external sort or spill/merge
@@ -20,6 +22,11 @@
   document id.
 - Changed the term-major raw segment sink writer to stream encoded posting
   blocks instead of buffering the full postings payload before writing.
+
+### Fixed
+
+- Preserved existing `raw::Error` implicit discriminant values while adding
+  term-major writer error variants.
 
 ## [0.2.5] - 2026-07-03
 

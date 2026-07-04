@@ -101,12 +101,6 @@ pub enum Error {
         /// Duplicate document id.
         doc_id: DocId,
     },
-    /// Two term posting lists in the input used the same term id.
-    #[error("duplicate raw segment term id: {term_id}")]
-    DuplicateTermId {
-        /// Duplicate term id.
-        term_id: RawTermId,
-    },
     /// A sorted raw segment writer received a smaller document id after a
     /// larger one.
     #[error("raw segment doc ids must be increasing: previous {previous}, current {current}")]
@@ -115,30 +109,6 @@ pub enum Error {
         previous: DocId,
         /// Current document id that violated the ordering requirement.
         current: DocId,
-    },
-    /// A term-major raw segment writer received a smaller term id after a
-    /// larger one.
-    #[error("raw segment term ids must be increasing: previous {previous}, current {current}")]
-    UnsortedTermId {
-        /// Previous term id in the input stream.
-        previous: RawTermId,
-        /// Current term id that violated the ordering requirement.
-        current: RawTermId,
-    },
-    /// A term-major raw segment writer received a term with no postings.
-    #[error("empty raw segment posting list for term {term_id}")]
-    EmptyPostingList {
-        /// Term with no postings.
-        term_id: RawTermId,
-    },
-    /// A term-major raw segment writer received a posting for a document id
-    /// missing from the document-length table.
-    #[error("raw segment posting references unknown doc {doc_id} for term {term_id}")]
-    UnknownDocId {
-        /// Term containing the unknown document id.
-        term_id: RawTermId,
-        /// Posting document id missing from document metadata.
-        doc_id: DocId,
     },
     /// A raw posting used a zero term weight.
     #[error("zero raw segment weight for doc {doc_id}, term {term_id}")]
@@ -200,6 +170,39 @@ pub enum Error {
     TrailingPostingsBytes {
         /// Term whose posting list has trailing bytes.
         term_id: RawTermId,
+    },
+    /// Two term posting lists in the input used the same term id.
+    ///
+    /// New variants are appended to avoid changing the implicit discriminants
+    /// observable through numeric casts on older variants.
+    #[error("duplicate raw segment term id: {term_id}")]
+    DuplicateTermId {
+        /// Duplicate term id.
+        term_id: RawTermId,
+    },
+    /// A term-major raw segment writer received a smaller term id after a
+    /// larger one.
+    #[error("raw segment term ids must be increasing: previous {previous}, current {current}")]
+    UnsortedTermId {
+        /// Previous term id in the input stream.
+        previous: RawTermId,
+        /// Current term id that violated the ordering requirement.
+        current: RawTermId,
+    },
+    /// A term-major raw segment writer received a term with no postings.
+    #[error("empty raw segment posting list for term {term_id}")]
+    EmptyPostingList {
+        /// Term with no postings.
+        term_id: RawTermId,
+    },
+    /// A term-major raw segment writer received a posting for a document id
+    /// missing from the document-length table.
+    #[error("raw segment posting references unknown doc {doc_id} for term {term_id}")]
+    UnknownDocId {
+        /// Term containing the unknown document id.
+        term_id: RawTermId,
+        /// Posting document id missing from document metadata.
+        doc_id: DocId,
     },
 }
 
