@@ -120,6 +120,9 @@ style sinks.
 `top_k_weighted_u32_files` merges exact top-k results across raw files when
 document ids are globally unique. The file-backed scorer uses block metadata for
 bounded reads and safe top-k pruning where the query weights make that possible.
+Use `RawSegmentFile::top_k_weighted_u32_filtered` or
+`top_k_weighted_u32_files_filtered` when a lifecycle layer supplies tombstones
+or newer-version masks; the predicate runs before local top-k truncation.
 `top_k_weighted_u32_files_and_index` fuses sealed files with one live
 `PostingsIndex<u64, u32>` shard and uses the live shard's current top-k
 threshold to skip low-bound sealed files.

@@ -2136,6 +2136,120 @@ impl RawSegmentFile {
         Ok(crate::top_k_scored_docs(scores, k))
     }
 
+    /// Return the top `k` visible documents by sparse inner product over raw
+    /// `u32` weights.
+    ///
+    /// Use this when a lifecycle layer has tombstones or newer-version masks for
+    /// immutable raw files. Filtered documents are skipped before they can enter
+    /// a local top-k result.
+    pub fn top_k_weighted_u32_filtered<F>(
+        &mut self,
+        query_terms: &[(RawTermId, f32)],
+        k: usize,
+        is_visible: F,
+    ) -> Result<Vec<(DocId, f32)>, RawSegmentFileError>
+    where
+        F: Fn(DocId) -> bool,
+    {
+        if k == 0 || query_terms.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let query_terms = normalize_weighted_query_terms(query_terms);
+        if query_terms.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut lists = Vec::with_capacity(query_terms.len());
+        let mut total_postings = 0usize;
+        for (term_id, query_weight) in query_terms {
+            let Some(entry) = self.term_entry(term_id)? else {
+                continue;
+            };
+            if entry.df == 0 {
+                continue;
+            }
+            total_postings = total_postings.saturating_add(entry.df as usize);
+            lists.push((entry, query_weight));
+        }
+        if lists.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let dense_limit = crate::dense_scratch_limit(self.meta.doc_count as usize);
+        let dense_range = self
+            .dense_doc_id_range()?
+            .filter(|(_, dense_slots)| *dense_slots <= dense_limit);
+        if let Some((dense_base, dense_slots)) = dense_range {
+            let mut scores = vec![0.0; dense_slots];
+            let mut touched = Vec::with_capacity(total_postings.min(self.meta.doc_count as usize));
+            let contributions_are_nonnegative = lists
+                .iter()
+                .all(|(_, query_weight)| *query_weight >= 0.0 && query_weight.is_finite());
+
+            if contributions_are_nonnegative {
+                for (entry, query_weight) in lists {
+                    self.for_each_posting_in_entry(entry, |doc_id, doc_weight| {
+                        if !is_visible(doc_id) {
+                            return;
+                        }
+                        let contribution = query_weight * doc_weight as f32;
+                        if contribution == 0.0 {
+                            return;
+                        }
+                        let slot = dense_doc_slot(doc_id, dense_base, dense_slots);
+                        if scores[slot] == 0.0 {
+                            touched.push((doc_id, slot));
+                        }
+                        scores[slot] += contribution;
+                    })?;
+                }
+            } else {
+                let mut seen = vec![false; dense_slots];
+                for (entry, query_weight) in lists {
+                    self.for_each_posting_in_entry(entry, |doc_id, doc_weight| {
+                        if !is_visible(doc_id) {
+                            return;
+                        }
+                        let contribution = query_weight * doc_weight as f32;
+                        if contribution == 0.0 {
+                            return;
+                        }
+                        let slot = dense_doc_slot(doc_id, dense_base, dense_slots);
+                        if !seen[slot] {
+                            seen[slot] = true;
+                            touched.push((doc_id, slot));
+                        }
+                        scores[slot] += contribution;
+                    })?;
+                }
+            }
+
+            return Ok(crate::top_k_scored_docs(
+                touched
+                    .into_iter()
+                    .map(|(doc_id, slot)| (doc_id, scores[slot])),
+                k,
+            ));
+        }
+
+        let mut scores: HashMap<DocId, f32> =
+            HashMap::with_capacity(total_postings.min(self.meta.doc_count as usize));
+        for (entry, query_weight) in lists {
+            self.for_each_posting_in_entry(entry, |doc_id, doc_weight| {
+                if !is_visible(doc_id) {
+                    return;
+                }
+                let contribution = query_weight * doc_weight as f32;
+                if contribution != 0.0 {
+                    *scores.entry(doc_id).or_insert(0.0) += contribution;
+                }
+            })?;
+        }
+
+        Ok(crate::top_k_scored_docs(scores, k))
+    }
+
     fn top_k_weighted_u32_pruned_blocks(
         &mut self,
         lists: Vec<(TermEntry, TermBlockDirectory, f32)>,
@@ -2809,6 +2923,33 @@ pub fn top_k_weighted_u32_files(
     top_k_weighted_u32_files_with_seed(segments, &query_terms, k, Vec::new())
 }
 
+/// Return the top `k` visible documents by sparse inner product across raw
+/// segment files.
+///
+/// Segment document ids must already be globally unique. The visibility
+/// predicate is applied before per-file top-k results are produced, so deleted
+/// or superseded documents cannot fill a local top-k slot before filtering.
+pub fn top_k_weighted_u32_files_filtered<F>(
+    segments: &mut [&mut RawSegmentFile],
+    query_terms: &[(RawTermId, f32)],
+    k: usize,
+    is_visible: F,
+) -> Result<Vec<(DocId, f32)>, RawSegmentFileError>
+where
+    F: Fn(DocId) -> bool,
+{
+    if k == 0 || query_terms.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let query_terms = normalize_weighted_query_terms(query_terms);
+    if query_terms.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    top_k_weighted_u32_files_filtered_with_seed(segments, &query_terms, k, Vec::new(), &is_visible)
+}
+
 fn top_k_weighted_u32_files_with_seed(
     segments: &mut [&mut RawSegmentFile],
     query_terms: &[(RawTermId, f32)],
@@ -2850,6 +2991,61 @@ fn top_k_weighted_u32_files_with_seed(
     } else {
         for segment in segments.iter_mut() {
             candidates.extend(segment.top_k_weighted_u32(query_terms, k)?);
+        }
+    }
+
+    Ok(crate::top_k_scored_docs(candidates, k))
+}
+
+fn top_k_weighted_u32_files_filtered_with_seed<F>(
+    segments: &mut [&mut RawSegmentFile],
+    query_terms: &[(RawTermId, f32)],
+    k: usize,
+    mut candidates: Vec<(DocId, f32)>,
+    is_visible: &F,
+) -> Result<Vec<(DocId, f32)>, RawSegmentFileError>
+where
+    F: Fn(DocId) -> bool,
+{
+    let can_prune_segments = query_terms
+        .iter()
+        .all(|(_, weight)| *weight >= 0.0 && weight.is_finite());
+
+    if can_prune_segments {
+        let mut order = Vec::with_capacity(segments.len());
+        for (index, segment) in segments.iter().enumerate() {
+            let mut upper_bound = 0.0f32;
+            for &(term_id, query_weight) in query_terms {
+                upper_bound += query_weight * segment.max_weight(term_id)? as f32;
+            }
+            order.push((index, upper_bound));
+        }
+        order.retain(|(_, upper_bound)| *upper_bound > 0.0 || !(*upper_bound).is_finite());
+        order.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+
+        let mut threshold = if candidates.len() >= k {
+            candidates = crate::top_k_scored_docs(candidates, k);
+            candidates.last().map_or(0.0, |(_, score)| *score)
+        } else {
+            0.0
+        };
+        for (index, upper_bound) in order {
+            if candidates.len() >= k && upper_bound < threshold {
+                continue;
+            }
+            candidates.extend(segments[index].top_k_weighted_u32_filtered(
+                query_terms,
+                k,
+                is_visible,
+            )?);
+            if candidates.len() >= k {
+                candidates = crate::top_k_scored_docs(candidates, k);
+                threshold = candidates.last().map_or(0.0, |(_, score)| *score);
+            }
+        }
+    } else {
+        for segment in segments.iter_mut() {
+            candidates.extend(segment.top_k_weighted_u32_filtered(query_terms, k, is_visible)?);
         }
     }
 
@@ -6413,6 +6609,89 @@ mod tests {
         assert_eq!(
             top_k_weighted_u32_files(&mut segments, &query, 4).unwrap(),
             idx.top_k_weighted(&memory_query, 4)
+        );
+    }
+
+    #[test]
+    fn raw_segment_file_filtered_top_k_matches_live_memory_index() {
+        let docs = [
+            (1, vec![(10, 3), (20, 1)]),
+            (2, vec![(10, 20), (30, 1)]),
+            (3, vec![(20, 4), (30, 3)]),
+            (4, vec![(10, 2), (30, 2)]),
+        ];
+        let visible = |doc_id: DocId| doc_id != 2;
+
+        let mut live: PostingsIndex<RawTermId, u32> = PostingsIndex::new();
+        for (doc_id, terms) in docs.iter().filter(|(doc_id, _)| visible(*doc_id)) {
+            live.add_weighted_document(*doc_id, terms).unwrap();
+        }
+
+        let raw_docs: Vec<_> = docs
+            .iter()
+            .map(|(doc_id, terms)| RawDocument::new(*doc_id, terms))
+            .collect();
+        let bytes = write_u64_u32_segment(&raw_docs).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raw.segment");
+        std::fs::write(&path, &bytes).unwrap();
+        let mut file_segment = RawSegmentFile::open(&path).unwrap();
+
+        let query = vec![(10, 1.0), (20, 0.5), (30, -0.25)];
+        let memory_query: Vec<(&RawTermId, f32)> = query
+            .iter()
+            .map(|(term_id, weight)| (term_id, *weight))
+            .collect();
+
+        assert_eq!(
+            file_segment
+                .top_k_weighted_u32_filtered(&query, 3, visible)
+                .unwrap(),
+            live.top_k_weighted(&memory_query, 3)
+        );
+    }
+
+    #[test]
+    fn raw_segment_files_filtered_keeps_deleted_docs_out_of_local_top_k() {
+        let first = [(1, vec![(7, 100)]), (2, vec![(7, 90)]), (3, vec![(7, 9)])];
+        let second = [(10, vec![(7, 8)]), (11, vec![(7, 7)])];
+        let visible = |doc_id: DocId| doc_id != 1 && doc_id != 2;
+
+        let mut live: PostingsIndex<RawTermId, u32> = PostingsIndex::new();
+        for (doc_id, terms) in first
+            .iter()
+            .chain(second.iter())
+            .filter(|(doc_id, _)| visible(*doc_id))
+        {
+            live.add_weighted_document(*doc_id, terms).unwrap();
+        }
+
+        let first_docs: Vec<_> = first
+            .iter()
+            .map(|(doc_id, terms)| RawDocument::new(*doc_id, terms))
+            .collect();
+        let second_docs: Vec<_> = second
+            .iter()
+            .map(|(doc_id, terms)| RawDocument::new(*doc_id, terms))
+            .collect();
+        let dir = tempfile::tempdir().unwrap();
+        let first_path = dir.path().join("first.raw");
+        let second_path = dir.path().join("second.raw");
+        std::fs::write(&first_path, write_u64_u32_segment(&first_docs).unwrap()).unwrap();
+        std::fs::write(&second_path, write_u64_u32_segment(&second_docs).unwrap()).unwrap();
+        let mut first_segment = RawSegmentFile::open(&first_path).unwrap();
+        let mut second_segment = RawSegmentFile::open(&second_path).unwrap();
+        let mut segments = [&mut first_segment, &mut second_segment];
+
+        let query = vec![(7, 1.0)];
+        let memory_query: Vec<(&RawTermId, f32)> = query
+            .iter()
+            .map(|(term_id, weight)| (term_id, *weight))
+            .collect();
+
+        assert_eq!(
+            top_k_weighted_u32_files_filtered(&mut segments, &query, 2, visible).unwrap(),
+            live.top_k_weighted(&memory_query, 2)
         );
     }
 

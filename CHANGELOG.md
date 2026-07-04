@@ -25,6 +25,9 @@
   paths.
 - Added Criterion coverage for cached file-backed raw positional phrase and
   NEAR query paths.
+- Added filtered file-backed raw top-k helpers so lifecycle layers can apply
+  tombstone or newer-version masks before local top-k truncation.
+- Added Criterion coverage for filtered multi-file raw top-k search.
 
 ## [0.2.11] - 2026-07-04
 

@@ -6,8 +6,8 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use postings::raw::{
     top_k_weighted_u32_files, top_k_weighted_u32_files_and_index,
-    top_k_weighted_u32_files_with_stats, write_u64_u32_segment, RawDocument, RawSegmentFile,
-    RawTermId,
+    top_k_weighted_u32_files_filtered, top_k_weighted_u32_files_with_stats, write_u64_u32_segment,
+    RawDocument, RawSegmentFile, RawTermId,
 };
 use postings::PostingsIndex;
 use std::collections::BTreeMap;
@@ -217,6 +217,20 @@ fn bench_multi_file_top_k(c: &mut Criterion) {
                     black_box(segment_refs.as_mut_slice()),
                     black_box(weighted_terms.as_slice()),
                     black_box(10),
+                )
+                .unwrap(),
+            );
+        });
+    });
+    group.bench_function("multi_64_filtered", |b| {
+        let mut segment_refs: Vec<_> = segments.iter_mut().collect();
+        b.iter(|| {
+            black_box(
+                top_k_weighted_u32_files_filtered(
+                    black_box(segment_refs.as_mut_slice()),
+                    black_box(weighted_terms.as_slice()),
+                    black_box(10),
+                    |doc_id| doc_id % 7 != 0,
                 )
                 .unwrap(),
             );
