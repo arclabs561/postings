@@ -96,6 +96,9 @@ open.
 `RawSegmentFile::resident_metadata_len` and
 `RawSegmentFile::posting_payload_len` report that split for callers that enforce
 per-generation or per-query memory budgets.
+`RawSegment::for_each_term_id` and `RawSegmentFile::for_each_term_id` stream the
+term directory when callers need generation-level statistics without allocating
+a full term-id list.
 
 Raw segments can be encoded from a slice, document iterator, sorted document
 iterator, or term-major posting lists into a `Vec<u8>`, caller-provided `Write`

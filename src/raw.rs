@@ -678,10 +678,16 @@ impl<'a> RawSegment<'a> {
     /// Numeric term ids present in this segment, in ascending order.
     pub fn term_ids(&self) -> Result<Vec<RawTermId>, Error> {
         let mut terms = Vec::with_capacity(self.meta.term_count as usize);
-        for index in 0..self.meta.term_count {
-            terms.push(self.term_entry_at(index)?.term_id);
-        }
+        self.for_each_term_id(|term_id| terms.push(term_id))?;
         Ok(terms)
+    }
+
+    /// Visit numeric term ids present in this segment, in ascending order.
+    pub fn for_each_term_id(&self, mut visit: impl FnMut(RawTermId)) -> Result<(), Error> {
+        for index in 0..self.meta.term_count {
+            visit(self.term_entry_at(index)?.term_id);
+        }
+        Ok(())
     }
 
     /// Return a lazy posting iterator for a term id.
@@ -1684,10 +1690,16 @@ impl RawSegmentFile {
     /// Numeric term ids present in this segment, in ascending order.
     pub fn term_ids(&self) -> Result<Vec<RawTermId>, Error> {
         let mut terms = Vec::with_capacity(self.meta.term_count as usize);
-        for index in 0..self.meta.term_count {
-            terms.push(self.term_entry_at(index)?.term_id);
-        }
+        self.for_each_term_id(|term_id| terms.push(term_id))?;
         Ok(terms)
+    }
+
+    /// Visit numeric term ids present in this segment, in ascending order.
+    pub fn for_each_term_id(&self, mut visit: impl FnMut(RawTermId)) -> Result<(), Error> {
+        for index in 0..self.meta.term_count {
+            visit(self.term_entry_at(index)?.term_id);
+        }
+        Ok(())
     }
 
     /// Return decoded postings for a term id, range-reading only that term's payload.
@@ -5153,6 +5165,11 @@ mod tests {
         assert_eq!(segment.total_weight(10).unwrap(), 5);
         assert_eq!(segment.max_weight(10).unwrap(), 4);
         assert_eq!(segment.term_ids().unwrap(), vec![10, 20, 30]);
+        let mut term_ids = Vec::new();
+        segment
+            .for_each_term_id(|term_id| term_ids.push(term_id))
+            .unwrap();
+        assert_eq!(term_ids, vec![10, 20, 30]);
         assert_eq!(collect_postings(&segment, 10), vec![(2, 1), (5, 4)]);
         let mut visited = Vec::new();
         segment
@@ -5640,6 +5657,11 @@ mod tests {
         assert_eq!(segment.total_weight(10).unwrap(), 5);
         assert_eq!(segment.max_weight(10).unwrap(), 4);
         assert_eq!(segment.term_ids().unwrap(), vec![10, 20]);
+        let mut term_ids = Vec::new();
+        segment
+            .for_each_term_id(|term_id| term_ids.push(term_id))
+            .unwrap();
+        assert_eq!(term_ids, vec![10, 20]);
         assert_eq!(segment.postings(10).unwrap(), vec![(2, 1), (5, 4)]);
         let mut visited = Vec::new();
         segment
