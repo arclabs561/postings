@@ -5,9 +5,11 @@
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use postings::raw::{
-    top_k_weighted_u32_files, top_k_weighted_u32_files_with_stats, write_u64_u32_segment,
-    RawDocument, RawSegmentFile, RawTermId,
+    top_k_weighted_u32_files, top_k_weighted_u32_files_and_index,
+    top_k_weighted_u32_files_with_stats, write_u64_u32_segment, RawDocument, RawSegmentFile,
+    RawTermId,
 };
+use postings::PostingsIndex;
 use std::collections::BTreeMap;
 
 const N_DOCS: usize = 50_000;
@@ -17,8 +19,16 @@ const SEGMENTS: usize = 64;
 const PARTITIONED_DOCS_PER_SEGMENT: usize = 512;
 const PARTITIONED_VOCAB_PER_SEGMENT: usize = 512;
 const PARTITIONED_TERMS_PER_DOC: usize = 32;
+const LIVE_PRUNE_DOCS_PER_SEGMENT: usize = 256;
+const LIVE_PRUNE_DOC_BASE: u32 = 1_000_000;
 
 type WeightedDocs = Vec<Vec<(RawTermId, u32)>>;
+type LivePruneFixture = (
+    tempfile::TempDir,
+    Vec<RawSegmentFile>,
+    PostingsIndex<RawTermId, u32>,
+    Vec<(RawTermId, f32)>,
+);
 
 fn zipf_sample(rng: &mut u64, vocab_size: usize) -> usize {
     *rng ^= *rng << 13;
@@ -125,10 +135,38 @@ fn build_partitioned_fixture() -> (
     (dir, segments, weighted_terms)
 }
 
+fn build_live_prune_fixture() -> LivePruneFixture {
+    let dir = tempfile::tempdir().unwrap();
+    let mut segments = Vec::new();
+
+    for segment_index in 0..SEGMENTS {
+        let doc_base = (segment_index * LIVE_PRUNE_DOCS_PER_SEGMENT) as u32;
+        let docs: Vec<_> = (0..LIVE_PRUNE_DOCS_PER_SEGMENT)
+            .map(|doc_offset| {
+                let weight = 1 + ((segment_index + doc_offset) % 3) as u32;
+                vec![(0, weight)]
+            })
+            .collect();
+        let path = dir.path().join(format!("live-prune-{segment_index}.raw"));
+        std::fs::write(&path, raw_segment_bytes_from_docs(&docs, doc_base)).unwrap();
+        segments.push(RawSegmentFile::open(path).unwrap());
+    }
+
+    let mut live = PostingsIndex::new();
+    for doc_offset in 0..16u32 {
+        live.add_weighted_document(LIVE_PRUNE_DOC_BASE + doc_offset, &[(0, 10_000)])
+            .unwrap();
+    }
+
+    (dir, segments, live, vec![(0, 1.0)])
+}
+
 fn bench_multi_file_top_k(c: &mut Criterion) {
     let (_dir, mut segments, weighted_terms) = build_fixture();
     let (_partitioned_dir, mut partitioned_segments, partitioned_weighted_terms) =
         build_partitioned_fixture();
+    let (_live_prune_dir, mut live_prune_segments, live_prune_index, live_prune_terms) =
+        build_live_prune_fixture();
 
     {
         let mut segment_refs: Vec<_> = partitioned_segments.iter_mut().collect();
@@ -138,6 +176,23 @@ fn bench_multi_file_top_k(c: &mut Criterion) {
         assert_eq!(result.stats.segments_seen, SEGMENTS);
         assert_eq!(result.stats.segments_scored, 1);
         assert_eq!(result.stats.segments_pruned, SEGMENTS - 1);
+    }
+    {
+        let mut segment_refs: Vec<_> = live_prune_segments.iter_mut().collect();
+        let result = top_k_weighted_u32_files_and_index(
+            &mut segment_refs,
+            &live_prune_index,
+            &live_prune_terms,
+            10,
+        )
+        .unwrap();
+        assert_eq!(result.len(), 10);
+        assert!(
+            result
+                .iter()
+                .all(|(doc_id, score)| *doc_id >= LIVE_PRUNE_DOC_BASE && *score == 10_000.0),
+            "live shard should dominate this fixture"
+        );
     }
 
     let mut group = c.benchmark_group("raw_file_topk");
@@ -174,6 +229,20 @@ fn bench_multi_file_top_k(c: &mut Criterion) {
                 top_k_weighted_u32_files_with_stats(
                     black_box(segment_refs.as_mut_slice()),
                     black_box(partitioned_weighted_terms.as_slice()),
+                    black_box(10),
+                )
+                .unwrap(),
+            );
+        });
+    });
+    group.bench_function("files_and_live_live_prunes_64", |b| {
+        let mut segment_refs: Vec<_> = live_prune_segments.iter_mut().collect();
+        b.iter(|| {
+            black_box(
+                top_k_weighted_u32_files_and_index(
+                    black_box(segment_refs.as_mut_slice()),
+                    black_box(&live_prune_index),
+                    black_box(live_prune_terms.as_slice()),
                     black_box(10),
                 )
                 .unwrap(),

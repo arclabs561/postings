@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Changed `top_k_weighted_u32_files_and_index` to score the live
+  `PostingsIndex` shard first, then use its exact top-k threshold to skip
+  low-bound sealed raw files. Added benchmark coverage for that live-dominant
+  dynamic/static query shape.
+
 ## [0.2.10] - 2026-07-04
 
 ### Added

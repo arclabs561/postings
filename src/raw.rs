@@ -2806,7 +2806,15 @@ pub fn top_k_weighted_u32_files(
         return Ok(Vec::new());
     }
 
-    let mut candidates = Vec::with_capacity(k.saturating_mul(segments.len()));
+    top_k_weighted_u32_files_with_seed(segments, &query_terms, k, Vec::new())
+}
+
+fn top_k_weighted_u32_files_with_seed(
+    segments: &mut [&mut RawSegmentFile],
+    query_terms: &[(RawTermId, f32)],
+    k: usize,
+    mut candidates: Vec<(DocId, f32)>,
+) -> Result<Vec<(DocId, f32)>, RawSegmentFileError> {
     let can_prune_segments = query_terms
         .iter()
         .all(|(_, weight)| *weight >= 0.0 && weight.is_finite());
@@ -2814,21 +2822,26 @@ pub fn top_k_weighted_u32_files(
     if can_prune_segments {
         let mut order = Vec::with_capacity(segments.len());
         for (index, segment) in segments.iter().enumerate() {
-            let mut upper_bound = 0.0;
-            for &(term_id, query_weight) in &query_terms {
+            let mut upper_bound = 0.0f32;
+            for &(term_id, query_weight) in query_terms {
                 upper_bound += query_weight * segment.max_weight(term_id)? as f32;
             }
             order.push((index, upper_bound));
         }
-        order.retain(|(_, upper_bound)| *upper_bound > 0.0 || !upper_bound.is_finite());
+        order.retain(|(_, upper_bound)| *upper_bound > 0.0 || !(*upper_bound).is_finite());
         order.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
 
-        let mut threshold = 0.0;
+        let mut threshold = if candidates.len() >= k {
+            candidates = crate::top_k_scored_docs(candidates, k);
+            candidates.last().map_or(0.0, |(_, score)| *score)
+        } else {
+            0.0
+        };
         for (index, upper_bound) in order {
             if candidates.len() >= k && upper_bound < threshold {
                 continue;
             }
-            candidates.extend(segments[index].top_k_weighted_u32(&query_terms, k)?);
+            candidates.extend(segments[index].top_k_weighted_u32(query_terms, k)?);
             if candidates.len() >= k {
                 candidates = crate::top_k_scored_docs(candidates, k);
                 threshold = candidates.last().map_or(0.0, |(_, score)| *score);
@@ -2836,7 +2849,7 @@ pub fn top_k_weighted_u32_files(
         }
     } else {
         for segment in segments.iter_mut() {
-            candidates.extend(segment.top_k_weighted_u32(&query_terms, k)?);
+            candidates.extend(segment.top_k_weighted_u32(query_terms, k)?);
         }
     }
 
@@ -2859,13 +2872,17 @@ pub fn top_k_weighted_u32_files_and_index(
         return Ok(Vec::new());
     }
 
-    let mut candidates = top_k_weighted_u32_files(segments, query_terms, k)?;
+    let query_terms = normalize_weighted_query_terms(query_terms);
+    if query_terms.is_empty() {
+        return Ok(Vec::new());
+    }
+
     let live_query: Vec<_> = query_terms
         .iter()
         .map(|(term_id, weight)| (term_id, *weight))
         .collect();
-    candidates.extend(live_index.top_k_weighted(&live_query, k));
-    Ok(crate::top_k_scored_docs(candidates, k))
+    let candidates = live_index.top_k_weighted(&live_query, k);
+    top_k_weighted_u32_files_with_seed(segments, &query_terms, k, candidates)
 }
 
 /// Return the top `k` documents by sparse inner product across raw segment files
@@ -6446,6 +6463,29 @@ mod tests {
         assert_eq!(
             top_k_weighted_u32_files_and_index(&mut segments, &live_index, &query, 4).unwrap(),
             full.top_k_weighted(&memory_query, 4)
+        );
+    }
+
+    #[test]
+    fn raw_segment_files_and_live_index_uses_live_threshold_to_skip_low_bound_files() {
+        let docs = [RawDocument::new(10, &[(7, 1)])];
+        let mut bytes = write_u64_u32_segment(&docs).unwrap();
+        let block = RawSegment::open(&bytes).unwrap().posting_blocks(7).unwrap()[0];
+        bytes[block.postings_offset() as usize] ^= 0xFF;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sealed.raw");
+        std::fs::write(&path, &bytes).unwrap();
+        let mut sealed_segment = RawSegmentFile::open(&path).unwrap();
+        let mut segments = [&mut sealed_segment];
+
+        let mut live_index: PostingsIndex<RawTermId, u32> = PostingsIndex::new();
+        live_index.add_weighted_document(1, &[(7, 100)]).unwrap();
+
+        assert_eq!(
+            top_k_weighted_u32_files_and_index(&mut segments, &live_index, &[(7, 1.0)], 1).unwrap(),
+            vec![(1, 100.0)],
+            "the live shard fills k, so the low-bound sealed file is not read"
         );
     }
 
