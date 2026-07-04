@@ -99,6 +99,9 @@ per-generation or per-query memory budgets.
 `RawSegment::for_each_term_id` and `RawSegmentFile::for_each_term_id` stream the
 term directory when callers need generation-level statistics without allocating
 a full term-id list.
+`RawSegment::for_each_term_meta` and `RawSegmentFile::for_each_term_meta` also
+stream document frequency, maximum weight, and total weight from the same
+directory pass.
 
 Raw segments can be encoded from a slice, document iterator, sorted document
 iterator, or term-major posting lists into a `Vec<u8>`, caller-provided `Write`

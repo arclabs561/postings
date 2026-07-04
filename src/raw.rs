@@ -379,6 +379,48 @@ struct TermEntry {
     postings_len: u32,
 }
 
+/// Query-planning metadata for one term in a raw segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RawTermMeta {
+    term_id: RawTermId,
+    df: u32,
+    max_weight: u32,
+    total_weight: u64,
+}
+
+impl RawTermMeta {
+    /// Numeric term id.
+    pub fn term_id(self) -> RawTermId {
+        self.term_id
+    }
+
+    /// Number of documents that contain the term.
+    pub fn df(self) -> u32 {
+        self.df
+    }
+
+    /// Maximum per-document weight for this term.
+    pub fn max_weight(self) -> u32 {
+        self.max_weight
+    }
+
+    /// Sum of term weights across this segment.
+    pub fn total_weight(self) -> u64 {
+        self.total_weight
+    }
+}
+
+impl From<TermEntry> for RawTermMeta {
+    fn from(entry: TermEntry) -> Self {
+        Self {
+            term_id: entry.term_id,
+            df: entry.df,
+            max_weight: entry.max_weight,
+            total_weight: entry.total_weight,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TermBlockDirectory {
     block_count: u32,
@@ -684,8 +726,13 @@ impl<'a> RawSegment<'a> {
 
     /// Visit numeric term ids present in this segment, in ascending order.
     pub fn for_each_term_id(&self, mut visit: impl FnMut(RawTermId)) -> Result<(), Error> {
+        self.for_each_term_meta(|meta| visit(meta.term_id()))
+    }
+
+    /// Visit term metadata present in this segment, in ascending term-id order.
+    pub fn for_each_term_meta(&self, mut visit: impl FnMut(RawTermMeta)) -> Result<(), Error> {
         for index in 0..self.meta.term_count {
-            visit(self.term_entry_at(index)?.term_id);
+            visit(self.term_entry_at(index)?.into());
         }
         Ok(())
     }
@@ -1696,8 +1743,13 @@ impl RawSegmentFile {
 
     /// Visit numeric term ids present in this segment, in ascending order.
     pub fn for_each_term_id(&self, mut visit: impl FnMut(RawTermId)) -> Result<(), Error> {
+        self.for_each_term_meta(|meta| visit(meta.term_id()))
+    }
+
+    /// Visit term metadata present in this segment, in ascending term-id order.
+    pub fn for_each_term_meta(&self, mut visit: impl FnMut(RawTermMeta)) -> Result<(), Error> {
         for index in 0..self.meta.term_count {
-            visit(self.term_entry_at(index)?.term_id);
+            visit(self.term_entry_at(index)?.into());
         }
         Ok(())
     }
@@ -5170,6 +5222,21 @@ mod tests {
             .for_each_term_id(|term_id| term_ids.push(term_id))
             .unwrap();
         assert_eq!(term_ids, vec![10, 20, 30]);
+        let mut term_metas = Vec::new();
+        segment
+            .for_each_term_meta(|meta| {
+                term_metas.push((
+                    meta.term_id(),
+                    meta.df(),
+                    meta.max_weight(),
+                    meta.total_weight(),
+                ));
+            })
+            .unwrap();
+        assert_eq!(
+            term_metas,
+            vec![(10, 2, 4, 5), (20, 2, 2, 3), (30, 1, 1, 1)]
+        );
         assert_eq!(collect_postings(&segment, 10), vec![(2, 1), (5, 4)]);
         let mut visited = Vec::new();
         segment
@@ -5662,6 +5729,18 @@ mod tests {
             .for_each_term_id(|term_id| term_ids.push(term_id))
             .unwrap();
         assert_eq!(term_ids, vec![10, 20]);
+        let mut term_metas = Vec::new();
+        segment
+            .for_each_term_meta(|meta| {
+                term_metas.push((
+                    meta.term_id(),
+                    meta.df(),
+                    meta.max_weight(),
+                    meta.total_weight(),
+                ));
+            })
+            .unwrap();
+        assert_eq!(term_metas, vec![(10, 2, 4, 5), (20, 2, 2, 3)]);
         assert_eq!(segment.postings(10).unwrap(), vec![(2, 1), (5, 4)]);
         let mut visited = Vec::new();
         segment

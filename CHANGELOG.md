@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `RawTermMeta`, `RawSegment::for_each_term_meta`, and
+  `RawSegmentFile::for_each_term_meta` for streaming raw term-directory stats
+  without allocating term-id lists or doing a second lookup per term.
+
 ## [0.2.7] - 2026-07-03
 
 ### Added
