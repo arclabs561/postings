@@ -6,6 +6,7 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 #[cfg(all(feature = "positional", feature = "raw-segment"))]
 use postings::positional::raw::{
+    near_match_terms_strs_segment_files, phrase_match_strs_segment_files,
     write_positional_segment_from_index, RawPositionalSegment, RawPositionalSegmentFile,
 };
 #[cfg(feature = "positional")]
@@ -227,6 +228,50 @@ fn build_positional_index() -> PosingsIndex {
         idx.add_document(doc_id, &terms).unwrap();
     }
     idx
+}
+
+#[cfg(all(feature = "positional", feature = "raw-segment"))]
+fn build_positional_segment_files(
+    shards: u32,
+) -> (Vec<tempfile::NamedTempFile>, Vec<RawPositionalSegmentFile>) {
+    let mut indexes: Vec<PosingsIndex> = (0..shards).map(|_| PosingsIndex::new()).collect();
+    let mut rng: u64 = 0xdeadbeef_cafebabe;
+
+    for doc_id in 0..POSITIONAL_DOCS as u32 {
+        let mut terms: Vec<String> = (0..POSITIONAL_TERMS_PER_DOC)
+            .map(|_| term_str(zipf_sample(&mut rng, VOCAB_SIZE, 1.0)))
+            .collect();
+
+        if doc_id % 10 == 0 {
+            terms[16] = "anchor_alpha".to_string();
+            terms[17] = "anchor_beta".to_string();
+            terms[18] = "anchor_gamma".to_string();
+        } else if doc_id % 10 == 1 {
+            terms[16] = "anchor_alpha".to_string();
+            terms[20] = "anchor_beta".to_string();
+            terms[30] = "anchor_gamma".to_string();
+        }
+        terms[48] = "near_common".to_string();
+        if doc_id % 20 == 0 {
+            terms[50] = "near_rare".to_string();
+        }
+
+        indexes[(doc_id % shards) as usize]
+            .add_document(doc_id, &terms)
+            .unwrap();
+    }
+
+    let mut files = Vec::with_capacity(shards as usize);
+    let mut segments = Vec::with_capacity(shards as usize);
+    for index in indexes {
+        let bytes = write_positional_segment_from_index(&index).unwrap();
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&bytes).unwrap();
+        file.flush().unwrap();
+        segments.push(RawPositionalSegmentFile::open(file.path()).unwrap());
+        files.push(file);
+    }
+    (files, segments)
 }
 
 /// Choose terms that are guaranteed to exist with a given minimum df.
@@ -1173,6 +1218,58 @@ fn bench_raw_positional_file_queries(c: &mut Criterion) {
 #[cfg(not(all(feature = "positional", feature = "raw-segment")))]
 fn bench_raw_positional_file_queries(_c: &mut Criterion) {}
 
+#[cfg(all(feature = "positional", feature = "raw-segment"))]
+fn bench_raw_positional_file_segment_queries(c: &mut Criterion) {
+    let (_files, mut segments) = build_positional_segment_files(4);
+    let phrase = ["anchor_alpha", "anchor_beta", "anchor_gamma"];
+    let mut group = c.benchmark_group("raw_positional_file_segment_queries");
+
+    group.bench_function("phrase_3_terms_multi_4", |b| {
+        let mut segment_refs: Vec<_> = segments.iter_mut().collect();
+        b.iter(|| {
+            black_box(
+                phrase_match_strs_segment_files(
+                    black_box(segment_refs.as_mut_slice()),
+                    black_box(&phrase),
+                )
+                .unwrap(),
+            );
+        });
+    });
+    group.bench_function("near_unordered_3_terms_window_16_multi_4", |b| {
+        let mut segment_refs: Vec<_> = segments.iter_mut().collect();
+        b.iter(|| {
+            black_box(
+                near_match_terms_strs_segment_files(
+                    black_box(segment_refs.as_mut_slice()),
+                    black_box(&phrase),
+                    black_box(16),
+                    black_box(false),
+                )
+                .unwrap(),
+            );
+        });
+    });
+    group.bench_function("near_ordered_3_terms_window_16_multi_4", |b| {
+        let mut segment_refs: Vec<_> = segments.iter_mut().collect();
+        b.iter(|| {
+            black_box(
+                near_match_terms_strs_segment_files(
+                    black_box(segment_refs.as_mut_slice()),
+                    black_box(&phrase),
+                    black_box(16),
+                    black_box(true),
+                )
+                .unwrap(),
+            );
+        });
+    });
+    group.finish();
+}
+
+#[cfg(not(all(feature = "positional", feature = "raw-segment")))]
+fn bench_raw_positional_file_segment_queries(_c: &mut Criterion) {}
+
 criterion_group!(
     benches,
     bench_insert_50k,
@@ -1185,6 +1282,7 @@ criterion_group!(
     bench_raw_segment_queries,
     bench_positional_queries,
     bench_raw_positional_queries,
-    bench_raw_positional_file_queries
+    bench_raw_positional_file_queries,
+    bench_raw_positional_file_segment_queries
 );
 criterion_main!(benches);

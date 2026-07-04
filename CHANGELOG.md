@@ -13,9 +13,13 @@
 - Added `RawPositionalSegmentFile` for file-backed positional segments that
   keep metadata resident, range-read term payloads, and validate term payload
   checksums lazily.
+- Added exact multi-segment phrase and NEAR helpers for byte-backed and
+  file-backed raw positional segments.
 - Added Criterion coverage for raw positional phrase and NEAR query paths beside
   the existing in-memory positional benchmarks.
 - Added Criterion coverage for file-backed raw positional phrase and NEAR query
+  paths.
+- Added Criterion coverage for multi-file raw positional phrase and NEAR query
   paths.
 
 ## [0.2.11] - 2026-07-04

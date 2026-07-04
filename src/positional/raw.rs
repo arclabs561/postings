@@ -658,6 +658,84 @@ impl RawPositionalSegmentFile {
     }
 }
 
+/// Exact phrase match across immutable byte-backed positional segments.
+///
+/// This unions per-segment matches and sorts/deduplicates document ids. Callers
+/// still own delete masks, newer-version masking, and manifest publication.
+pub fn phrase_match_strs_segments(
+    segments: &[RawPositionalSegment<'_>],
+    phrase: &[&str],
+) -> Result<Vec<DocId>, Error> {
+    let mut out = Vec::new();
+    for segment in segments {
+        out.extend(segment.phrase_match_strs(phrase)?);
+    }
+    Ok(sort_dedup_doc_ids(out))
+}
+
+/// Pairwise NEAR match across immutable byte-backed positional segments.
+pub fn near_match_segments(
+    segments: &[RawPositionalSegment<'_>],
+    a: &str,
+    b: &str,
+    window: u32,
+) -> Result<Vec<DocId>, Error> {
+    near_match_terms_strs_segments(segments, &[a, b], window, false)
+}
+
+/// Multi-term NEAR match across immutable byte-backed positional segments.
+pub fn near_match_terms_strs_segments(
+    segments: &[RawPositionalSegment<'_>],
+    terms: &[&str],
+    window: u32,
+    ordered: bool,
+) -> Result<Vec<DocId>, Error> {
+    let mut out = Vec::new();
+    for segment in segments {
+        out.extend(segment.near_match_terms_strs(terms, window, ordered)?);
+    }
+    Ok(sort_dedup_doc_ids(out))
+}
+
+/// Exact phrase match across immutable file-backed positional segments.
+///
+/// This unions per-segment matches and sorts/deduplicates document ids. Callers
+/// still own delete masks, newer-version masking, and manifest publication.
+pub fn phrase_match_strs_segment_files(
+    segments: &mut [&mut RawPositionalSegmentFile],
+    phrase: &[&str],
+) -> Result<Vec<DocId>, RawPositionalSegmentFileError> {
+    let mut out = Vec::new();
+    for segment in segments.iter_mut() {
+        out.extend(segment.phrase_match_strs(phrase)?);
+    }
+    Ok(sort_dedup_doc_ids(out))
+}
+
+/// Pairwise NEAR match across immutable file-backed positional segments.
+pub fn near_match_segment_files(
+    segments: &mut [&mut RawPositionalSegmentFile],
+    a: &str,
+    b: &str,
+    window: u32,
+) -> Result<Vec<DocId>, RawPositionalSegmentFileError> {
+    near_match_terms_strs_segment_files(segments, &[a, b], window, false)
+}
+
+/// Multi-term NEAR match across immutable file-backed positional segments.
+pub fn near_match_terms_strs_segment_files(
+    segments: &mut [&mut RawPositionalSegmentFile],
+    terms: &[&str],
+    window: u32,
+    ordered: bool,
+) -> Result<Vec<DocId>, RawPositionalSegmentFileError> {
+    let mut out = Vec::new();
+    for segment in segments.iter_mut() {
+        out.extend(segment.near_match_terms_strs(terms, window, ordered)?);
+    }
+    Ok(sort_dedup_doc_ids(out))
+}
+
 fn decode_postings_bytes(
     bytes: &[u8],
     doc_freq: u32,
@@ -728,6 +806,12 @@ fn decode_postings_bytes(
         return Err(Error::InvalidLayout("trailing posting bytes"));
     }
     Ok(out)
+}
+
+fn sort_dedup_doc_ids(mut docs: Vec<DocId>) -> Vec<DocId> {
+    docs.sort_unstable();
+    docs.dedup();
+    docs
 }
 
 #[derive(Debug)]
@@ -1393,6 +1477,40 @@ mod tests {
         index
     }
 
+    fn split_phrase_indexes() -> (PosingsIndex, PosingsIndex, PosingsIndex) {
+        let mut first = PosingsIndex::new();
+        first
+            .add_document(1, &strings(&["new", "york", "city", "search"]))
+            .unwrap();
+        first
+            .add_document(2, &strings(&["new", "jersey", "york", "search"]))
+            .unwrap();
+
+        let mut second = PosingsIndex::new();
+        second
+            .add_document(10, &strings(&["search", "new", "fast", "york"]))
+            .unwrap();
+        second
+            .add_document(11, &strings(&["a", "x", "a", "b"]))
+            .unwrap();
+
+        let mut combined = PosingsIndex::new();
+        combined
+            .add_document(1, &strings(&["new", "york", "city", "search"]))
+            .unwrap();
+        combined
+            .add_document(2, &strings(&["new", "jersey", "york", "search"]))
+            .unwrap();
+        combined
+            .add_document(10, &strings(&["search", "new", "fast", "york"]))
+            .unwrap();
+        combined
+            .add_document(11, &strings(&["a", "x", "a", "b"]))
+            .unwrap();
+
+        (first, second, combined)
+    }
+
     fn write_temp_segment(bytes: &[u8]) -> tempfile::NamedTempFile {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         file.write_all(bytes).unwrap();
@@ -1553,6 +1671,82 @@ mod tests {
             segment.near_match("missing", "york", 2).unwrap(),
             Vec::<DocId>::new()
         );
+    }
+
+    #[test]
+    fn raw_positional_segments_match_combined_in_memory_index() {
+        let (first, second, combined) = split_phrase_indexes();
+        let first_bytes = write_positional_segment_from_index(&first).unwrap();
+        let second_bytes = write_positional_segment_from_index(&second).unwrap();
+        let segments = vec![
+            RawPositionalSegment::open(&first_bytes).unwrap(),
+            RawPositionalSegment::open(&second_bytes).unwrap(),
+        ];
+
+        assert_eq!(
+            phrase_match_strs_segments(&segments, &["new", "york"]).unwrap(),
+            combined.phrase_match_strs(&["new", "york"])
+        );
+        assert_eq!(
+            near_match_segments(&segments, "new", "york", 2).unwrap(),
+            combined.near_match("new", "york", 2)
+        );
+        assert_eq!(
+            near_match_terms_strs_segments(&segments, &["new", "york", "search"], 4, false)
+                .unwrap(),
+            combined.near_match_terms_strs(&["new", "york", "search"], 4, false)
+        );
+        assert_eq!(
+            near_match_terms_strs_segments(&segments, &["a", "a", "b"], 10, true).unwrap(),
+            combined.near_match_terms_strs(&["a", "a", "b"], 10, true)
+        );
+    }
+
+    #[test]
+    fn raw_positional_segment_files_match_combined_in_memory_index() {
+        let (first, second, combined) = split_phrase_indexes();
+        let first_bytes = write_positional_segment_from_index(&first).unwrap();
+        let second_bytes = write_positional_segment_from_index(&second).unwrap();
+        let first_file = write_temp_segment(&first_bytes);
+        let second_file = write_temp_segment(&second_bytes);
+        let mut first_segment = RawPositionalSegmentFile::open(first_file.path()).unwrap();
+        let mut second_segment = RawPositionalSegmentFile::open(second_file.path()).unwrap();
+
+        {
+            let mut segments = [&mut first_segment, &mut second_segment];
+            assert_eq!(
+                phrase_match_strs_segment_files(&mut segments, &["new", "york"]).unwrap(),
+                combined.phrase_match_strs(&["new", "york"])
+            );
+        }
+        {
+            let mut segments = [&mut first_segment, &mut second_segment];
+            assert_eq!(
+                near_match_segment_files(&mut segments, "new", "york", 2).unwrap(),
+                combined.near_match("new", "york", 2)
+            );
+        }
+        {
+            let mut segments = [&mut first_segment, &mut second_segment];
+            assert_eq!(
+                near_match_terms_strs_segment_files(
+                    &mut segments,
+                    &["new", "york", "search"],
+                    4,
+                    false
+                )
+                .unwrap(),
+                combined.near_match_terms_strs(&["new", "york", "search"], 4, false)
+            );
+        }
+        {
+            let mut segments = [&mut first_segment, &mut second_segment];
+            assert_eq!(
+                near_match_terms_strs_segment_files(&mut segments, &["a", "a", "b"], 10, true)
+                    .unwrap(),
+                combined.near_match_terms_strs(&["a", "a", "b"], 10, true)
+            );
+        }
     }
 
     #[test]
