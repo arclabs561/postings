@@ -80,6 +80,8 @@ assert_eq!(ranking[0].0, 1);
 Runnable examples live in [`examples/`](examples/):
 
 - `durable_roundtrip` pairs `postings` with `durability` to build a crash-recoverable inverted index: update events go to a record log, snapshots to a checkpoint, and the index rebuilds from both, the persistence pattern a search engine needs to survive restarts.
+- `raw_segment_file` writes immutable raw impact files and queries them with
+  file-backed top-k search. Run with `--features raw-segment`.
 - `splade_weighted` scores a small learned-sparse collection with `f32` weights
   and verifies top-k sparse inner-product search.
 

@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added a `raw_segment_file` example for writing immutable raw impact files and
+  querying them with file-backed multi-segment top-k search.
+
 ## [0.2.8] - 2026-07-03
 
 ### Added
