@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.2.8] - 2026-07-03
+
 ### Added
 
 - Added `RawTermMeta`, `RawSegment::for_each_term_meta`, and
