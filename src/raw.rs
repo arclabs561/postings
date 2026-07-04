@@ -1516,6 +1516,10 @@ impl BlockChecksums {
         }
         Ok(self.decoded.as_deref().expect("decoded above"))
     }
+
+    fn encoded_len(&self) -> usize {
+        self.encoded.len()
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1623,6 +1627,29 @@ impl RawSegmentFile {
     /// Average document length in the segment.
     pub fn avg_doc_len(&self) -> f32 {
         self.meta.avg_doc_len()
+    }
+
+    /// Raw metadata bytes kept resident by this file-backed reader.
+    ///
+    /// This counts the term directory, document metadata, block directory, and
+    /// encoded per-block checksum bytes copied from the file. It excludes `Vec`
+    /// capacity, the file handle, and lazily decoded checksum lookup caches.
+    pub fn resident_metadata_len(&self) -> usize {
+        self.term_dir.len()
+            + self.doc_meta.len()
+            + self.block_dir.len()
+            + self
+                .block_checksums
+                .as_ref()
+                .map_or(0, BlockChecksums::encoded_len)
+    }
+
+    /// Raw posting payload bytes that remain file-backed.
+    ///
+    /// This excludes the integrity section and footer. Query methods range-read
+    /// from this span instead of keeping it resident at open.
+    pub fn posting_payload_len(&self) -> Result<u64, Error> {
+        posting_payload_len(self.meta)
     }
 
     /// Document length for a document id, if the id is present.
@@ -4721,6 +4748,20 @@ fn integrity_layout(meta: RawSegmentMeta) -> Result<(u64, u64, u64), Error> {
     Ok((integrity_offset, block_count, integrity_len))
 }
 
+fn posting_payload_len(meta: RawSegmentMeta) -> Result<u64, Error> {
+    let postings_end = if meta.has_checksums() {
+        let (integrity_offset, _, _) = integrity_layout(meta)?;
+        integrity_offset
+    } else {
+        meta.footer_offset
+    };
+    postings_end
+        .checked_sub(meta.postings_offset)
+        .ok_or(Error::InvalidLayout {
+            reason: "posting payload end precedes postings section",
+        })
+}
+
 fn verify_directory_checksums(
     term_dir: &[u8],
     doc_meta: &[u8],
@@ -5572,6 +5613,21 @@ mod tests {
 
         assert_eq!(segment.num_docs(), 3);
         assert_eq!(segment.meta().term_count(), 2);
+        let meta = segment.meta();
+        let (integrity_offset, block_count, _) = integrity_layout(meta).unwrap();
+        let block_dir_len = meta.postings_offset - doc_meta_end(meta).unwrap();
+        let expected_resident_metadata_len = meta.term_count as usize * TERM_ENTRY_LEN
+            + meta.doc_count as usize * DOC_ENTRY_LEN
+            + block_dir_len as usize
+            + block_count as usize * 4;
+        assert_eq!(
+            segment.resident_metadata_len(),
+            expected_resident_metadata_len
+        );
+        assert_eq!(
+            segment.posting_payload_len().unwrap(),
+            integrity_offset - meta.postings_offset
+        );
         assert_eq!(segment.doc_id_range().unwrap(), Some((2, 9)));
         assert_eq!(segment.document_len(5).unwrap(), Some(6));
         assert_eq!(segment.document_len(999).unwrap(), None);
@@ -5639,6 +5695,11 @@ mod tests {
                 )
                 .unwrap(),
             CandidatePlan::Candidates(vec![2, 5, 9])
+        );
+        assert_eq!(
+            segment.resident_metadata_len(),
+            expected_resident_metadata_len,
+            "range reads must not promote posting payloads into resident metadata"
         );
     }
 

@@ -93,6 +93,9 @@ files remain readable.
 It is the path intended for large lexical and learned-sparse indexes whose
 posting payloads should not be rebuilt into a full `PostingsIndex` on every
 open.
+`RawSegmentFile::resident_metadata_len` and
+`RawSegmentFile::posting_payload_len` report that split for callers that enforce
+per-generation or per-query memory budgets.
 
 Raw segments can be encoded from a slice, document iterator, sorted document
 iterator, or term-major posting lists into a `Vec<u8>`, caller-provided `Write`

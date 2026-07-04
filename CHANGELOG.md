@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `RawSegmentFile::resident_metadata_len` and
+  `RawSegmentFile::posting_payload_len` so callers can budget file-backed raw
+  segments by resident directory bytes versus range-read posting payload bytes.
+
 ## [0.2.6] - 2026-07-03
 
 ### Added
