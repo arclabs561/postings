@@ -7,6 +7,12 @@
 - Added raw-segment benchmark coverage for sealing a live
   `PostingsIndex<u64, u32>` shard directly into a seekable raw segment writer.
 
+### Changed
+
+- Reduced live-index raw-segment sealing memory by borrowing the source index's
+  posting slices instead of copying every posting into owned term lists before
+  writing.
+
 ## [0.2.9] - 2026-07-04
 
 ### Added

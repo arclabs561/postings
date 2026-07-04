@@ -36,7 +36,7 @@ const FILE_FULL_POSTINGS_READ_LIMIT: u64 = 1024 * 1024;
 pub type RawTermId = u64;
 
 type RawDocumentLengths = Vec<(DocId, u32)>;
-type OwnedRawTermPostings = Vec<(RawTermId, Vec<(DocId, u32)>)>;
+type BorrowedRawTermPostings<'a> = Vec<(RawTermId, &'a [(DocId, u32)])>;
 
 /// Segment-level diagnostics for multi-file raw sparse top-k search.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -3701,7 +3701,8 @@ pub fn write_u64_u32_segment_from_term_postings_seekable_to<W: Write + Seek + ?S
 /// segment bytes. Callers still own file paths, atomic publication, fsync
 /// policy, manifests, deletes, retention, and compaction. The source index must
 /// satisfy the same value constraints as the raw format: zero weights are
-/// rejected by the underlying term-major writer.
+/// rejected by the underlying term-major writer. Posting lists are borrowed
+/// from the source index rather than copied.
 pub fn write_u64_u32_segment_from_index_seekable_to<W: Write + Seek + ?Sized>(
     index: &PostingsIndex<RawTermId, u32>,
     writer: &mut W,
@@ -3716,7 +3717,7 @@ pub fn write_u64_u32_segment_from_index_seekable_to<W: Write + Seek + ?Sized>(
 
 fn collect_raw_index_parts(
     index: &PostingsIndex<RawTermId, u32>,
-) -> (RawDocumentLengths, OwnedRawTermPostings) {
+) -> (RawDocumentLengths, BorrowedRawTermPostings<'_>) {
     let mut document_lengths: Vec<_> = index
         .doc_len
         .iter()
@@ -3728,12 +3729,7 @@ fn collect_raw_index_parts(
         .global_postings
         .iter()
         .filter_map(|(&term_id, postings)| {
-            let live_postings: Vec<_> = postings
-                .iter()
-                .copied()
-                .filter(|(doc_id, _)| index.doc_len.contains_key(doc_id))
-                .collect();
-            (!live_postings.is_empty()).then_some((term_id, live_postings))
+            (!postings.is_empty()).then_some((term_id, postings.as_slice()))
         })
         .collect();
     term_postings.sort_unstable_by_key(|&(term_id, _)| term_id);
