@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added raw-segment benchmark coverage for sealing a live
+  `PostingsIndex<u64, u32>` shard directly into a seekable raw segment writer.
+
 ## [0.2.9] - 2026-07-04
 
 ### Added

@@ -8,9 +8,9 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use postings::positional::PosingsIndex;
 #[cfg(feature = "raw-segment")]
 use postings::raw::{
-    top_k_weighted_u32_files, write_u64_u32_segment, write_u64_u32_segment_from_iter,
-    write_u64_u32_segment_from_iter_to, write_u64_u32_segment_from_term_postings,
-    write_u64_u32_segment_from_term_postings_seekable_to,
+    top_k_weighted_u32_files, write_u64_u32_segment, write_u64_u32_segment_from_index_seekable_to,
+    write_u64_u32_segment_from_iter, write_u64_u32_segment_from_iter_to,
+    write_u64_u32_segment_from_term_postings, write_u64_u32_segment_from_term_postings_seekable_to,
     write_u64_u32_segment_from_term_postings_to, write_u64_u32_segment_sorted_from_iter,
     write_u64_u32_segment_sorted_from_iter_to, write_u64_u32_segment_to, RawDocument, RawSegment,
     RawSegmentFile, RawTermPostingList,
@@ -514,6 +514,12 @@ fn bench_raw_segment_queries(c: &mut Criterion) {
         .enumerate()
         .map(|(doc_id, terms)| RawDocument::new(doc_id as u32, terms))
         .collect();
+    let mut writer_index: PostingsIndex<u64, u32> = PostingsIndex::new();
+    for (doc_id, terms) in weighted_docs.iter().take(writer_doc_count).enumerate() {
+        writer_index
+            .add_weighted_document(doc_id as u32, terms)
+            .unwrap();
+    }
     let writer_segment_len = write_u64_u32_segment(&writer_docs).unwrap().len();
     let mut writer_doc_lengths = Vec::with_capacity(writer_docs.len());
     let mut writer_term_storage: std::collections::BTreeMap<u64, Vec<(u32, u32)>> =
@@ -687,6 +693,18 @@ fn bench_raw_segment_queries(c: &mut Criterion) {
                     &mut out,
                 )
                 .unwrap();
+                black_box(out.get_ref().len());
+            },
+            criterion::BatchSize::SmallInput,
+        );
+    });
+
+    group.bench_function("write_10k_index_seekable_cursor", |b| {
+        b.iter_batched(
+            || std::io::Cursor::new(Vec::with_capacity(writer_segment_len)),
+            |mut out| {
+                write_u64_u32_segment_from_index_seekable_to(black_box(&writer_index), &mut out)
+                    .unwrap();
                 black_box(out.get_ref().len());
             },
             criterion::BatchSize::SmallInput,
