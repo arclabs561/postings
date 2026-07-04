@@ -48,3 +48,8 @@ required-features = ["positional"]
 [[bench]]
 name = "query"
 harness = false
+
+[[bench]]
+name = "raw_file_topk"
+harness = false
+required-features = ["raw-segment"]
