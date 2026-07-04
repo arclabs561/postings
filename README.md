@@ -168,6 +168,8 @@ per-document positions, and exact phrase/NEAR matching; deletes and lifecycle
 stay above them. Segment-set helpers such as `phrase_match_strs_segment_files`
 and `near_match_terms_strs_segment_files` union exact results across sealed
 positional files while leaving delete and newer-version masking to the caller.
+`RawPositionalTermCache` lets serving paths reuse decoded term lists across
+file-backed queries without forcing one-shot scans to retain them.
 
 `cnk-compression` is a helper for sorted candidate doc-id sets produced by
 positional workflows. It is not a storage backend, postings codec, or lifecycle

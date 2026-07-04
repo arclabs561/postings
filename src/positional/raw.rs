@@ -4,6 +4,7 @@
 //! segment. It owns only the segment byte format; callers still own term
 //! analysis, commit publication, deletes, compaction, and crash-safety policy.
 
+use std::collections::BTreeMap;
 use std::fs::File;
 #[cfg(not(unix))]
 use std::io::{Read, Seek, SeekFrom};
@@ -134,6 +135,78 @@ pub struct RawPositionalSegmentFile {
     postings_offset: u64,
     posting_payload_len: u64,
     postings_crc: u32,
+}
+
+/// Decoded positional postings cache for repeated file-backed queries.
+///
+/// The cache is caller-owned so memory policy stays explicit: one-shot scans can
+/// avoid it, while serving paths can reuse decoded term lists across queries.
+#[derive(Clone, Debug, Default)]
+pub struct RawPositionalTermCache {
+    terms: BTreeMap<String, Vec<RawPositionalPosting>>,
+    posting_count: usize,
+    position_count: usize,
+}
+
+impl RawPositionalTermCache {
+    /// Create an empty decoded term cache.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Remove all cached terms.
+    pub fn clear(&mut self) {
+        self.terms.clear();
+        self.posting_count = 0;
+        self.position_count = 0;
+    }
+
+    /// Number of cached term entries, including cached misses.
+    pub fn len(&self) -> usize {
+        self.terms.len()
+    }
+
+    /// Whether the cache has no term entries.
+    pub fn is_empty(&self) -> bool {
+        self.terms.is_empty()
+    }
+
+    /// Total decoded postings retained by the cache.
+    pub fn posting_count(&self) -> usize {
+        self.posting_count
+    }
+
+    /// Total decoded token positions retained by the cache.
+    pub fn position_count(&self) -> usize {
+        self.position_count
+    }
+
+    fn contains(&self, term: &str) -> bool {
+        self.terms.contains_key(term)
+    }
+
+    fn insert(&mut self, term: &str, postings: Vec<RawPositionalPosting>) {
+        if let Some(previous) = self.terms.remove(term) {
+            self.posting_count -= previous.len();
+            self.position_count -= previous
+                .iter()
+                .map(|posting| posting.positions.len())
+                .sum::<usize>();
+        }
+        self.posting_count += postings.len();
+        self.position_count += postings
+            .iter()
+            .map(|posting| posting.positions.len())
+            .sum::<usize>();
+        self.terms.insert(term.to_owned(), postings);
+    }
+
+    fn get(&self, term: &str) -> &[RawPositionalPosting] {
+        self.terms
+            .get(term)
+            .map(Vec::as_slice)
+            .expect("cache entry was ensured before lookup")
+    }
 }
 
 impl<'a> RawPositionalSegment<'a> {
@@ -348,7 +421,7 @@ impl<'a> RawPositionalSegment<'a> {
     fn load_required_terms<'q>(
         &self,
         required: &[(&'q str, usize)],
-    ) -> Result<Vec<DecodedTerm<'q>>, Error> {
+    ) -> Result<Vec<DecodedTerm<'q, Vec<RawPositionalPosting>>>, Error> {
         let mut out = Vec::with_capacity(required.len());
         for &(term, _) in required {
             out.push(DecodedTerm {
@@ -524,6 +597,19 @@ impl RawPositionalSegmentFile {
         )?)
     }
 
+    /// Return decoded postings for one term, using a caller-owned cache.
+    ///
+    /// Missing terms are cached as empty lists so repeated misses do not repeat
+    /// term-directory lookup work.
+    pub fn term_postings_cached<'cache>(
+        &mut self,
+        term: &str,
+        cache: &'cache mut RawPositionalTermCache,
+    ) -> Result<&'cache [RawPositionalPosting], RawPositionalSegmentFileError> {
+        self.ensure_cached_term(term, cache)?;
+        Ok(cache.get(term))
+    }
+
     /// Return positions for one term in one document.
     pub fn positions(
         &mut self,
@@ -533,6 +619,24 @@ impl RawPositionalSegmentFile {
         for posting in self.term_postings(term)? {
             if posting.doc_id == doc_id {
                 return Ok(posting.positions);
+            }
+            if posting.doc_id > doc_id {
+                break;
+            }
+        }
+        Ok(Vec::new())
+    }
+
+    /// Return positions for one term in one document, using a caller-owned cache.
+    pub fn positions_cached(
+        &mut self,
+        term: &str,
+        doc_id: DocId,
+        cache: &mut RawPositionalTermCache,
+    ) -> Result<Vec<TokenPos>, RawPositionalSegmentFileError> {
+        for posting in self.term_postings_cached(term, cache)? {
+            if posting.doc_id == doc_id {
+                return Ok(posting.positions.clone());
             }
             if posting.doc_id > doc_id {
                 break;
@@ -598,6 +702,69 @@ impl RawPositionalSegmentFile {
         Ok(out)
     }
 
+    /// Exact phrase match over borrowed term strings, using a caller-owned cache.
+    pub fn phrase_match_strs_cached(
+        &mut self,
+        phrase: &[&str],
+        cache: &mut RawPositionalTermCache,
+    ) -> Result<Vec<DocId>, RawPositionalSegmentFileError> {
+        if phrase.is_empty() {
+            return Ok(Vec::new());
+        }
+        if let [term] = phrase {
+            return Ok(self
+                .term_postings_cached(term, cache)?
+                .iter()
+                .map(|posting| posting.doc_id)
+                .collect());
+        }
+
+        let required = required_counts(phrase);
+        self.ensure_required_terms_cached(&required, cache)?;
+        let lookups = load_required_terms_from_cache(&required, cache);
+        let candidates = candidates_all_terms(&lookups, &required);
+        let mut out = Vec::new();
+
+        'doc: for doc_id in candidates {
+            let mut anchor_i = 0usize;
+            let mut anchor_positions: &[TokenPos] = &[];
+            for (i, &term) in phrase.iter().enumerate() {
+                let positions = positions_for_term(&lookups, term, doc_id);
+                if positions.is_empty() {
+                    continue 'doc;
+                }
+                if anchor_positions.is_empty() || positions.len() < anchor_positions.len() {
+                    anchor_i = i;
+                    anchor_positions = positions;
+                }
+            }
+
+            'start: for &anchor_pos in anchor_positions {
+                let Some(start) = anchor_pos.checked_sub(anchor_i as u32) else {
+                    continue;
+                };
+                for (i, &term) in phrase.iter().enumerate() {
+                    if i == anchor_i {
+                        continue;
+                    }
+                    let Some(target) = start.checked_add(i as u32) else {
+                        continue 'start;
+                    };
+                    if positions_for_term(&lookups, term, doc_id)
+                        .binary_search(&target)
+                        .is_err()
+                    {
+                        continue 'start;
+                    }
+                }
+                out.push(doc_id);
+                continue 'doc;
+            }
+        }
+
+        Ok(out)
+    }
+
     /// Proximity match: returns docs where `a` and `b` occur within `window` tokens.
     pub fn near_match(
         &mut self,
@@ -606,6 +773,17 @@ impl RawPositionalSegmentFile {
         window: u32,
     ) -> Result<Vec<DocId>, RawPositionalSegmentFileError> {
         self.near_match_terms_strs(&[a, b], window, false)
+    }
+
+    /// Proximity match using a caller-owned cache.
+    pub fn near_match_cached(
+        &mut self,
+        a: &str,
+        b: &str,
+        window: u32,
+        cache: &mut RawPositionalTermCache,
+    ) -> Result<Vec<DocId>, RawPositionalSegmentFileError> {
+        self.near_match_terms_strs_cached(&[a, b], window, false, cache)
     }
 
     /// Multi-term proximity over borrowed term strings.
@@ -636,6 +814,36 @@ impl RawPositionalSegmentFile {
         Ok(out)
     }
 
+    /// Multi-term proximity over borrowed term strings, using a caller-owned cache.
+    pub fn near_match_terms_strs_cached(
+        &mut self,
+        terms: &[&str],
+        window: u32,
+        ordered: bool,
+        cache: &mut RawPositionalTermCache,
+    ) -> Result<Vec<DocId>, RawPositionalSegmentFileError> {
+        if terms.len() < 2 || window == 0 {
+            return Ok(Vec::new());
+        }
+
+        let required = required_counts(terms);
+        self.ensure_required_terms_cached(&required, cache)?;
+        let lookups = load_required_terms_from_cache(&required, cache);
+        let candidates = candidates_all_terms(&lookups, &required);
+        let mut out = Vec::new();
+        for doc_id in candidates {
+            let hit = if ordered {
+                near_doc_ordered(&lookups, doc_id, terms, window)
+            } else {
+                near_doc_unordered(&lookups, doc_id, &required, window)
+            };
+            if hit {
+                out.push(doc_id);
+            }
+        }
+        Ok(out)
+    }
+
     fn term_entry(&self, term: &str) -> Option<&FileTermEntry> {
         self.terms
             .binary_search_by(|entry| entry.term.as_str().cmp(term))
@@ -646,7 +854,8 @@ impl RawPositionalSegmentFile {
     fn load_required_terms<'q>(
         &mut self,
         required: &[(&'q str, usize)],
-    ) -> Result<Vec<DecodedTerm<'q>>, RawPositionalSegmentFileError> {
+    ) -> Result<Vec<DecodedTerm<'q, Vec<RawPositionalPosting>>>, RawPositionalSegmentFileError>
+    {
         let mut out = Vec::with_capacity(required.len());
         for &(term, _) in required {
             out.push(DecodedTerm {
@@ -656,6 +865,43 @@ impl RawPositionalSegmentFile {
         }
         Ok(out)
     }
+
+    fn ensure_required_terms_cached(
+        &mut self,
+        required: &[(&str, usize)],
+        cache: &mut RawPositionalTermCache,
+    ) -> Result<(), RawPositionalSegmentFileError> {
+        for &(term, _) in required {
+            self.ensure_cached_term(term, cache)?;
+        }
+        Ok(())
+    }
+
+    fn ensure_cached_term(
+        &mut self,
+        term: &str,
+        cache: &mut RawPositionalTermCache,
+    ) -> Result<(), RawPositionalSegmentFileError> {
+        if !cache.contains(term) {
+            let postings = self.term_postings(term)?;
+            cache.insert(term, postings);
+        }
+        Ok(())
+    }
+}
+
+fn load_required_terms_from_cache<'q, 'cache>(
+    required: &[(&'q str, usize)],
+    cache: &'cache RawPositionalTermCache,
+) -> Vec<DecodedTerm<'q, &'cache [RawPositionalPosting]>> {
+    let mut out = Vec::with_capacity(required.len());
+    for &(term, _) in required {
+        out.push(DecodedTerm {
+            term,
+            postings: cache.get(term),
+        });
+    }
+    out
 }
 
 /// Exact phrase match across immutable byte-backed positional segments.
@@ -815,17 +1061,18 @@ fn sort_dedup_doc_ids(mut docs: Vec<DocId>) -> Vec<DocId> {
 }
 
 #[derive(Debug)]
-struct DecodedTerm<'a> {
+struct DecodedTerm<'a, P> {
     term: &'a str,
-    postings: Vec<RawPositionalPosting>,
+    postings: P,
 }
 
-impl DecodedTerm<'_> {
+impl<P: AsRef<[RawPositionalPosting]>> DecodedTerm<'_, P> {
     fn positions(&self, doc_id: DocId) -> &[TokenPos] {
         self.postings
+            .as_ref()
             .binary_search_by_key(&doc_id, |posting| posting.doc_id)
             .ok()
-            .map(|index| self.postings[index].positions.as_slice())
+            .map(|index| self.postings.as_ref()[index].positions.as_slice())
             .unwrap_or(&[])
     }
 }
@@ -844,17 +1091,20 @@ fn required_counts<'a>(terms: &[&'a str]) -> Vec<(&'a str, usize)> {
     required
 }
 
-fn candidates_all_terms(lookups: &[DecodedTerm<'_>], required: &[(&str, usize)]) -> Vec<DocId> {
+fn candidates_all_terms<P: AsRef<[RawPositionalPosting]>>(
+    lookups: &[DecodedTerm<'_, P>],
+    required: &[(&str, usize)],
+) -> Vec<DocId> {
     if lookups.is_empty() {
         return Vec::new();
     }
 
     let mut anchor_i = 0usize;
-    let mut anchor_df = lookups[0].postings.len();
+    let mut anchor_df = lookups[0].postings.as_ref().len();
     for (i, lookup) in lookups.iter().enumerate().skip(1) {
-        if lookup.postings.len() < anchor_df {
+        if lookup.postings.as_ref().len() < anchor_df {
             anchor_i = i;
-            anchor_df = lookup.postings.len();
+            anchor_df = lookup.postings.as_ref().len();
         }
     }
 
@@ -865,7 +1115,7 @@ fn candidates_all_terms(lookups: &[DecodedTerm<'_>], required: &[(&str, usize)])
         .map_or(1, |(_, count)| *count);
     let mut out = Vec::new();
 
-    'doc: for posting in &anchor.postings {
+    'doc: for posting in anchor.postings.as_ref() {
         if posting.positions.len() < anchor_required {
             continue;
         }
@@ -883,8 +1133,8 @@ fn candidates_all_terms(lookups: &[DecodedTerm<'_>], required: &[(&str, usize)])
     out
 }
 
-fn positions_for_term<'a>(
-    lookups: &'a [DecodedTerm<'_>],
+fn positions_for_term<'a, P: AsRef<[RawPositionalPosting]>>(
+    lookups: &'a [DecodedTerm<'_, P>],
     term: &str,
     doc_id: DocId,
 ) -> &'a [TokenPos] {
@@ -895,8 +1145,8 @@ fn positions_for_term<'a>(
         .unwrap_or(&[])
 }
 
-fn near_doc_unordered(
-    lookups: &[DecodedTerm<'_>],
+fn near_doc_unordered<P: AsRef<[RawPositionalPosting]>>(
+    lookups: &[DecodedTerm<'_, P>],
     doc_id: DocId,
     required: &[(&str, usize)],
     window: u32,
@@ -937,8 +1187,8 @@ fn near_doc_unordered(
     false
 }
 
-fn near_doc_ordered(
-    lookups: &[DecodedTerm<'_>],
+fn near_doc_ordered<P: AsRef<[RawPositionalPosting]>>(
+    lookups: &[DecodedTerm<'_, P>],
     doc_id: DocId,
     terms: &[&str],
     window: u32,
@@ -1670,6 +1920,98 @@ mod tests {
         assert_eq!(
             segment.near_match("missing", "york", 2).unwrap(),
             Vec::<DocId>::new()
+        );
+    }
+
+    #[test]
+    fn raw_positional_segment_file_cache_tracks_decoded_terms() {
+        let index = sample_index();
+        let bytes = write_positional_segment_from_index(&index).unwrap();
+        let file = write_temp_segment(&bytes);
+        let mut segment = RawPositionalSegmentFile::open(file.path()).unwrap();
+        let mut cache = RawPositionalTermCache::new();
+
+        assert!(cache.is_empty());
+        assert_eq!(
+            segment.term_postings_cached("a", &mut cache).unwrap(),
+            &[
+                RawPositionalPosting {
+                    doc_id: 2,
+                    positions: vec![0],
+                },
+                RawPositionalPosting {
+                    doc_id: 4,
+                    positions: vec![0, 2],
+                },
+            ]
+        );
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.posting_count(), 2);
+        assert_eq!(cache.position_count(), 3);
+        assert_eq!(
+            segment.positions_cached("a", 4, &mut cache).unwrap(),
+            vec![0, 2]
+        );
+        assert!(segment
+            .term_postings_cached("missing", &mut cache)
+            .unwrap()
+            .is_empty());
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.posting_count(), 2);
+        assert_eq!(cache.position_count(), 3);
+
+        cache.clear();
+        assert!(cache.is_empty());
+        assert_eq!(cache.posting_count(), 0);
+        assert_eq!(cache.position_count(), 0);
+    }
+
+    #[test]
+    fn raw_positional_segment_file_cached_queries_match_in_memory() {
+        let mut index = PosingsIndex::new();
+        index
+            .add_document(1, &strings(&["new", "york", "city", "search"]))
+            .unwrap();
+        index
+            .add_document(2, &strings(&["new", "jersey", "york", "search"]))
+            .unwrap();
+        index
+            .add_document(3, &strings(&["search", "new", "fast", "york"]))
+            .unwrap();
+
+        let bytes = write_positional_segment_from_index(&index).unwrap();
+        let file = write_temp_segment(&bytes);
+        let mut segment = RawPositionalSegmentFile::open(file.path()).unwrap();
+        let mut cache = RawPositionalTermCache::new();
+
+        assert_eq!(
+            segment
+                .phrase_match_strs_cached(&["new", "york"], &mut cache)
+                .unwrap(),
+            index.phrase_match_strs(&["new", "york"])
+        );
+        let cached_after_phrase = (cache.len(), cache.posting_count(), cache.position_count());
+        assert_eq!(
+            segment
+                .phrase_match_strs_cached(&["new", "york"], &mut cache)
+                .unwrap(),
+            index.phrase_match_strs(&["new", "york"])
+        );
+        assert_eq!(
+            (cache.len(), cache.posting_count(), cache.position_count()),
+            cached_after_phrase
+        );
+        assert_eq!(
+            segment
+                .near_match_terms_strs_cached(&["new", "york", "search"], 4, false, &mut cache)
+                .unwrap(),
+            index.near_match_terms_strs(&["new", "york", "search"], 4, false)
+        );
+        assert_eq!(
+            segment
+                .near_match_cached("new", "york", 2, &mut cache)
+                .unwrap(),
+            index.near_match("new", "york", 2)
         );
     }
 
