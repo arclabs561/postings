@@ -8,6 +8,8 @@
   wins visible when term vocabularies are segment-local.
 - Added `write_u64_u32_segment_from_index_seekable_to` to seal a live
   `PostingsIndex<u64, u32>` shard directly into a raw segment file.
+- Added `top_k_weighted_u32_files_and_index` to fuse immutable raw segment
+  files with one live `PostingsIndex<u64, u32>` shard for exact top-k search.
 - Added a `raw_segment_file` example for writing immutable raw impact files and
   querying them with file-backed multi-segment top-k search.
 

@@ -2843,6 +2843,31 @@ pub fn top_k_weighted_u32_files(
     Ok(crate::top_k_scored_docs(candidates, k))
 }
 
+/// Return the top `k` documents across immutable raw segment files and one live
+/// in-memory `PostingsIndex<u64, u32>` shard.
+///
+/// This is exact top-k fusion over disjoint live document-id sets. Callers own
+/// any delete mask, update policy, or manifest rule needed to keep raw segment
+/// docs and live-shard docs disjoint.
+pub fn top_k_weighted_u32_files_and_index(
+    segments: &mut [&mut RawSegmentFile],
+    live_index: &PostingsIndex<RawTermId, u32>,
+    query_terms: &[(RawTermId, f32)],
+    k: usize,
+) -> Result<Vec<(DocId, f32)>, RawSegmentFileError> {
+    if k == 0 || query_terms.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut candidates = top_k_weighted_u32_files(segments, query_terms, k)?;
+    let live_query: Vec<_> = query_terms
+        .iter()
+        .map(|(term_id, weight)| (term_id, *weight))
+        .collect();
+    candidates.extend(live_index.top_k_weighted(&live_query, k));
+    Ok(crate::top_k_scored_docs(candidates, k))
+}
+
 /// Return the top `k` documents by sparse inner product across raw segment files
 /// with segment-pruning diagnostics.
 ///
@@ -6375,6 +6400,56 @@ mod tests {
         assert_eq!(
             top_k_weighted_u32_files(&mut segments, &query, 4).unwrap(),
             idx.top_k_weighted(&memory_query, 4)
+        );
+    }
+
+    #[test]
+    fn raw_segment_files_and_live_index_top_k_matches_full_memory_index() {
+        let sealed = [
+            (1, vec![(10, 3), (20, 1)]),
+            (2, vec![(20, 5)]),
+            (3, vec![(30, 2)]),
+        ];
+        let live = [
+            (10, vec![(10, 1), (30, 7)]),
+            (11, vec![(20, 2), (40, 10)]),
+            (12, vec![(10, 4), (40, 1)]),
+        ];
+
+        let mut full: PostingsIndex<RawTermId> = PostingsIndex::new();
+        let mut live_index: PostingsIndex<RawTermId> = PostingsIndex::new();
+        for (doc_id, terms) in sealed.iter().chain(live.iter()) {
+            let mut expanded = Vec::new();
+            for &(term_id, weight) in terms {
+                for _ in 0..weight {
+                    expanded.push(term_id);
+                }
+            }
+            full.add_document(*doc_id, &expanded).unwrap();
+            if *doc_id >= 10 {
+                live_index.add_document(*doc_id, &expanded).unwrap();
+            }
+        }
+
+        let sealed_docs: Vec<_> = sealed
+            .iter()
+            .map(|(doc_id, terms)| RawDocument::new(*doc_id, terms))
+            .collect();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sealed.raw");
+        std::fs::write(&path, write_u64_u32_segment(&sealed_docs).unwrap()).unwrap();
+        let mut sealed_segment = RawSegmentFile::open(&path).unwrap();
+        let mut segments = [&mut sealed_segment];
+
+        let query = vec![(10, 1.5), (30, 2.0), (40, 0.25)];
+        let memory_query: Vec<(&RawTermId, f32)> = query
+            .iter()
+            .map(|(term_id, weight)| (term_id, *weight))
+            .collect();
+
+        assert_eq!(
+            top_k_weighted_u32_files_and_index(&mut segments, &live_index, &query, 4).unwrap(),
+            full.top_k_weighted(&memory_query, 4)
         );
     }
 
