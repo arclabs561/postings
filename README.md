@@ -161,7 +161,8 @@ consumer-owned segment format without cloning position vectors.
 With `raw-segment` also enabled, `postings::positional::raw` can write and open
 checked byte-backed positional segments. The first reader exposes document
 lengths, term document frequency, sorted docs, postings, and per-document
-positions; query planning, deletes, and lifecycle stay above it.
+positions, plus exact phrase and NEAR matching over those decoded term lists;
+deletes and lifecycle stay above it.
 
 `cnk-compression` is a helper for sorted candidate doc-id sets produced by
 positional workflows. It is not a storage backend, postings codec, or lifecycle

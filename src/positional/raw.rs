@@ -207,11 +207,115 @@ impl<'a> RawPositionalSegment<'a> {
         Ok(Vec::new())
     }
 
+    /// Exact phrase match over borrowed term strings.
+    pub fn phrase_match_strs(&self, phrase: &[&str]) -> Result<Vec<DocId>, Error> {
+        if phrase.is_empty() {
+            return Ok(Vec::new());
+        }
+        if let [term] = phrase {
+            return self.docs_with_term(term);
+        }
+
+        let required = required_counts(phrase);
+        let lookups = self.load_required_terms(&required)?;
+        let candidates = candidates_all_terms(&lookups, &required);
+        let mut out = Vec::new();
+
+        'doc: for doc_id in candidates {
+            let mut anchor_i = 0usize;
+            let mut anchor_positions: &[TokenPos] = &[];
+            for (i, &term) in phrase.iter().enumerate() {
+                let positions = positions_for_term(&lookups, term, doc_id);
+                if positions.is_empty() {
+                    continue 'doc;
+                }
+                if anchor_positions.is_empty() || positions.len() < anchor_positions.len() {
+                    anchor_i = i;
+                    anchor_positions = positions;
+                }
+            }
+
+            'start: for &anchor_pos in anchor_positions {
+                let Some(start) = anchor_pos.checked_sub(anchor_i as u32) else {
+                    continue;
+                };
+                for (i, &term) in phrase.iter().enumerate() {
+                    if i == anchor_i {
+                        continue;
+                    }
+                    let Some(target) = start.checked_add(i as u32) else {
+                        continue 'start;
+                    };
+                    if positions_for_term(&lookups, term, doc_id)
+                        .binary_search(&target)
+                        .is_err()
+                    {
+                        continue 'start;
+                    }
+                }
+                out.push(doc_id);
+                continue 'doc;
+            }
+        }
+
+        Ok(out)
+    }
+
+    /// Proximity match: returns docs where `a` and `b` occur within `window` tokens.
+    pub fn near_match(&self, a: &str, b: &str, window: u32) -> Result<Vec<DocId>, Error> {
+        self.near_match_terms_strs(&[a, b], window, false)
+    }
+
+    /// Multi-term proximity over borrowed term strings.
+    ///
+    /// - `ordered=false`: unordered window (`max(pos)-min(pos) <= window`) covering all term occurrences.
+    /// - `ordered=true`: terms must appear in the given order within `window`.
+    pub fn near_match_terms_strs(
+        &self,
+        terms: &[&str],
+        window: u32,
+        ordered: bool,
+    ) -> Result<Vec<DocId>, Error> {
+        if terms.len() < 2 || window == 0 {
+            return Ok(Vec::new());
+        }
+
+        let required = required_counts(terms);
+        let lookups = self.load_required_terms(&required)?;
+        let candidates = candidates_all_terms(&lookups, &required);
+        let mut out = Vec::new();
+        for doc_id in candidates {
+            let hit = if ordered {
+                near_doc_ordered(&lookups, doc_id, terms, window)
+            } else {
+                near_doc_unordered(&lookups, doc_id, &required, window)
+            };
+            if hit {
+                out.push(doc_id);
+            }
+        }
+        Ok(out)
+    }
+
     fn term_entry(&self, term: &str) -> Option<&TermEntry<'a>> {
         self.terms
             .binary_search_by_key(&term, |entry| entry.term)
             .ok()
             .map(|index| &self.terms[index])
+    }
+
+    fn load_required_terms<'q>(
+        &self,
+        required: &[(&'q str, usize)],
+    ) -> Result<Vec<DecodedTerm<'q>>, Error> {
+        let mut out = Vec::with_capacity(required.len());
+        for &(term, _) in required {
+            out.push(DecodedTerm {
+                term,
+                postings: self.term_postings(term)?,
+            });
+        }
+        Ok(out)
     }
 
     fn decode_postings(&self, entry: &TermEntry<'a>) -> Result<Vec<RawPositionalPosting>, Error> {
@@ -282,6 +386,164 @@ impl<'a> RawPositionalSegment<'a> {
         }
         Ok(out)
     }
+}
+
+#[derive(Debug)]
+struct DecodedTerm<'a> {
+    term: &'a str,
+    postings: Vec<RawPositionalPosting>,
+}
+
+impl DecodedTerm<'_> {
+    fn positions(&self, doc_id: DocId) -> &[TokenPos] {
+        self.postings
+            .binary_search_by_key(&doc_id, |posting| posting.doc_id)
+            .ok()
+            .map(|index| self.postings[index].positions.as_slice())
+            .unwrap_or(&[])
+    }
+}
+
+fn required_counts<'a>(terms: &[&'a str]) -> Vec<(&'a str, usize)> {
+    let mut required = Vec::new();
+    for &term in terms {
+        match required
+            .iter_mut()
+            .find(|(required_term, _)| *required_term == term)
+        {
+            Some((_, count)) => *count += 1,
+            None => required.push((term, 1)),
+        }
+    }
+    required
+}
+
+fn candidates_all_terms(lookups: &[DecodedTerm<'_>], required: &[(&str, usize)]) -> Vec<DocId> {
+    if lookups.is_empty() {
+        return Vec::new();
+    }
+
+    let mut anchor_i = 0usize;
+    let mut anchor_df = lookups[0].postings.len();
+    for (i, lookup) in lookups.iter().enumerate().skip(1) {
+        if lookup.postings.len() < anchor_df {
+            anchor_i = i;
+            anchor_df = lookup.postings.len();
+        }
+    }
+
+    let anchor = &lookups[anchor_i];
+    let anchor_required = required
+        .iter()
+        .find(|(term, _)| *term == anchor.term)
+        .map_or(1, |(_, count)| *count);
+    let mut out = Vec::new();
+
+    'doc: for posting in &anchor.postings {
+        if posting.positions.len() < anchor_required {
+            continue;
+        }
+        for &(term, count) in required {
+            if term == anchor.term {
+                continue;
+            }
+            if positions_for_term(lookups, term, posting.doc_id).len() < count {
+                continue 'doc;
+            }
+        }
+        out.push(posting.doc_id);
+    }
+    out.sort_unstable();
+    out
+}
+
+fn positions_for_term<'a>(
+    lookups: &'a [DecodedTerm<'_>],
+    term: &str,
+    doc_id: DocId,
+) -> &'a [TokenPos] {
+    lookups
+        .iter()
+        .find(|lookup| lookup.term == term)
+        .map(|lookup| lookup.positions(doc_id))
+        .unwrap_or(&[])
+}
+
+fn near_doc_unordered(
+    lookups: &[DecodedTerm<'_>],
+    doc_id: DocId,
+    required: &[(&str, usize)],
+    window: u32,
+) -> bool {
+    let mut occurrences: Vec<(TokenPos, usize)> = Vec::new();
+    for (term_i, &(term, _)) in required.iter().enumerate() {
+        for &position in positions_for_term(lookups, term, doc_id) {
+            occurrences.push((position, term_i));
+        }
+    }
+    occurrences.sort_unstable_by_key(|(position, _)| *position);
+    if occurrences.is_empty() {
+        return false;
+    }
+
+    let mut have = vec![0usize; required.len()];
+    let mut satisfied = 0usize;
+    let mut left = 0usize;
+    for right in 0..occurrences.len() {
+        let (right_position, right_term) = occurrences[right];
+        have[right_term] += 1;
+        if have[right_term] == required[right_term].1 {
+            satisfied += 1;
+        }
+
+        while satisfied == required.len() {
+            let (left_position, left_term) = occurrences[left];
+            if right_position.saturating_sub(left_position) <= window {
+                return true;
+            }
+            if have[left_term] == required[left_term].1 {
+                satisfied -= 1;
+            }
+            have[left_term] -= 1;
+            left += 1;
+        }
+    }
+    false
+}
+
+fn near_doc_ordered(
+    lookups: &[DecodedTerm<'_>],
+    doc_id: DocId,
+    terms: &[&str],
+    window: u32,
+) -> bool {
+    let first_positions = positions_for_term(lookups, terms[0], doc_id);
+    if first_positions.is_empty() {
+        return false;
+    }
+
+    'start: for &start in first_positions {
+        let mut previous = start;
+        for &term in terms.iter().skip(1) {
+            let positions = positions_for_term(lookups, term, doc_id);
+            if positions.is_empty() {
+                continue 'start;
+            }
+            let target = previous.saturating_add(1);
+            let index = positions.partition_point(|&position| position < target);
+            let Some(&next) = positions.get(index) else {
+                continue 'start;
+            };
+            previous = next;
+            if previous.saturating_sub(start) > window {
+                continue 'start;
+            }
+        }
+        if previous.saturating_sub(start) <= window {
+            return true;
+        }
+    }
+    false
 }
 
 /// Encode a positional index into a raw positional segment.
@@ -732,6 +994,57 @@ mod tests {
                     positions: vec![0, 2],
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn raw_positional_segment_matches_in_memory_phrase_and_near() {
+        let mut index = PosingsIndex::new();
+        index
+            .add_document(1, &strings(&["new", "york", "city", "search"]))
+            .unwrap();
+        index
+            .add_document(2, &strings(&["new", "jersey", "york", "search"]))
+            .unwrap();
+        index
+            .add_document(3, &strings(&["search", "new", "fast", "york"]))
+            .unwrap();
+        index
+            .add_document(4, &strings(&["a", "x", "a", "b"]))
+            .unwrap();
+
+        let bytes = write_positional_segment_from_index(&index).unwrap();
+        let segment = RawPositionalSegment::open(&bytes).unwrap();
+
+        assert_eq!(
+            segment.phrase_match_strs(&["new", "york"]).unwrap(),
+            index.phrase_match_strs(&["new", "york"])
+        );
+        assert_eq!(
+            segment.near_match("new", "york", 2).unwrap(),
+            index.near_match("new", "york", 2)
+        );
+        assert_eq!(
+            segment
+                .near_match_terms_strs(&["new", "york", "search"], 4, false)
+                .unwrap(),
+            index.near_match_terms_strs(&["new", "york", "search"], 4, false)
+        );
+        assert_eq!(
+            segment
+                .near_match_terms_strs(&["new", "york", "search"], 4, true)
+                .unwrap(),
+            index.near_match_terms_strs(&["new", "york", "search"], 4, true)
+        );
+        assert_eq!(
+            segment
+                .near_match_terms_strs(&["a", "a", "b"], 10, true)
+                .unwrap(),
+            index.near_match_terms_strs(&["a", "a", "b"], 10, true)
+        );
+        assert_eq!(
+            segment.near_match("missing", "york", 2).unwrap(),
+            Vec::<DocId>::new()
         );
     }
 
