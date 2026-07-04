@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.2.7] - 2026-07-03
+
 ### Added
 
 - Added `RawSegmentFile::resident_metadata_len` and
