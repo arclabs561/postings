@@ -5,7 +5,7 @@
 //! without reconstructing a full [`crate::PostingsIndex`].
 
 use crate::codec::varint;
-use crate::{CandidatePlan, DocId, PlannerConfig};
+use crate::{CandidatePlan, DocId, PlannerConfig, PostingsIndex};
 use std::collections::{btree_map::Entry, BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -34,6 +34,9 @@ const FILE_FULL_POSTINGS_READ_LIMIT: u64 = 1024 * 1024;
 
 /// A numeric term id in the first raw postings format.
 pub type RawTermId = u64;
+
+type RawDocumentLengths = Vec<(DocId, u32)>;
+type OwnedRawTermPostings = Vec<(RawTermId, Vec<(DocId, u32)>)>;
 
 /// Segment-level diagnostics for multi-file raw sparse top-k search.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -3666,6 +3669,53 @@ pub fn write_u64_u32_segment_from_term_postings_seekable_to<W: Write + Seek + ?S
     )
 }
 
+/// Encode a live `PostingsIndex<u64, u32>` shard into a seekable raw segment
+/// writer.
+///
+/// This is a sealing bridge for bounded in-memory shards. It only emits raw
+/// segment bytes. Callers still own file paths, atomic publication, fsync
+/// policy, manifests, deletes, retention, and compaction. The source index must
+/// satisfy the same value constraints as the raw format: zero weights are
+/// rejected by the underlying term-major writer.
+pub fn write_u64_u32_segment_from_index_seekable_to<W: Write + Seek + ?Sized>(
+    index: &PostingsIndex<RawTermId, u32>,
+    writer: &mut W,
+) -> Result<(), RawSegmentWriteError> {
+    let (document_lengths, term_postings) = collect_raw_index_parts(index);
+    let terms: Vec<_> = term_postings
+        .iter()
+        .map(|(term_id, postings)| RawTermPostingList::new(*term_id, postings))
+        .collect();
+    write_u64_u32_segment_from_term_postings_seekable_to(&document_lengths, &terms, writer)
+}
+
+fn collect_raw_index_parts(
+    index: &PostingsIndex<RawTermId, u32>,
+) -> (RawDocumentLengths, OwnedRawTermPostings) {
+    let mut document_lengths: Vec<_> = index
+        .doc_len
+        .iter()
+        .map(|(&doc_id, &doc_len)| (doc_id, doc_len))
+        .collect();
+    document_lengths.sort_unstable_by_key(|&(doc_id, _)| doc_id);
+
+    let mut term_postings: Vec<_> = index
+        .global_postings
+        .iter()
+        .filter_map(|(&term_id, postings)| {
+            let live_postings: Vec<_> = postings
+                .iter()
+                .copied()
+                .filter(|(doc_id, _)| index.doc_len.contains_key(doc_id))
+                .collect();
+            (!live_postings.is_empty()).then_some((term_id, live_postings))
+        })
+        .collect();
+    term_postings.sort_unstable_by_key(|&(term_id, _)| term_id);
+
+    (document_lengths, term_postings)
+}
+
 fn build_u64_u32_segment_sections(
     documents: &[RawDocument<'_>],
 ) -> Result<RawSegmentSections, Error> {
@@ -5430,6 +5480,54 @@ mod tests {
         assert_eq!(&prefixed[13..], expected);
         RawSegment::open(&written).unwrap();
         RawSegment::open(&prefixed[13..]).unwrap();
+    }
+
+    #[test]
+    fn raw_segment_index_seal_matches_live_memory_index() {
+        let mut idx: PostingsIndex<RawTermId, u32> = PostingsIndex::new();
+        idx.add_weighted_document(20, &[(10, 2), (20, 1)]).unwrap();
+        idx.add_weighted_document(4, &[(10, 100)]).unwrap();
+        idx.add_weighted_document(7, &[(10, 1), (30, 5)]).unwrap();
+        idx.add_weighted_document(3, &[(40, 2)]).unwrap();
+        assert!(idx.delete_document(4));
+
+        let mut out = std::io::Cursor::new(Vec::new());
+        write_u64_u32_segment_from_index_seekable_to(&idx, &mut out).unwrap();
+        let bytes = out.into_inner();
+        let segment = RawSegment::open(&bytes).unwrap();
+
+        assert_eq!(segment.document_len(4).unwrap(), None);
+        assert_eq!(segment.document_len(7).unwrap(), Some(6));
+        assert_eq!(collect_postings(&segment, 10), vec![(7, 1), (20, 2)]);
+
+        let query = [(10, 1.5), (30, 2.0), (40, 0.25)];
+        let memory_query: Vec<_> = query
+            .iter()
+            .map(|(term_id, weight)| (term_id, *weight))
+            .collect();
+        assert_eq!(
+            segment.top_k_weighted_u32(&query, 10).unwrap(),
+            idx.top_k_weighted(&memory_query, 10)
+        );
+    }
+
+    #[test]
+    fn raw_segment_index_seal_rejects_zero_weights() {
+        let mut idx: PostingsIndex<RawTermId, u32> = PostingsIndex::new();
+        idx.add_weighted_document(2, &[(7, 0)]).unwrap();
+
+        let mut out = std::io::Cursor::new(Vec::new());
+        let err = write_u64_u32_segment_from_index_seekable_to(&idx, &mut out).unwrap_err();
+
+        assert!(matches!(
+            err,
+            RawSegmentWriteError::Segment {
+                source: Error::ZeroWeight {
+                    doc_id: 2,
+                    term_id: 7
+                }
+            }
+        ));
     }
 
     #[test]
