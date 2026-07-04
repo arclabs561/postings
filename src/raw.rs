@@ -6369,6 +6369,33 @@ mod tests {
     }
 
     #[test]
+    fn raw_segment_files_negative_query_weights_disable_segment_pruning() {
+        let first_docs = [RawDocument::new(10, &[(7, 100)])];
+        let second_docs = [RawDocument::new(1, &[(7, 1), (8, 200)])];
+        let dir = tempfile::tempdir().unwrap();
+        let first_path = dir.path().join("first.raw");
+        let second_path = dir.path().join("second.raw");
+        std::fs::write(&first_path, write_u64_u32_segment(&first_docs).unwrap()).unwrap();
+        std::fs::write(&second_path, write_u64_u32_segment(&second_docs).unwrap()).unwrap();
+        let mut first_segment = RawSegmentFile::open(&first_path).unwrap();
+        let mut second_segment = RawSegmentFile::open(&second_path).unwrap();
+        let mut segments = [&mut first_segment, &mut second_segment];
+
+        let result =
+            top_k_weighted_u32_files_with_stats(&mut segments, &[(7, 1.0), (8, -1.0)], 1).unwrap();
+
+        assert_eq!(result.hits, vec![(10, 100.0)]);
+        assert_eq!(
+            result.stats,
+            RawTopKSearchStats {
+                segments_seen: 2,
+                segments_scored: 2,
+                segments_pruned: 0,
+            }
+        );
+    }
+
+    #[test]
     fn raw_segment_files_return_empty_for_absent_terms() {
         let first_docs = [RawDocument::new(10, &[(7, 5)])];
         let second_docs = [RawDocument::new(1, &[(8, 5)])];
