@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added sorted positional shard export helpers for document lengths and borrowed
+  term posting lists, preparing positional phrase/proximity data for
+  consumer-owned segment writers without cloning position vectors.
+
 ## [0.2.11] - 2026-07-04
 
 ### Changed

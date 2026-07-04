@@ -31,6 +31,24 @@ pub type PositionalIndex = PosingsIndex;
 /// Preferred name for the positional postings error type.
 pub type PositionalError = Error;
 
+/// One document's positions for a positional term posting list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PositionalPosting<'a> {
+    /// Document id containing the term.
+    pub doc_id: DocId,
+    /// Sorted token positions where the term occurs in the document.
+    pub positions: &'a [TokenPos],
+}
+
+/// A sorted positional posting list for one term.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PositionalTermPostings<'a> {
+    /// Term text for this posting list.
+    pub term: &'a str,
+    /// Posting entries sorted by document id.
+    pub postings: Vec<PositionalPosting<'a>>,
+}
+
 /// Feature-gated helpers for representing candidate doc-id sets with Elias–Fano (via `sbits`).
 ///
 /// This is intentionally a helper surface rather than a hard dependency of the main index.
@@ -193,6 +211,22 @@ impl PosingsIndex {
         self.doc_len.get(&doc_id).copied().unwrap_or(0)
     }
 
+    /// Return `(doc_id, token_count)` pairs sorted by document id.
+    ///
+    /// This is a sealing helper for bounded in-memory positional shards. Callers
+    /// that build byte-native or externally sorted segment files can use this as
+    /// the stable document metadata stream while keeping publication, deletes,
+    /// compaction, and crash-safety policy outside the in-memory index.
+    pub fn sorted_document_lengths(&self) -> Vec<(DocId, u32)> {
+        let mut lengths: Vec<_> = self
+            .doc_len
+            .iter()
+            .map(|(&doc_id, &len)| (doc_id, len))
+            .collect();
+        lengths.sort_unstable_by_key(|&(doc_id, _)| doc_id);
+        lengths
+    }
+
     /// Positions for a term in a given doc (empty if absent).
     pub fn positions(&self, term: &str, doc_id: DocId) -> &[TokenPos] {
         positions_in_docs(self.postings.get(term), doc_id)
@@ -209,6 +243,31 @@ impl PosingsIndex {
     /// Document frequency for a term (number of docs containing it).
     pub fn df(&self, term: &str) -> u32 {
         self.postings.get(term).map(|m| m.len() as u32).unwrap_or(0)
+    }
+
+    /// Return all positional posting lists sorted by term, then by document id.
+    ///
+    /// This is intended for sealing bounded in-memory shards into an immutable
+    /// segment format. It borrows position slices from the index, so callers can
+    /// encode without cloning the per-document position vectors.
+    pub fn sorted_term_posting_lists(&self) -> Vec<PositionalTermPostings<'_>> {
+        let mut terms: Vec<_> = self.postings.keys().map(String::as_str).collect();
+        terms.sort_unstable();
+
+        terms
+            .into_iter()
+            .map(|term| {
+                let mut postings: Vec<_> = self.postings[term]
+                    .iter()
+                    .map(|(&doc_id, positions)| PositionalPosting {
+                        doc_id,
+                        positions: positions.as_slice(),
+                    })
+                    .collect();
+                postings.sort_unstable_by_key(|posting| posting.doc_id);
+                PositionalTermPostings { term, postings }
+            })
+            .collect()
     }
 
     /// Candidate docs containing all required terms (intersection).
@@ -986,6 +1045,65 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ix.positions("a", 1), &[0, 2, 4]);
+    }
+
+    #[test]
+    fn sorted_document_lengths_are_doc_ordered() {
+        let mut ix = PosingsIndex::new();
+        ix.add_document(7, &["b".into(), "c".into()]).unwrap();
+        ix.add_document(2, &["a".into()]).unwrap();
+        ix.add_document(4, &["a".into(), "b".into(), "a".into()])
+            .unwrap();
+
+        assert_eq!(ix.sorted_document_lengths(), vec![(2, 1), (4, 3), (7, 2)]);
+    }
+
+    #[test]
+    fn sorted_term_posting_lists_are_term_then_doc_ordered() {
+        let mut ix = PosingsIndex::new();
+        ix.add_document(7, &["b".into(), "c".into()]).unwrap();
+        ix.add_document(2, &["a".into()]).unwrap();
+        ix.add_document(4, &["a".into(), "b".into(), "a".into()])
+            .unwrap();
+
+        let lists = ix.sorted_term_posting_lists();
+        assert_eq!(
+            lists.iter().map(|list| list.term).collect::<Vec<_>>(),
+            vec!["a", "b", "c"]
+        );
+        assert_eq!(
+            lists[0].postings,
+            vec![
+                PositionalPosting {
+                    doc_id: 2,
+                    positions: &[0],
+                },
+                PositionalPosting {
+                    doc_id: 4,
+                    positions: &[0, 2],
+                },
+            ]
+        );
+        assert_eq!(
+            lists[1].postings,
+            vec![
+                PositionalPosting {
+                    doc_id: 4,
+                    positions: &[1],
+                },
+                PositionalPosting {
+                    doc_id: 7,
+                    positions: &[0],
+                },
+            ]
+        );
+        assert_eq!(
+            lists[2].postings,
+            vec![PositionalPosting {
+                doc_id: 7,
+                positions: &[1],
+            }]
+        );
     }
 
     #[test]
