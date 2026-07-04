@@ -4,7 +4,11 @@
 //! segment. It owns only the segment byte format; callers still own term
 //! analysis, commit publication, deletes, compaction, and crash-safety policy.
 
+use std::fs::File;
+#[cfg(not(unix))]
+use std::io::{Read, Seek, SeekFrom};
 use std::ops::Range;
+use std::path::Path;
 
 use crate::codec::varint;
 use crate::DocId;
@@ -12,10 +16,10 @@ use crate::DocId;
 use super::{PosingsIndex, PositionalTermPostings, TokenPos};
 
 const MAGIC: &[u8; 8] = b"PSTP0001";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const FLAGS: u32 = 0;
 const HEADER_LEN: usize = 72;
-const TERM_ENTRY_LEN: usize = 28;
+const TERM_ENTRY_LEN: usize = 32;
 
 /// Errors returned by raw positional segment encoding and decoding.
 #[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
@@ -57,6 +61,17 @@ pub enum Error {
     InvalidUtf8,
 }
 
+/// Errors returned by file-backed raw positional segment readers.
+#[derive(thiserror::Error, Debug)]
+pub enum RawPositionalSegmentFileError {
+    /// A file read failed.
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    /// The encoded segment was invalid.
+    #[error(transparent)]
+    Segment(#[from] Error),
+}
+
 /// One decoded raw positional posting.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RawPositionalPosting {
@@ -85,6 +100,16 @@ struct TermEntry<'a> {
     term: &'a str,
     postings: Range<usize>,
     doc_freq: u32,
+    postings_crc: u32,
+}
+
+#[derive(Clone, Debug)]
+struct FileTermEntry {
+    term: String,
+    postings_offset: u64,
+    postings_len: usize,
+    doc_freq: u32,
+    postings_crc: u32,
 }
 
 /// A byte-backed immutable positional segment.
@@ -93,6 +118,22 @@ pub struct RawPositionalSegment<'a> {
     bytes: &'a [u8],
     terms: Vec<TermEntry<'a>>,
     document_lengths: Vec<(DocId, u32)>,
+}
+
+/// A file-backed immutable positional segment.
+///
+/// This reader keeps decoded term and document metadata resident, then
+/// range-reads one term's posting payload when a query needs it. It does not
+/// own commit publication, deletes, retention, or compaction.
+#[derive(Debug)]
+pub struct RawPositionalSegmentFile {
+    file: File,
+    terms: Vec<FileTermEntry>,
+    document_lengths: Vec<(DocId, u32)>,
+    resident_metadata_len: usize,
+    postings_offset: u64,
+    posting_payload_len: u64,
+    postings_crc: u32,
 }
 
 impl<'a> RawPositionalSegment<'a> {
@@ -320,72 +361,373 @@ impl<'a> RawPositionalSegment<'a> {
 
     fn decode_postings(&self, entry: &TermEntry<'a>) -> Result<Vec<RawPositionalPosting>, Error> {
         let bytes = &self.bytes[entry.postings.clone()];
-        let mut consumed = 0usize;
-        let mut previous_doc = 0u32;
-        let mut out = Vec::with_capacity(entry.doc_freq as usize);
+        check_crc("term postings", bytes, entry.postings_crc)?;
+        decode_postings_bytes(bytes, entry.doc_freq, &self.document_lengths)
+    }
+}
 
-        for posting_index in 0..entry.doc_freq as usize {
-            let (doc_gap, doc_gap_len) = decode_varint(bytes, consumed, "postings", posting_index)?;
-            consumed += doc_gap_len;
-            let doc_id = if posting_index == 0 {
-                doc_gap
-            } else {
-                previous_doc
-                    .checked_add(doc_gap)
-                    .ok_or(Error::DocIdOverflow(posting_index))?
-            };
-            if posting_index > 0 && doc_id <= previous_doc {
-                return Err(Error::InvalidLayout("non-increasing posting doc id"));
-            }
-            previous_doc = doc_id;
+impl RawPositionalSegmentFile {
+    /// Open a raw positional segment file from a path.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, RawPositionalSegmentFileError> {
+        Self::from_file(File::open(path)?)
+    }
 
-            let Some(doc_len) = self.document_len(doc_id) else {
-                return Err(Error::InvalidLayout("posting references unknown document"));
-            };
-
-            let (position_count, position_count_len) =
-                decode_varint(bytes, consumed, "postings", posting_index)?;
-            consumed += position_count_len;
-            if position_count == 0 {
-                return Err(Error::InvalidLayout("empty position list"));
-            }
-
-            let mut previous_position = 0u32;
-            let mut positions = Vec::with_capacity(position_count as usize);
-            for position_index in 0..position_count as usize {
-                let field_index = posting_index
-                    .checked_add(position_index)
-                    .ok_or(Error::InvalidLayout("position index overflow"))?;
-                let (position_gap, position_gap_len) =
-                    decode_varint(bytes, consumed, "postings", field_index)?;
-                consumed += position_gap_len;
-                let position = if position_index == 0 {
-                    position_gap
-                } else {
-                    previous_position
-                        .checked_add(position_gap)
-                        .ok_or(Error::PositionOverflow(field_index))?
-                };
-                if position_index > 0 && position <= previous_position {
-                    return Err(Error::InvalidLayout("non-increasing token position"));
-                }
-                if position >= doc_len {
-                    return Err(Error::InvalidLayout(
-                        "token position exceeds document length",
-                    ));
-                }
-                previous_position = position;
-                positions.push(position);
-            }
-
-            out.push(RawPositionalPosting { doc_id, positions });
+    /// Open a raw positional segment from an already-open file handle.
+    pub fn from_file(mut file: File) -> Result<Self, RawPositionalSegmentFileError> {
+        let file_len_u64 = file.metadata()?.len();
+        let file_len =
+            usize::try_from(file_len_u64).map_err(|_| Error::InvalidLayout("file too large"))?;
+        if file_len < HEADER_LEN {
+            return Err(Error::Truncated("header").into());
         }
 
-        if consumed != bytes.len() {
-            return Err(Error::InvalidLayout("trailing posting bytes"));
+        let header_bytes = read_exact_at_file(&mut file, 0, HEADER_LEN)?;
+        let header = read_header(&header_bytes)?;
+        let term_dir = checked_range(HEADER_LEN, header.term_dir_len, file_len, "term directory")?;
+        let term_bytes =
+            checked_range(term_dir.end, header.term_bytes_len, file_len, "term bytes")?;
+        let doc_meta = checked_range(
+            term_bytes.end,
+            header.doc_meta_len,
+            file_len,
+            "document metadata",
+        )?;
+        let postings = checked_range(doc_meta.end, header.postings_len, file_len, "postings")?;
+        if postings.end != file_len {
+            return Err(Error::InvalidLayout("trailing bytes").into());
+        }
+
+        let term_dir_bytes = read_exact_at_file(
+            &mut file,
+            checked_u64(term_dir.start, "term directory offset")?,
+            term_dir.len(),
+        )?;
+        let term_bytes_bytes = read_exact_at_file(
+            &mut file,
+            checked_u64(term_bytes.start, "term bytes offset")?,
+            term_bytes.len(),
+        )?;
+        let doc_meta_bytes = read_exact_at_file(
+            &mut file,
+            checked_u64(doc_meta.start, "document metadata offset")?,
+            doc_meta.len(),
+        )?;
+
+        check_crc("term directory", &term_dir_bytes, header.term_dir_crc)?;
+        check_crc("term bytes", &term_bytes_bytes, header.term_bytes_crc)?;
+        check_crc("document metadata", &doc_meta_bytes, header.doc_meta_crc)?;
+
+        let document_lengths = decode_document_lengths(&doc_meta_bytes, header.doc_count as usize)?;
+        let postings_offset = checked_u64(postings.start, "postings offset")?;
+        let terms = decode_file_term_directory(
+            &term_dir_bytes,
+            &term_bytes_bytes,
+            postings_offset,
+            header.postings_len,
+            header.term_count as usize,
+        )?;
+        let resident_metadata_len = header
+            .term_dir_len
+            .checked_add(header.term_bytes_len)
+            .and_then(|len| len.checked_add(header.doc_meta_len))
+            .ok_or(Error::InvalidLayout("resident metadata length overflow"))?;
+
+        Ok(Self {
+            file,
+            terms,
+            document_lengths,
+            resident_metadata_len,
+            postings_offset,
+            posting_payload_len: checked_u64(header.postings_len, "postings length")?,
+            postings_crc: header.postings_crc,
+        })
+    }
+
+    /// Return `(doc_id, token_count)` pairs sorted by document id.
+    pub fn document_lengths(&self) -> &[(DocId, u32)] {
+        &self.document_lengths
+    }
+
+    /// Return one document's token count, if present.
+    pub fn document_len(&self, doc_id: DocId) -> Option<u32> {
+        document_len(&self.document_lengths, doc_id)
+    }
+
+    /// Encoded term and document metadata bytes kept resident by this reader.
+    ///
+    /// This is the byte-format size of decoded resident metadata. It excludes
+    /// `Vec`/`String` allocation overhead and the file handle.
+    pub fn resident_metadata_len(&self) -> usize {
+        self.resident_metadata_len
+    }
+
+    /// Raw posting payload bytes that remain file-backed.
+    pub fn posting_payload_len(&self) -> u64 {
+        self.posting_payload_len
+    }
+
+    /// Verify the global postings checksum by streaming the file-backed payload.
+    pub fn verify_postings_checksum(&mut self) -> Result<(), RawPositionalSegmentFileError> {
+        let mut hasher = crc32fast::Hasher::new();
+        let mut remaining = self.posting_payload_len;
+        let mut offset = self.postings_offset;
+        let mut buffer = vec![0; 64 * 1024];
+
+        while remaining > 0 {
+            let len = usize::try_from(remaining.min(buffer.len() as u64))
+                .map_err(|_| Error::InvalidLayout("postings length too large"))?;
+            read_exact_at_file_into(&mut self.file, offset, &mut buffer[..len])?;
+            hasher.update(&buffer[..len]);
+            offset = offset
+                .checked_add(len as u64)
+                .ok_or(Error::InvalidLayout("postings offset overflow"))?;
+            remaining -= len as u64;
+        }
+
+        if hasher.finalize() != self.postings_crc {
+            return Err(Error::ChecksumMismatch("postings").into());
+        }
+        Ok(())
+    }
+
+    /// Return the number of documents containing a term.
+    pub fn df(&self, term: &str) -> u32 {
+        self.term_entry(term).map_or(0, |entry| entry.doc_freq)
+    }
+
+    /// Return sorted document ids containing a term.
+    pub fn docs_with_term(
+        &mut self,
+        term: &str,
+    ) -> Result<Vec<DocId>, RawPositionalSegmentFileError> {
+        Ok(self
+            .term_postings(term)?
+            .into_iter()
+            .map(|posting| posting.doc_id)
+            .collect())
+    }
+
+    /// Return decoded postings for one term, range-reading only that term's payload.
+    pub fn term_postings(
+        &mut self,
+        term: &str,
+    ) -> Result<Vec<RawPositionalPosting>, RawPositionalSegmentFileError> {
+        let Some(entry) = self.term_entry(term).cloned() else {
+            return Ok(Vec::new());
+        };
+        let bytes = read_exact_at_file(&mut self.file, entry.postings_offset, entry.postings_len)?;
+        check_crc("term postings", &bytes, entry.postings_crc)?;
+        Ok(decode_postings_bytes(
+            &bytes,
+            entry.doc_freq,
+            &self.document_lengths,
+        )?)
+    }
+
+    /// Return positions for one term in one document.
+    pub fn positions(
+        &mut self,
+        term: &str,
+        doc_id: DocId,
+    ) -> Result<Vec<TokenPos>, RawPositionalSegmentFileError> {
+        for posting in self.term_postings(term)? {
+            if posting.doc_id == doc_id {
+                return Ok(posting.positions);
+            }
+            if posting.doc_id > doc_id {
+                break;
+            }
+        }
+        Ok(Vec::new())
+    }
+
+    /// Exact phrase match over borrowed term strings.
+    pub fn phrase_match_strs(
+        &mut self,
+        phrase: &[&str],
+    ) -> Result<Vec<DocId>, RawPositionalSegmentFileError> {
+        if phrase.is_empty() {
+            return Ok(Vec::new());
+        }
+        if let [term] = phrase {
+            return self.docs_with_term(term);
+        }
+
+        let required = required_counts(phrase);
+        let lookups = self.load_required_terms(&required)?;
+        let candidates = candidates_all_terms(&lookups, &required);
+        let mut out = Vec::new();
+
+        'doc: for doc_id in candidates {
+            let mut anchor_i = 0usize;
+            let mut anchor_positions: &[TokenPos] = &[];
+            for (i, &term) in phrase.iter().enumerate() {
+                let positions = positions_for_term(&lookups, term, doc_id);
+                if positions.is_empty() {
+                    continue 'doc;
+                }
+                if anchor_positions.is_empty() || positions.len() < anchor_positions.len() {
+                    anchor_i = i;
+                    anchor_positions = positions;
+                }
+            }
+
+            'start: for &anchor_pos in anchor_positions {
+                let Some(start) = anchor_pos.checked_sub(anchor_i as u32) else {
+                    continue;
+                };
+                for (i, &term) in phrase.iter().enumerate() {
+                    if i == anchor_i {
+                        continue;
+                    }
+                    let Some(target) = start.checked_add(i as u32) else {
+                        continue 'start;
+                    };
+                    if positions_for_term(&lookups, term, doc_id)
+                        .binary_search(&target)
+                        .is_err()
+                    {
+                        continue 'start;
+                    }
+                }
+                out.push(doc_id);
+                continue 'doc;
+            }
+        }
+
+        Ok(out)
+    }
+
+    /// Proximity match: returns docs where `a` and `b` occur within `window` tokens.
+    pub fn near_match(
+        &mut self,
+        a: &str,
+        b: &str,
+        window: u32,
+    ) -> Result<Vec<DocId>, RawPositionalSegmentFileError> {
+        self.near_match_terms_strs(&[a, b], window, false)
+    }
+
+    /// Multi-term proximity over borrowed term strings.
+    pub fn near_match_terms_strs(
+        &mut self,
+        terms: &[&str],
+        window: u32,
+        ordered: bool,
+    ) -> Result<Vec<DocId>, RawPositionalSegmentFileError> {
+        if terms.len() < 2 || window == 0 {
+            return Ok(Vec::new());
+        }
+
+        let required = required_counts(terms);
+        let lookups = self.load_required_terms(&required)?;
+        let candidates = candidates_all_terms(&lookups, &required);
+        let mut out = Vec::new();
+        for doc_id in candidates {
+            let hit = if ordered {
+                near_doc_ordered(&lookups, doc_id, terms, window)
+            } else {
+                near_doc_unordered(&lookups, doc_id, &required, window)
+            };
+            if hit {
+                out.push(doc_id);
+            }
         }
         Ok(out)
     }
+
+    fn term_entry(&self, term: &str) -> Option<&FileTermEntry> {
+        self.terms
+            .binary_search_by(|entry| entry.term.as_str().cmp(term))
+            .ok()
+            .map(|index| &self.terms[index])
+    }
+
+    fn load_required_terms<'q>(
+        &mut self,
+        required: &[(&'q str, usize)],
+    ) -> Result<Vec<DecodedTerm<'q>>, RawPositionalSegmentFileError> {
+        let mut out = Vec::with_capacity(required.len());
+        for &(term, _) in required {
+            out.push(DecodedTerm {
+                term,
+                postings: self.term_postings(term)?,
+            });
+        }
+        Ok(out)
+    }
+}
+
+fn decode_postings_bytes(
+    bytes: &[u8],
+    doc_freq: u32,
+    document_lengths: &[(DocId, u32)],
+) -> Result<Vec<RawPositionalPosting>, Error> {
+    let mut consumed = 0usize;
+    let mut previous_doc = 0u32;
+    let mut out = Vec::with_capacity(doc_freq as usize);
+
+    for posting_index in 0..doc_freq as usize {
+        let (doc_gap, doc_gap_len) = decode_varint(bytes, consumed, "postings", posting_index)?;
+        consumed += doc_gap_len;
+        let doc_id = if posting_index == 0 {
+            doc_gap
+        } else {
+            previous_doc
+                .checked_add(doc_gap)
+                .ok_or(Error::DocIdOverflow(posting_index))?
+        };
+        if posting_index > 0 && doc_id <= previous_doc {
+            return Err(Error::InvalidLayout("non-increasing posting doc id"));
+        }
+        previous_doc = doc_id;
+
+        let Some(doc_len) = document_len(document_lengths, doc_id) else {
+            return Err(Error::InvalidLayout("posting references unknown document"));
+        };
+
+        let (position_count, position_count_len) =
+            decode_varint(bytes, consumed, "postings", posting_index)?;
+        consumed += position_count_len;
+        if position_count == 0 {
+            return Err(Error::InvalidLayout("empty position list"));
+        }
+
+        let mut previous_position = 0u32;
+        let mut positions = Vec::with_capacity(position_count as usize);
+        for position_index in 0..position_count as usize {
+            let field_index = posting_index
+                .checked_add(position_index)
+                .ok_or(Error::InvalidLayout("position index overflow"))?;
+            let (position_gap, position_gap_len) =
+                decode_varint(bytes, consumed, "postings", field_index)?;
+            consumed += position_gap_len;
+            let position = if position_index == 0 {
+                position_gap
+            } else {
+                previous_position
+                    .checked_add(position_gap)
+                    .ok_or(Error::PositionOverflow(field_index))?
+            };
+            if position_index > 0 && position <= previous_position {
+                return Err(Error::InvalidLayout("non-increasing token position"));
+            }
+            if position >= doc_len {
+                return Err(Error::InvalidLayout(
+                    "token position exceeds document length",
+                ));
+            }
+            previous_position = position;
+            positions.push(position);
+        }
+
+        out.push(RawPositionalPosting { doc_id, positions });
+    }
+
+    if consumed != bytes.len() {
+        return Err(Error::InvalidLayout("trailing posting bytes"));
+    }
+    Ok(out)
 }
 
 #[derive(Debug)]
@@ -592,23 +934,26 @@ pub fn write_positional_segment(
         let postings_offset = checked_u64(postings_start, "postings offset")?;
         append_postings(document_lengths, &term.postings, &mut postings_bytes)?;
         let postings_len = checked_u64(postings_bytes.len() - postings_start, "postings length")?;
+        let postings_crc = crc32fast::hash(&postings_bytes[postings_start..]);
         entries.push((
             term_offset,
             term_len,
             postings_offset,
             postings_len,
             term.postings.len(),
+            postings_crc,
         ));
         previous_term = Some(term.term);
     }
 
     let mut term_dir = Vec::with_capacity(entries.len() * TERM_ENTRY_LEN);
-    for (term_offset, term_len, postings_offset, postings_len, doc_freq) in entries {
+    for (term_offset, term_len, postings_offset, postings_len, doc_freq, postings_crc) in entries {
         put_u32(&mut term_dir, term_offset);
         put_u32(&mut term_dir, term_len);
         put_u64(&mut term_dir, postings_offset);
         put_u64(&mut term_dir, postings_len);
         put_u32(&mut term_dir, checked_u32(doc_freq, "document frequency")?);
+        put_u32(&mut term_dir, postings_crc);
     }
 
     let mut doc_meta = Vec::new();
@@ -785,6 +1130,7 @@ fn decode_term_directory<'a>(
         let postings_offset = read_usize_at(dir, offset + 8, "term directory")?;
         let postings_len = read_usize_at(dir, offset + 16, "term directory")?;
         let doc_freq = read_u32_at(dir, offset + 24, "term directory")?;
+        let postings_crc = read_u32_at(dir, offset + 28, "term directory")?;
 
         let term_start = term_bytes
             .start
@@ -815,6 +1161,67 @@ fn decode_term_directory<'a>(
             term,
             postings: postings_start..postings_end,
             doc_freq,
+            postings_crc,
+        });
+        previous_term = Some(term);
+    }
+    Ok(entries)
+}
+
+fn decode_file_term_directory(
+    dir: &[u8],
+    term_bytes: &[u8],
+    postings_offset: u64,
+    postings_len: usize,
+    count: usize,
+) -> Result<Vec<FileTermEntry>, Error> {
+    let expected_len = count
+        .checked_mul(TERM_ENTRY_LEN)
+        .ok_or(Error::InvalidLayout("term directory length overflow"))?;
+    if dir.len() != expected_len {
+        return Err(Error::InvalidLayout("term directory length mismatch"));
+    }
+
+    let mut entries = Vec::with_capacity(count);
+    let mut previous_term = None;
+    for index in 0..count {
+        let offset = index * TERM_ENTRY_LEN;
+        let term_offset = read_u32_at(dir, offset, "term directory")? as usize;
+        let term_len = read_u32_at(dir, offset + 4, "term directory")? as usize;
+        let relative_postings_offset = read_usize_at(dir, offset + 8, "term directory")?;
+        let entry_postings_len = read_usize_at(dir, offset + 16, "term directory")?;
+        let doc_freq = read_u32_at(dir, offset + 24, "term directory")?;
+        let postings_crc = read_u32_at(dir, offset + 28, "term directory")?;
+
+        let term_range = checked_range(term_offset, term_len, term_bytes.len(), "term bytes")?;
+        let term = std::str::from_utf8(&term_bytes[term_range]).map_err(|_| Error::InvalidUtf8)?;
+        if term.is_empty() {
+            return Err(Error::InvalidLayout("empty term"));
+        }
+        if previous_term.is_some_and(|previous| term <= previous) {
+            return Err(Error::InvalidLayout("non-increasing term"));
+        }
+        let relative_postings = checked_range(
+            relative_postings_offset,
+            entry_postings_len,
+            postings_len,
+            "postings",
+        )?;
+        if doc_freq == 0 {
+            return Err(Error::InvalidLayout("empty term posting list"));
+        }
+        let absolute_postings_offset = postings_offset
+            .checked_add(checked_u64(
+                relative_postings.start,
+                "posting range offset",
+            )?)
+            .ok_or(Error::InvalidLayout("posting range overflow"))?;
+        entries.push(FileTermEntry {
+            term: term.to_owned(),
+            postings_offset: absolute_postings_offset,
+            postings_len: relative_postings.len(),
+            doc_freq,
+            postings_crc,
         });
         previous_term = Some(term);
     }
@@ -951,9 +1358,28 @@ fn read_usize_at(bytes: &[u8], offset: usize, section: &'static str) -> Result<u
         .map_err(|_| Error::InvalidLayout("section length is too large"))
 }
 
+fn read_exact_at_file(file: &mut File, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
+    let mut bytes = vec![0; len];
+    read_exact_at_file_into(file, offset, &mut bytes)?;
+    Ok(bytes)
+}
+
+#[cfg(unix)]
+fn read_exact_at_file_into(file: &mut File, offset: u64, bytes: &mut [u8]) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.read_exact_at(bytes, offset)
+}
+
+#[cfg(not(unix))]
+fn read_exact_at_file_into(file: &mut File, offset: u64, bytes: &mut [u8]) -> std::io::Result<()> {
+    file.seek(SeekFrom::Start(offset))?;
+    file.read_exact(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     fn strings(terms: &[&str]) -> Vec<String> {
         terms.iter().map(|term| (*term).to_string()).collect()
@@ -965,6 +1391,13 @@ mod tests {
         index.add_document(2, &strings(&["a"])).unwrap();
         index.add_document(4, &strings(&["a", "b", "a"])).unwrap();
         index
+    }
+
+    fn write_temp_segment(bytes: &[u8]) -> tempfile::NamedTempFile {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(bytes).unwrap();
+        file.flush().unwrap();
+        file
     }
 
     #[test]
@@ -995,6 +1428,28 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn raw_positional_segment_file_reads_term_payloads() {
+        let index = sample_index();
+        let bytes = write_positional_segment_from_index(&index).unwrap();
+        let file = write_temp_segment(&bytes);
+        let mut segment = RawPositionalSegmentFile::open(file.path()).unwrap();
+
+        assert_eq!(segment.document_lengths(), &[(2, 1), (4, 3), (7, 2)]);
+        assert_eq!(segment.document_len(4), Some(3));
+        assert_eq!(segment.document_len(99), None);
+        assert_eq!(segment.df("a"), 2);
+        assert_eq!(segment.df("missing"), 0);
+        assert_eq!(segment.docs_with_term("b").unwrap(), vec![4, 7]);
+        assert_eq!(segment.positions("a", 4).unwrap(), vec![0, 2]);
+        assert!(segment.positions("a", 7).unwrap().is_empty());
+        assert_eq!(
+            HEADER_LEN + segment.resident_metadata_len() + segment.posting_payload_len() as usize,
+            bytes.len()
+        );
+        segment.verify_postings_checksum().unwrap();
     }
 
     #[test]
@@ -1049,6 +1504,58 @@ mod tests {
     }
 
     #[test]
+    fn raw_positional_segment_file_matches_in_memory_phrase_and_near() {
+        let mut index = PosingsIndex::new();
+        index
+            .add_document(1, &strings(&["new", "york", "city", "search"]))
+            .unwrap();
+        index
+            .add_document(2, &strings(&["new", "jersey", "york", "search"]))
+            .unwrap();
+        index
+            .add_document(3, &strings(&["search", "new", "fast", "york"]))
+            .unwrap();
+        index
+            .add_document(4, &strings(&["a", "x", "a", "b"]))
+            .unwrap();
+
+        let bytes = write_positional_segment_from_index(&index).unwrap();
+        let file = write_temp_segment(&bytes);
+        let mut segment = RawPositionalSegmentFile::open(file.path()).unwrap();
+
+        assert_eq!(
+            segment.phrase_match_strs(&["new", "york"]).unwrap(),
+            index.phrase_match_strs(&["new", "york"])
+        );
+        assert_eq!(
+            segment.near_match("new", "york", 2).unwrap(),
+            index.near_match("new", "york", 2)
+        );
+        assert_eq!(
+            segment
+                .near_match_terms_strs(&["new", "york", "search"], 4, false)
+                .unwrap(),
+            index.near_match_terms_strs(&["new", "york", "search"], 4, false)
+        );
+        assert_eq!(
+            segment
+                .near_match_terms_strs(&["new", "york", "search"], 4, true)
+                .unwrap(),
+            index.near_match_terms_strs(&["new", "york", "search"], 4, true)
+        );
+        assert_eq!(
+            segment
+                .near_match_terms_strs(&["a", "a", "b"], 10, true)
+                .unwrap(),
+            index.near_match_terms_strs(&["a", "a", "b"], 10, true)
+        );
+        assert_eq!(
+            segment.near_match("missing", "york", 2).unwrap(),
+            Vec::<DocId>::new()
+        );
+    }
+
+    #[test]
     fn raw_positional_segment_rejects_corrupt_postings_checksum() {
         let index = sample_index();
         let mut bytes = write_positional_segment_from_index(&index).unwrap();
@@ -1058,6 +1565,30 @@ mod tests {
         assert!(matches!(
             RawPositionalSegment::open(&bytes),
             Err(Error::ChecksumMismatch("postings"))
+        ));
+    }
+
+    #[test]
+    fn raw_positional_segment_file_rejects_corrupt_term_payload() {
+        let index = sample_index();
+        let mut bytes = write_positional_segment_from_index(&index).unwrap();
+        let term_offset = RawPositionalSegment::open(&bytes)
+            .unwrap()
+            .term_entry("a")
+            .unwrap()
+            .postings
+            .start;
+        bytes[term_offset] ^= 0xff;
+        let file = write_temp_segment(&bytes);
+        let mut segment = RawPositionalSegmentFile::open(file.path()).unwrap();
+
+        assert!(matches!(
+            segment.term_postings("a").unwrap_err(),
+            RawPositionalSegmentFileError::Segment(Error::ChecksumMismatch("term postings"))
+        ));
+        assert!(matches!(
+            segment.verify_postings_checksum().unwrap_err(),
+            RawPositionalSegmentFileError::Segment(Error::ChecksumMismatch("postings"))
         ));
     }
 

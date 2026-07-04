@@ -159,10 +159,13 @@ historical name from the older `posings` crate.
 borrowed, sorted streams for sealing a bounded in-memory positional shard into a
 consumer-owned segment format without cloning position vectors.
 With `raw-segment` also enabled, `postings::positional::raw` can write and open
-checked byte-backed positional segments. The first reader exposes document
-lengths, term document frequency, sorted docs, postings, and per-document
-positions, plus exact phrase and NEAR matching over those decoded term lists;
-deletes and lifecycle stay above it.
+checked byte-backed or file-backed positional segments.
+`RawPositionalSegmentFile` keeps term/document metadata resident, range-reads
+term payloads, validates each term payload with its directory checksum, and
+can stream-check the whole postings payload on demand. Both readers expose
+document lengths, term document frequency, sorted docs, postings,
+per-document positions, and exact phrase/NEAR matching; deletes and lifecycle
+stay above them.
 
 `cnk-compression` is a helper for sorted candidate doc-id sets produced by
 positional workflows. It is not a storage backend, postings codec, or lifecycle
