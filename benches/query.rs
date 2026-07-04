@@ -4,6 +4,8 @@
 /// (Zipf-distributed term frequencies so common terms appear in many docs,
 /// rare terms in only a few -- realistic IR workload).
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+#[cfg(all(feature = "positional", feature = "raw-segment"))]
+use postings::positional::raw::{write_positional_segment_from_index, RawPositionalSegment};
 #[cfg(feature = "positional")]
 use postings::positional::PosingsIndex;
 #[cfg(feature = "raw-segment")]
@@ -1038,6 +1040,69 @@ fn bench_positional_queries(c: &mut Criterion) {
 #[cfg(not(feature = "positional"))]
 fn bench_positional_queries(_c: &mut Criterion) {}
 
+#[cfg(all(feature = "positional", feature = "raw-segment"))]
+fn bench_raw_positional_queries(c: &mut Criterion) {
+    let idx = build_positional_index();
+    let bytes = write_positional_segment_from_index(&idx).unwrap();
+    let segment = RawPositionalSegment::open(&bytes).unwrap();
+    let phrase = ["anchor_alpha", "anchor_beta", "anchor_gamma"];
+    let mut group = c.benchmark_group("raw_positional_queries");
+
+    group.bench_function("phrase_3_terms", |b| {
+        b.iter(|| {
+            black_box(segment.phrase_match_strs(black_box(&phrase)).unwrap());
+        });
+    });
+    group.bench_function("near_pair_window_4", |b| {
+        b.iter(|| {
+            black_box(
+                segment
+                    .near_match(
+                        black_box("anchor_alpha"),
+                        black_box("anchor_beta"),
+                        black_box(4),
+                    )
+                    .unwrap(),
+            );
+        });
+    });
+    group.bench_function("near_pair_skewed_window_4", |b| {
+        b.iter(|| {
+            black_box(
+                segment
+                    .near_match(
+                        black_box("near_common"),
+                        black_box("near_rare"),
+                        black_box(4),
+                    )
+                    .unwrap(),
+            );
+        });
+    });
+    group.bench_function("near_unordered_3_terms_window_16", |b| {
+        b.iter(|| {
+            black_box(
+                segment
+                    .near_match_terms_strs(black_box(&phrase), black_box(16), black_box(false))
+                    .unwrap(),
+            );
+        });
+    });
+    group.bench_function("near_ordered_3_terms_window_16", |b| {
+        b.iter(|| {
+            black_box(
+                segment
+                    .near_match_terms_strs(black_box(&phrase), black_box(16), black_box(true))
+                    .unwrap(),
+            );
+        });
+    });
+    group.finish();
+}
+
+#[cfg(not(all(feature = "positional", feature = "raw-segment")))]
+fn bench_raw_positional_queries(_c: &mut Criterion) {}
+
 criterion_group!(
     benches,
     bench_insert_50k,
@@ -1048,6 +1113,7 @@ criterion_group!(
     bench_weighted_top_k_sparse_doc_ids,
     bench_delete,
     bench_raw_segment_queries,
-    bench_positional_queries
+    bench_positional_queries,
+    bench_raw_positional_queries
 );
 criterion_main!(benches);

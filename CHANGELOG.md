@@ -10,6 +10,8 @@
 - Added `postings::positional::raw` for checked byte-backed positional segment
   encoding, lazy term/posting lookup, and exact phrase/NEAR matching when both
   `positional` and `raw-segment` are enabled.
+- Added Criterion coverage for raw positional phrase and NEAR query paths beside
+  the existing in-memory positional benchmarks.
 
 ## [0.2.11] - 2026-07-04
 
