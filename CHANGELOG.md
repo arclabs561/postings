@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.2.10] - 2026-07-04
+
 ### Added
 
 - Added raw-segment benchmark coverage for sealing a live
