@@ -31,6 +31,10 @@ pub type PositionalIndex = PosingsIndex;
 /// Preferred name for the positional postings error type.
 pub type PositionalError = Error;
 
+/// Byte-backed positional segment helpers.
+#[cfg(feature = "raw-segment")]
+pub mod raw;
+
 /// One document's positions for a positional term posting list.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PositionalPosting<'a> {

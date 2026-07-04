@@ -7,6 +7,9 @@
 - Added sorted positional shard export helpers for document lengths and borrowed
   term posting lists, preparing positional phrase/proximity data for
   consumer-owned segment writers without cloning position vectors.
+- Added `postings::positional::raw` for checked byte-backed positional segment
+  encoding and lazy term/posting lookup when both `positional` and
+  `raw-segment` are enabled.
 
 ## [0.2.11] - 2026-07-04
 

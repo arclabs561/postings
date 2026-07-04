@@ -158,6 +158,10 @@ historical name from the older `posings` crate.
 `sorted_document_lengths` and `sorted_term_posting_lists` expose stable,
 borrowed, sorted streams for sealing a bounded in-memory positional shard into a
 consumer-owned segment format without cloning position vectors.
+With `raw-segment` also enabled, `postings::positional::raw` can write and open
+checked byte-backed positional segments. The first reader exposes document
+lengths, term document frequency, sorted docs, postings, and per-document
+positions; query planning, deletes, and lifecycle stay above it.
 
 `cnk-compression` is a helper for sorted candidate doc-id sets produced by
 positional workflows. It is not a storage backend, postings codec, or lifecycle
