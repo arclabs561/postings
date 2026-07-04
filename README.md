@@ -152,6 +152,10 @@ evaluation. `phrase_match_strs` and `near_match_terms_strs` accept borrowed
 query terms when a parser already holds `&str`s. `PosingsIndex` remains as the
 historical name from the older `posings` crate.
 
+`cnk-compression` is a helper for sorted candidate doc-id sets produced by
+positional workflows. It is not a storage backend, postings codec, or lifecycle
+layer.
+
 ## Development
 
 ```bash
