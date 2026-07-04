@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.2.11] - 2026-07-04
+
 ### Changed
 
 - Changed `top_k_weighted_u32_files_and_index` to score the live
