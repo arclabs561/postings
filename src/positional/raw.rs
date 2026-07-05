@@ -1167,7 +1167,6 @@ fn candidates_all_terms<P: AsRef<[RawPositionalPosting]>>(
         }
         out.push(posting.doc_id);
     }
-    out.sort_unstable();
     out
 }
 
@@ -1276,7 +1275,6 @@ fn phrase_match_three_unique_decoded<P: AsRef<[RawPositionalPosting]>>(
             continue 'doc;
         }
     }
-    out.sort_unstable();
     out
 }
 
@@ -1322,7 +1320,6 @@ fn near_match_three_unique_decoded<const ORDERED: bool, P: AsRef<[RawPositionalP
             out.push(posting.doc_id);
         }
     }
-    out.sort_unstable();
     out
 }
 
