@@ -58,7 +58,7 @@ pub struct PositionalTermPostings<'a> {
 /// This is intentionally a helper surface rather than a hard dependency of the main index.
 #[cfg(feature = "sbits")]
 pub mod ef_candidates {
-    use crate::DocId;
+    use crate::{codec, DocId};
 
     /// Re-export the underlying succinct structure.
     pub type EliasFano = sbits::EliasFano;
@@ -70,8 +70,18 @@ pub mod ef_candidates {
     /// - `ids` must be **sorted** and **strictly increasing**
     /// - every id must satisfy `id < universe_size`
     pub fn elias_fano_from_sorted_doc_ids(ids: &[DocId], universe_size: u32) -> EliasFano {
+        try_elias_fano_from_sorted_doc_ids(ids, universe_size)
+            .expect("doc ids must be strictly increasing and inside the universe")
+    }
+
+    /// Build an Elias-Fano structure from sorted doc ids, validating the public contract.
+    pub fn try_elias_fano_from_sorted_doc_ids(
+        ids: &[DocId],
+        universe_size: u32,
+    ) -> Result<EliasFano, codec::Error> {
+        codec::validate_sorted_ids(ids, universe_size)?;
         let ids64: Vec<u64> = ids.iter().map(|&x| x as u64).collect();
-        EliasFano::new(&ids64, universe_size as u64)
+        Ok(EliasFano::new(&ids64, universe_size as u64))
     }
 }
 
@@ -1145,6 +1155,30 @@ mod tests {
         for (i, &id) in ids.iter().enumerate() {
             assert_eq!(ef.get(i).unwrap(), id as u64);
         }
+    }
+
+    #[cfg(feature = "sbits")]
+    #[test]
+    fn ef_candidates_checked_constructor_rejects_bad_ids() {
+        let err = ef_candidates::try_elias_fano_from_sorted_doc_ids(&[2, 2], 10).unwrap_err();
+        assert_eq!(
+            err,
+            crate::codec::Error::NotStrictlyIncreasing {
+                index: 1,
+                prev: 2,
+                next: 2
+            }
+        );
+
+        let err = ef_candidates::try_elias_fano_from_sorted_doc_ids(&[2, 10], 10).unwrap_err();
+        assert_eq!(
+            err,
+            crate::codec::Error::IdOutOfUniverse {
+                index: 1,
+                id: 10,
+                universe_size: 10
+            }
+        );
     }
 
     #[cfg(feature = "sbits")]

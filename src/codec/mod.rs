@@ -33,6 +33,16 @@ pub enum Error {
         /// Index in the gaps stream where overflow occurred.
         index: usize,
     },
+    /// An id exceeded the declared universe.
+    #[error("id at index {index} is outside the universe: id={id}, universe_size={universe_size}")]
+    IdOutOfUniverse {
+        /// Index of the invalid id.
+        index: usize,
+        /// Invalid id.
+        id: u32,
+        /// Exclusive upper bound for valid ids.
+        universe_size: u32,
+    },
 }
 
 /// Encode a sorted list of doc ids as gaps (delta encoding).
@@ -112,6 +122,29 @@ pub fn ids_from_gaps_unchecked(gaps: &[u32]) -> Vec<u32> {
     out
 }
 
+/// Check that ids are sorted, unique, and inside the declared universe.
+pub fn validate_sorted_ids(ids: &[u32], universe_size: u32) -> Result<(), Error> {
+    for (index, &id) in ids.iter().enumerate() {
+        if id >= universe_size {
+            return Err(Error::IdOutOfUniverse {
+                index,
+                id,
+                universe_size,
+            });
+        }
+        if let Some(&prev) = index.checked_sub(1).and_then(|prev| ids.get(prev)) {
+            if id <= prev {
+                return Err(Error::NotStrictlyIncreasing {
+                    index,
+                    prev,
+                    next: id,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -134,6 +167,32 @@ mod tests {
     fn ids_from_gaps_rejects_overflow() {
         let err = ids_from_gaps(&[u32::MAX, 1]).unwrap_err();
         assert_eq!(err, Error::Overflow { index: 1 });
+    }
+
+    #[test]
+    fn validate_sorted_ids_rejects_duplicates() {
+        let err = validate_sorted_ids(&[1, 3, 3], 10).unwrap_err();
+        assert_eq!(
+            err,
+            Error::NotStrictlyIncreasing {
+                index: 2,
+                prev: 3,
+                next: 3
+            }
+        );
+    }
+
+    #[test]
+    fn validate_sorted_ids_rejects_ids_outside_universe() {
+        let err = validate_sorted_ids(&[1, 10], 10).unwrap_err();
+        assert_eq!(
+            err,
+            Error::IdOutOfUniverse {
+                index: 1,
+                id: 10,
+                universe_size: 10
+            }
+        );
     }
 
     proptest! {

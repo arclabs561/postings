@@ -10,8 +10,18 @@ pub type EliasFano = sbits::EliasFano;
 ///
 /// Caller must ensure `ids` are sorted and in `[0, universe_size)`.
 pub fn elias_fano_from_sorted_ids(ids: &[u32], universe_size: u32) -> EliasFano {
+    try_elias_fano_from_sorted_ids(ids, universe_size)
+        .expect("ids must be strictly increasing and inside the universe")
+}
+
+/// Build an Elias-Fano structure from sorted ids, validating the public contract.
+pub fn try_elias_fano_from_sorted_ids(
+    ids: &[u32],
+    universe_size: u32,
+) -> Result<EliasFano, crate::codec::Error> {
+    crate::codec::validate_sorted_ids(ids, universe_size)?;
     let ids64: Vec<u64> = ids.iter().map(|&x| x as u64).collect();
-    EliasFano::new(&ids64, universe_size as u64)
+    Ok(EliasFano::new(&ids64, universe_size as u64))
 }
 
 #[cfg(test)]
@@ -34,6 +44,32 @@ mod tests {
         for (i, &id) in ids.iter().enumerate() {
             assert_eq!(ef.get(i).unwrap(), id as u64);
         }
+    }
+
+    #[test]
+    fn try_elias_fano_rejects_unsorted_ids() {
+        let err = try_elias_fano_from_sorted_ids(&[1, 5, 3], 10).unwrap_err();
+        assert_eq!(
+            err,
+            crate::codec::Error::NotStrictlyIncreasing {
+                index: 2,
+                prev: 5,
+                next: 3
+            }
+        );
+    }
+
+    #[test]
+    fn try_elias_fano_rejects_ids_outside_universe() {
+        let err = try_elias_fano_from_sorted_ids(&[1, 10], 10).unwrap_err();
+        assert_eq!(
+            err,
+            crate::codec::Error::IdOutOfUniverse {
+                index: 1,
+                id: 10,
+                universe_size: 10
+            }
+        );
     }
 
     proptest! {

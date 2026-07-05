@@ -5,6 +5,8 @@
 ### Added
 
 - Added Criterion coverage for large single-term filtered raw-file top-k search.
+- Added checked Elias-Fano constructors for codec ids and positional candidate
+  doc-id sets.
 
 ### Changed
 
