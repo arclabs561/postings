@@ -1183,45 +1183,73 @@ fn positions_for_term<'a, P: AsRef<[RawPositionalPosting]>>(
         .unwrap_or(&[])
 }
 
+fn positions_in_postings(postings: &[RawPositionalPosting], doc_id: DocId) -> &[TokenPos] {
+    postings
+        .binary_search_by_key(&doc_id, |posting| posting.doc_id)
+        .ok()
+        .map(|index| postings[index].positions.as_slice())
+        .unwrap_or(&[])
+}
+
+fn decoded_posting_lists<'a, P: AsRef<[RawPositionalPosting]>>(
+    lookups: &'a [DecodedTerm<'_, P>],
+    terms: [&str; 3],
+) -> [&'a [RawPositionalPosting]; 3] {
+    let empty: &'a [RawPositionalPosting] = &[];
+    [
+        lookups
+            .iter()
+            .find(|lookup| lookup.term == terms[0])
+            .map_or(empty, |lookup| lookup.postings.as_ref()),
+        lookups
+            .iter()
+            .find(|lookup| lookup.term == terms[1])
+            .map_or(empty, |lookup| lookup.postings.as_ref()),
+        lookups
+            .iter()
+            .find(|lookup| lookup.term == terms[2])
+            .map_or(empty, |lookup| lookup.postings.as_ref()),
+    ]
+}
+
+fn rarest_posting_list(postings: [&[RawPositionalPosting]; 3]) -> (usize, &[RawPositionalPosting]) {
+    let mut anchor_i = 0usize;
+    let mut anchor_df = postings[0].len();
+    for (i, postings) in postings.iter().enumerate().skip(1) {
+        if postings.len() < anchor_df {
+            anchor_i = i;
+            anchor_df = postings.len();
+        }
+    }
+    (anchor_i, postings[anchor_i])
+}
+
 fn phrase_match_three_unique_decoded<P: AsRef<[RawPositionalPosting]>>(
     lookups: &[DecodedTerm<'_, P>],
     terms: [&str; 3],
 ) -> Vec<DocId> {
-    let decoded = [
-        lookups.iter().find(|lookup| lookup.term == terms[0]),
-        lookups.iter().find(|lookup| lookup.term == terms[1]),
-        lookups.iter().find(|lookup| lookup.term == terms[2]),
-    ];
-    let mut anchor_i = 0usize;
-    let mut anchor_df = decoded[0].map_or(0, |lookup| lookup.postings.as_ref().len());
-    for (i, lookup) in decoded.iter().enumerate().skip(1) {
-        let df = lookup.map_or(0, |lookup| lookup.postings.as_ref().len());
-        if df < anchor_df {
-            anchor_i = i;
-            anchor_df = df;
-        }
+    let postings = decoded_posting_lists(lookups, terms);
+    let (anchor_i, anchor) = rarest_posting_list(postings);
+    if anchor.is_empty() {
+        return Vec::new();
     }
 
-    let Some(anchor) = decoded[anchor_i] else {
-        return Vec::new();
-    };
-
-    let mut out = Vec::new();
-    'doc: for posting in anchor.postings.as_ref() {
+    let mut out = Vec::with_capacity(anchor.len());
+    'doc: for posting in anchor {
         let positions = match anchor_i {
             0 => [
                 posting.positions.as_slice(),
-                positions_for_term(lookups, terms[1], posting.doc_id),
-                positions_for_term(lookups, terms[2], posting.doc_id),
+                positions_in_postings(postings[1], posting.doc_id),
+                positions_in_postings(postings[2], posting.doc_id),
             ],
             1 => [
-                positions_for_term(lookups, terms[0], posting.doc_id),
+                positions_in_postings(postings[0], posting.doc_id),
                 posting.positions.as_slice(),
-                positions_for_term(lookups, terms[2], posting.doc_id),
+                positions_in_postings(postings[2], posting.doc_id),
             ],
             _ => [
-                positions_for_term(lookups, terms[0], posting.doc_id),
-                positions_for_term(lookups, terms[1], posting.doc_id),
+                positions_in_postings(postings[0], posting.doc_id),
+                positions_in_postings(postings[1], posting.doc_id),
                 posting.positions.as_slice(),
             ],
         };
@@ -1257,41 +1285,28 @@ fn near_match_three_unique_decoded<const ORDERED: bool, P: AsRef<[RawPositionalP
     terms: [&str; 3],
     window: u32,
 ) -> Vec<DocId> {
-    let decoded = [
-        lookups.iter().find(|lookup| lookup.term == terms[0]),
-        lookups.iter().find(|lookup| lookup.term == terms[1]),
-        lookups.iter().find(|lookup| lookup.term == terms[2]),
-    ];
-    let mut anchor_i = 0usize;
-    let mut anchor_df = decoded[0].map_or(0, |lookup| lookup.postings.as_ref().len());
-    for (i, lookup) in decoded.iter().enumerate().skip(1) {
-        let df = lookup.map_or(0, |lookup| lookup.postings.as_ref().len());
-        if df < anchor_df {
-            anchor_i = i;
-            anchor_df = df;
-        }
+    let postings = decoded_posting_lists(lookups, terms);
+    let (anchor_i, anchor) = rarest_posting_list(postings);
+    if anchor.is_empty() {
+        return Vec::new();
     }
 
-    let Some(anchor) = decoded[anchor_i] else {
-        return Vec::new();
-    };
-
-    let mut out = Vec::new();
-    for posting in anchor.postings.as_ref() {
+    let mut out = Vec::with_capacity(anchor.len());
+    for posting in anchor {
         let positions = match anchor_i {
             0 => [
                 posting.positions.as_slice(),
-                positions_for_term(lookups, terms[1], posting.doc_id),
-                positions_for_term(lookups, terms[2], posting.doc_id),
+                positions_in_postings(postings[1], posting.doc_id),
+                positions_in_postings(postings[2], posting.doc_id),
             ],
             1 => [
-                positions_for_term(lookups, terms[0], posting.doc_id),
+                positions_in_postings(postings[0], posting.doc_id),
                 posting.positions.as_slice(),
-                positions_for_term(lookups, terms[2], posting.doc_id),
+                positions_in_postings(postings[2], posting.doc_id),
             ],
             _ => [
-                positions_for_term(lookups, terms[0], posting.doc_id),
-                positions_for_term(lookups, terms[1], posting.doc_id),
+                positions_in_postings(postings[0], posting.doc_id),
+                positions_in_postings(postings[1], posting.doc_id),
                 posting.positions.as_slice(),
             ],
         };
