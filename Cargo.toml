@@ -54,6 +54,11 @@ name = "raw_file_topk"
 harness = false
 required-features = ["raw-segment"]
 
+[[bench]]
+name = "raw_file_single_large"
+harness = false
+required-features = ["raw-segment"]
+
 [[example]]
 name = "raw_segment_file"
 required-features = ["raw-segment"]

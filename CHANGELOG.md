@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added Criterion coverage for large single-term filtered raw-file top-k search.
+
+### Changed
+
+- Changed large single-term filtered `RawSegmentFile` top-k search to reuse
+  block-max pruning while applying visibility before ranking.
+
 ## [0.2.12] - 2026-07-04
 
 ### Added

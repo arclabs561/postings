@@ -2159,6 +2159,13 @@ impl RawSegmentFile {
         if query_terms.is_empty() {
             return Ok(Vec::new());
         }
+        if query_terms.len() == 1 {
+            if let Some(result) =
+                self.top_k_weighted_u32_filtered_single_pruned(query_terms[0], k, &is_visible)?
+            {
+                return Ok(result);
+            }
+        }
 
         let mut lists = Vec::with_capacity(query_terms.len());
         let mut total_postings = 0usize;
@@ -2180,6 +2187,7 @@ impl RawSegmentFile {
         let dense_range = self
             .dense_doc_id_range()?
             .filter(|(_, dense_slots)| *dense_slots <= dense_limit);
+
         if let Some((dense_base, dense_slots)) = dense_range {
             let mut scores = vec![0.0; dense_slots];
             let mut touched = Vec::with_capacity(total_postings.min(self.meta.doc_count as usize));
@@ -2394,6 +2402,44 @@ impl RawSegmentFile {
         }
 
         Ok(crate::top_k_scored_docs(scores, k))
+    }
+
+    #[inline(never)]
+    fn top_k_weighted_u32_filtered_single_pruned<F>(
+        &mut self,
+        (term_id, query_weight): (RawTermId, f32),
+        k: usize,
+        is_visible: &F,
+    ) -> Result<Option<Vec<(DocId, f32)>>, RawSegmentFileError>
+    where
+        F: Fn(DocId) -> bool,
+    {
+        if query_weight < 0.0 || !query_weight.is_finite() {
+            return Ok(None);
+        }
+
+        let Some(entry) = self.term_entry(term_id)? else {
+            return Ok(Some(Vec::new()));
+        };
+        if entry.df == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        if entry.postings_len as u64 <= FILE_FULL_POSTINGS_READ_LIMIT {
+            return Ok(None);
+        }
+
+        let Some((_, block_directory)) = self.term_entry_with_blocks(entry.term_id)? else {
+            return Err(Error::InvalidLayout {
+                reason: "term block directory missing",
+            }
+            .into());
+        };
+        if block_directory.block_count <= 1 {
+            return Ok(None);
+        }
+
+        self.top_k_single_raw_term_filtered(entry, block_directory, query_weight, k, is_visible)
+            .map(Some)
     }
 
     fn for_each_scoring_block_posting(
@@ -2884,6 +2930,68 @@ impl RawSegmentFile {
                 block.base_doc_id,
                 block.last_doc_id,
                 |doc_id, doc_weight| {
+                    push_top_k_doc(
+                        &mut ranked,
+                        &mut sorted,
+                        (doc_id, query_weight * doc_weight as f32),
+                        k,
+                    );
+                },
+            )?;
+        }
+        if !sorted {
+            ranked.sort_by(crate::cmp_doc_scores);
+        }
+        Ok(ranked)
+    }
+
+    fn top_k_single_raw_term_filtered<F>(
+        &mut self,
+        entry: TermEntry,
+        block_directory: TermBlockDirectory,
+        query_weight: f32,
+        k: usize,
+        is_visible: &F,
+    ) -> Result<Vec<(DocId, f32)>, RawSegmentFileError>
+    where
+        F: Fn(DocId) -> bool,
+    {
+        if query_weight == 0.0 || k == 0 {
+            return Ok(Vec::new());
+        }
+
+        self.validate_block_directory(block_directory)?;
+        let mut ranked = Vec::with_capacity(k);
+        let mut sorted = false;
+        let can_prune_blocks = query_weight > 0.0 && query_weight.is_finite();
+        let mut block_bytes = Vec::new();
+        for block_index in 0..block_directory.block_count {
+            let block = self.posting_block_at(entry, block_directory, block_index)?;
+            if can_prune_blocks && ranked.len() == k {
+                if !sorted {
+                    ranked.sort_by(crate::cmp_doc_scores);
+                    sorted = true;
+                }
+                let threshold = ranked.last().expect("top-k buffer is full").1;
+                if query_weight * (block.max_weight as f32) < threshold {
+                    continue;
+                }
+            }
+
+            self.read_posting_block_range_into(
+                block.postings_offset,
+                block.postings_len as u64,
+                &mut block_bytes,
+            )?;
+            for_each_posting_in_block(
+                entry.term_id,
+                &block_bytes,
+                block.base_doc_id,
+                block.last_doc_id,
+                |doc_id, doc_weight| {
+                    if !is_visible(doc_id) {
+                        return;
+                    }
                     push_top_k_doc(
                         &mut ranked,
                         &mut sorted,
@@ -6648,6 +6756,40 @@ mod tests {
                 .top_k_weighted_u32_filtered(&query, 3, visible)
                 .unwrap(),
             live.top_k_weighted(&memory_query, 3)
+        );
+    }
+
+    #[test]
+    fn raw_segment_file_filtered_top_k_prunes_low_bound_blocks() {
+        let mut weighted_terms = Vec::new();
+        weighted_terms.push(vec![(10, 100)]);
+        for _ in 1..384 {
+            weighted_terms.push(vec![(10, 1)]);
+        }
+        let raw_docs: Vec<_> = weighted_terms
+            .iter()
+            .enumerate()
+            .map(|(doc_id, terms)| RawDocument::new(doc_id as DocId, terms))
+            .collect();
+        let mut bytes = write_u64_u32_segment(&raw_docs).unwrap();
+        let third_block = RawSegment::open(&bytes)
+            .unwrap()
+            .posting_blocks(10)
+            .unwrap()[2];
+        bytes[third_block.postings_offset() as usize] ^= 0xFF;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raw.segment");
+        std::fs::write(&path, &bytes).unwrap();
+        let mut file_segment = RawSegmentFile::open(&path).unwrap();
+        let (entry, block_directory) = file_segment.term_entry_with_blocks(10).unwrap().unwrap();
+        let visible = |_| true;
+
+        assert_eq!(
+            file_segment
+                .top_k_single_raw_term_filtered(entry, block_directory, 1.0, 1, &visible)
+                .unwrap(),
+            vec![(0, 100.0)]
         );
     }
 
