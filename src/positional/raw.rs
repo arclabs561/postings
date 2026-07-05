@@ -24,6 +24,7 @@ const TERM_ENTRY_LEN: usize = 32;
 
 /// Errors returned by raw positional segment encoding and decoding.
 #[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Error {
     /// The segment magic did not match the raw positional format.
     #[error("raw positional segment has invalid magic")]
@@ -64,6 +65,7 @@ pub enum Error {
 
 /// Errors returned by file-backed raw positional segment readers and helpers.
 #[derive(thiserror::Error, Debug)]
+#[non_exhaustive]
 pub enum RawPositionalSegmentFileError {
     /// A file read failed.
     #[error(transparent)]

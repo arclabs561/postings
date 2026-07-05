@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-05
+
 ### Added
 
 - Added `RawPositionalTermCache` inspection and single-term removal helpers so
@@ -9,6 +11,12 @@
   cache or delegating eviction policy to `postings`.
 - Added cache-aware file-backed raw positional segment-set helpers for phrase
   and NEAR queries across multiple sealed files.
+
+### Changed
+
+- Marked raw positional segment error enums as non-exhaustive, and added an
+  explicit cache/segment count mismatch error for cached file segment-set
+  helpers.
 
 ## [0.2.13] - 2026-07-05
 
