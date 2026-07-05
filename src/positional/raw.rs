@@ -329,6 +329,14 @@ impl<'a> RawPositionalSegment<'a> {
         if let [term] = phrase {
             return self.docs_with_term(term);
         }
+        if let [a, b, c] = phrase {
+            let terms = [*a, *b, *c];
+            if terms[0] != terms[1] && terms[0] != terms[2] && terms[1] != terms[2] {
+                let required = required_counts(phrase);
+                let lookups = self.load_required_terms(&required)?;
+                return Ok(phrase_match_three_unique_decoded(&lookups, terms));
+            }
+        }
 
         let required = required_counts(phrase);
         let lookups = self.load_required_terms(&required)?;
@@ -656,6 +664,14 @@ impl RawPositionalSegmentFile {
         if let [term] = phrase {
             return self.docs_with_term(term);
         }
+        if let [a, b, c] = phrase {
+            let terms = [*a, *b, *c];
+            if terms[0] != terms[1] && terms[0] != terms[2] && terms[1] != terms[2] {
+                let required = required_counts(phrase);
+                let lookups = self.load_required_terms(&required)?;
+                return Ok(phrase_match_three_unique_decoded(&lookups, terms));
+            }
+        }
 
         let required = required_counts(phrase);
         let lookups = self.load_required_terms(&required)?;
@@ -717,6 +733,15 @@ impl RawPositionalSegmentFile {
                 .iter()
                 .map(|posting| posting.doc_id)
                 .collect());
+        }
+        if let [a, b, c] = phrase {
+            let terms = [*a, *b, *c];
+            if terms[0] != terms[1] && terms[0] != terms[2] && terms[1] != terms[2] {
+                let required = required_counts(phrase);
+                self.ensure_required_terms_cached(&required, cache)?;
+                let lookups = load_required_terms_from_cache(&required, cache);
+                return Ok(phrase_match_three_unique_decoded(&lookups, terms));
+            }
         }
 
         let required = required_counts(phrase);
@@ -824,6 +849,19 @@ impl RawPositionalSegmentFile {
     ) -> Result<Vec<DocId>, RawPositionalSegmentFileError> {
         if terms.len() < 2 || window == 0 {
             return Ok(Vec::new());
+        }
+        if let [a, b, c] = terms {
+            let terms = [*a, *b, *c];
+            if terms[0] != terms[1] && terms[0] != terms[2] && terms[1] != terms[2] {
+                let required = required_counts(&terms);
+                self.ensure_required_terms_cached(&required, cache)?;
+                let lookups = load_required_terms_from_cache(&required, cache);
+                return Ok(if ordered {
+                    near_match_three_unique_decoded::<true, _>(&lookups, terms, window)
+                } else {
+                    near_match_three_unique_decoded::<false, _>(&lookups, terms, window)
+                });
+            }
         }
 
         let required = required_counts(terms);
@@ -1143,6 +1181,177 @@ fn positions_for_term<'a, P: AsRef<[RawPositionalPosting]>>(
         .find(|lookup| lookup.term == term)
         .map(|lookup| lookup.positions(doc_id))
         .unwrap_or(&[])
+}
+
+fn phrase_match_three_unique_decoded<P: AsRef<[RawPositionalPosting]>>(
+    lookups: &[DecodedTerm<'_, P>],
+    terms: [&str; 3],
+) -> Vec<DocId> {
+    let decoded = [
+        lookups.iter().find(|lookup| lookup.term == terms[0]),
+        lookups.iter().find(|lookup| lookup.term == terms[1]),
+        lookups.iter().find(|lookup| lookup.term == terms[2]),
+    ];
+    let mut anchor_i = 0usize;
+    let mut anchor_df = decoded[0].map_or(0, |lookup| lookup.postings.as_ref().len());
+    for (i, lookup) in decoded.iter().enumerate().skip(1) {
+        let df = lookup.map_or(0, |lookup| lookup.postings.as_ref().len());
+        if df < anchor_df {
+            anchor_i = i;
+            anchor_df = df;
+        }
+    }
+
+    let Some(anchor) = decoded[anchor_i] else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    'doc: for posting in anchor.postings.as_ref() {
+        let positions = match anchor_i {
+            0 => [
+                posting.positions.as_slice(),
+                positions_for_term(lookups, terms[1], posting.doc_id),
+                positions_for_term(lookups, terms[2], posting.doc_id),
+            ],
+            1 => [
+                positions_for_term(lookups, terms[0], posting.doc_id),
+                posting.positions.as_slice(),
+                positions_for_term(lookups, terms[2], posting.doc_id),
+            ],
+            _ => [
+                positions_for_term(lookups, terms[0], posting.doc_id),
+                positions_for_term(lookups, terms[1], posting.doc_id),
+                posting.positions.as_slice(),
+            ],
+        };
+        if positions.iter().any(|positions| positions.is_empty()) {
+            continue;
+        }
+
+        'start: for &anchor_pos in positions[anchor_i] {
+            let Some(start) = anchor_pos.checked_sub(anchor_i as u32) else {
+                continue;
+            };
+            for (i, positions) in positions.iter().enumerate() {
+                if i == anchor_i {
+                    continue;
+                }
+                let Some(target) = start.checked_add(i as u32) else {
+                    continue 'start;
+                };
+                if positions.binary_search(&target).is_err() {
+                    continue 'start;
+                }
+            }
+            out.push(posting.doc_id);
+            continue 'doc;
+        }
+    }
+    out.sort_unstable();
+    out
+}
+
+fn near_match_three_unique_decoded<const ORDERED: bool, P: AsRef<[RawPositionalPosting]>>(
+    lookups: &[DecodedTerm<'_, P>],
+    terms: [&str; 3],
+    window: u32,
+) -> Vec<DocId> {
+    let decoded = [
+        lookups.iter().find(|lookup| lookup.term == terms[0]),
+        lookups.iter().find(|lookup| lookup.term == terms[1]),
+        lookups.iter().find(|lookup| lookup.term == terms[2]),
+    ];
+    let mut anchor_i = 0usize;
+    let mut anchor_df = decoded[0].map_or(0, |lookup| lookup.postings.as_ref().len());
+    for (i, lookup) in decoded.iter().enumerate().skip(1) {
+        let df = lookup.map_or(0, |lookup| lookup.postings.as_ref().len());
+        if df < anchor_df {
+            anchor_i = i;
+            anchor_df = df;
+        }
+    }
+
+    let Some(anchor) = decoded[anchor_i] else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    for posting in anchor.postings.as_ref() {
+        let positions = match anchor_i {
+            0 => [
+                posting.positions.as_slice(),
+                positions_for_term(lookups, terms[1], posting.doc_id),
+                positions_for_term(lookups, terms[2], posting.doc_id),
+            ],
+            1 => [
+                positions_for_term(lookups, terms[0], posting.doc_id),
+                posting.positions.as_slice(),
+                positions_for_term(lookups, terms[2], posting.doc_id),
+            ],
+            _ => [
+                positions_for_term(lookups, terms[0], posting.doc_id),
+                positions_for_term(lookups, terms[1], posting.doc_id),
+                posting.positions.as_slice(),
+            ],
+        };
+        if positions.iter().any(|positions| positions.is_empty()) {
+            continue;
+        }
+        let hit = if ORDERED {
+            near_positions_ordered_three(positions, window)
+        } else {
+            near_positions_unordered_three(positions, window)
+        };
+        if hit {
+            out.push(posting.doc_id);
+        }
+    }
+    out.sort_unstable();
+    out
+}
+
+fn near_positions_unordered_three(positions: [&[TokenPos]; 3], window: u32) -> bool {
+    let [a, b, c] = positions;
+    let mut i = 0usize;
+    let mut j = 0usize;
+    let mut k = 0usize;
+    while i < a.len() && j < b.len() && k < c.len() {
+        let pa = a[i];
+        let pb = b[j];
+        let pc = c[k];
+        let min_pos = pa.min(pb).min(pc);
+        let max_pos = pa.max(pb).max(pc);
+        if max_pos - min_pos <= window {
+            return true;
+        }
+        if pa == min_pos {
+            i += 1;
+        } else if pb == min_pos {
+            j += 1;
+        } else {
+            k += 1;
+        }
+    }
+    false
+}
+
+fn near_positions_ordered_three(positions: [&[TokenPos]; 3], window: u32) -> bool {
+    let [a, b, c] = positions;
+    for &pa in a {
+        let b_i = b.partition_point(|&p| p <= pa);
+        let Some(&pb) = b.get(b_i) else {
+            return false;
+        };
+        let c_i = c.partition_point(|&p| p <= pb);
+        let Some(&pc) = c.get(c_i) else {
+            return false;
+        };
+        if pc.saturating_sub(pa) <= window {
+            return true;
+        }
+    }
+    false
 }
 
 fn near_doc_unordered<P: AsRef<[RawPositionalPosting]>>(

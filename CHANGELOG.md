@@ -12,6 +12,10 @@
 
 - Changed large single-term filtered `RawSegmentFile` top-k search to reuse
   block-max pruning while applying visibility before ranking.
+- Changed raw positional phrase queries for three distinct terms to use the
+  rarest decoded term as the anchor, matching the in-memory fast path.
+- Changed cached file-backed raw positional NEAR queries for three distinct
+  terms to use the same decoded three-list scan as the in-memory fast path.
 
 ## [0.2.12] - 2026-07-04
 
