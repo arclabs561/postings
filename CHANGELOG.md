@@ -7,6 +7,8 @@
 - Added `RawPositionalTermCache` inspection and single-term removal helpers so
   callers can enforce decoded-term cache budgets without clearing the whole
   cache or delegating eviction policy to `postings`.
+- Added cache-aware file-backed raw positional segment-set helpers for phrase
+  and NEAR queries across multiple sealed files.
 
 ## [0.2.13] - 2026-07-05
 

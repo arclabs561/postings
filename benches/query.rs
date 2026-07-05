@@ -6,7 +6,8 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 #[cfg(all(feature = "positional", feature = "raw-segment"))]
 use postings::positional::raw::{
-    near_match_terms_strs_segment_files, phrase_match_strs_segment_files,
+    near_match_terms_strs_segment_files, near_match_terms_strs_segment_files_cached,
+    phrase_match_strs_segment_files, phrase_match_strs_segment_files_cached,
     write_positional_segment_from_index, RawPositionalSegment, RawPositionalSegmentFile,
     RawPositionalTermCache,
 };
@@ -1332,6 +1333,76 @@ fn bench_raw_positional_file_segment_queries(c: &mut Criterion) {
 #[cfg(not(all(feature = "positional", feature = "raw-segment")))]
 fn bench_raw_positional_file_segment_queries(_c: &mut Criterion) {}
 
+#[cfg(all(feature = "positional", feature = "raw-segment"))]
+fn bench_raw_positional_file_segment_cached_queries(c: &mut Criterion) {
+    let (_files, mut segments) = build_positional_segment_files(4);
+    let phrase = ["anchor_alpha", "anchor_beta", "anchor_gamma"];
+    let mut caches = (0..segments.len())
+        .map(|_| RawPositionalTermCache::new())
+        .collect::<Vec<_>>();
+    {
+        let mut segment_refs: Vec<_> = segments.iter_mut().collect();
+        phrase_match_strs_segment_files_cached(&mut segment_refs, &phrase, &mut caches).unwrap();
+        near_match_terms_strs_segment_files_cached(
+            &mut segment_refs,
+            &phrase,
+            16,
+            false,
+            &mut caches,
+        )
+        .unwrap();
+    }
+    let mut group = c.benchmark_group("raw_positional_file_segment_cached_queries");
+
+    group.bench_function("phrase_3_terms_multi_4", |b| {
+        let mut segment_refs: Vec<_> = segments.iter_mut().collect();
+        b.iter(|| {
+            black_box(
+                phrase_match_strs_segment_files_cached(
+                    black_box(segment_refs.as_mut_slice()),
+                    black_box(&phrase),
+                    black_box(&mut caches),
+                )
+                .unwrap(),
+            );
+        });
+    });
+    group.bench_function("near_unordered_3_terms_window_16_multi_4", |b| {
+        let mut segment_refs: Vec<_> = segments.iter_mut().collect();
+        b.iter(|| {
+            black_box(
+                near_match_terms_strs_segment_files_cached(
+                    black_box(segment_refs.as_mut_slice()),
+                    black_box(&phrase),
+                    black_box(16),
+                    black_box(false),
+                    black_box(&mut caches),
+                )
+                .unwrap(),
+            );
+        });
+    });
+    group.bench_function("near_ordered_3_terms_window_16_multi_4", |b| {
+        let mut segment_refs: Vec<_> = segments.iter_mut().collect();
+        b.iter(|| {
+            black_box(
+                near_match_terms_strs_segment_files_cached(
+                    black_box(segment_refs.as_mut_slice()),
+                    black_box(&phrase),
+                    black_box(16),
+                    black_box(true),
+                    black_box(&mut caches),
+                )
+                .unwrap(),
+            );
+        });
+    });
+    group.finish();
+}
+
+#[cfg(not(all(feature = "positional", feature = "raw-segment")))]
+fn bench_raw_positional_file_segment_cached_queries(_c: &mut Criterion) {}
+
 criterion_group!(
     benches,
     bench_insert_50k,
@@ -1346,6 +1417,7 @@ criterion_group!(
     bench_raw_positional_queries,
     bench_raw_positional_file_queries,
     bench_raw_positional_file_cached_queries,
-    bench_raw_positional_file_segment_queries
+    bench_raw_positional_file_segment_queries,
+    bench_raw_positional_file_segment_cached_queries
 );
 criterion_main!(benches);

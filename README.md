@@ -175,7 +175,9 @@ layer supplies tombstones or newer-version masks.
 `RawPositionalTermCache` lets serving paths reuse decoded term lists across
 file-backed queries without forcing one-shot scans to retain them. It exposes
 cached-term iteration and single-term removal so callers can enforce their own
-entry, posting, or position budgets.
+entry, posting, or position budgets. Cache-aware file segment-set helpers take
+one cache per segment, so sealed-file serving paths can reuse decoded terms
+without mixing term keys from different files.
 
 `cnk-compression` is a helper for sorted candidate doc-id sets produced by
 positional workflows. It is not a storage backend, postings codec, or lifecycle

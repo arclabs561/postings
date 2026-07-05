@@ -62,7 +62,7 @@ pub enum Error {
     InvalidUtf8,
 }
 
-/// Errors returned by file-backed raw positional segment readers.
+/// Errors returned by file-backed raw positional segment readers and helpers.
 #[derive(thiserror::Error, Debug)]
 pub enum RawPositionalSegmentFileError {
     /// A file read failed.
@@ -71,6 +71,14 @@ pub enum RawPositionalSegmentFileError {
     /// The encoded segment was invalid.
     #[error(transparent)]
     Segment(#[from] Error),
+    /// The caller supplied a different number of per-segment caches than files.
+    #[error("raw positional cache count ({caches}) does not match segment count ({segments})")]
+    CacheSegmentCountMismatch {
+        /// Number of file-backed segments being searched.
+        segments: usize,
+        /// Number of caller-owned caches supplied.
+        caches: usize,
+    },
 }
 
 /// One decoded raw positional posting.
@@ -1072,6 +1080,21 @@ pub fn phrase_match_strs_segment_files(
     Ok(sort_dedup_doc_ids(out))
 }
 
+/// Exact phrase match across immutable file-backed positional segments, using
+/// one caller-owned decoded-term cache per segment.
+pub fn phrase_match_strs_segment_files_cached(
+    segments: &mut [&mut RawPositionalSegmentFile],
+    phrase: &[&str],
+    caches: &mut [RawPositionalTermCache],
+) -> Result<Vec<DocId>, RawPositionalSegmentFileError> {
+    ensure_cache_count(segments.len(), caches.len())?;
+    let mut out = Vec::new();
+    for (segment, cache) in segments.iter_mut().zip(caches.iter_mut()) {
+        out.extend(segment.phrase_match_strs_cached(phrase, cache)?);
+    }
+    Ok(sort_dedup_doc_ids(out))
+}
+
 /// Exact phrase match across immutable file-backed positional segments with a
 /// caller-supplied visibility predicate.
 ///
@@ -1093,6 +1116,29 @@ where
     Ok(sort_dedup_doc_ids(out))
 }
 
+/// Exact cached phrase match across immutable file-backed positional segments
+/// with a caller-supplied visibility predicate.
+pub fn phrase_match_strs_segment_files_filtered_cached<F>(
+    segments: &mut [&mut RawPositionalSegmentFile],
+    phrase: &[&str],
+    is_visible: F,
+    caches: &mut [RawPositionalTermCache],
+) -> Result<Vec<DocId>, RawPositionalSegmentFileError>
+where
+    F: Fn(DocId) -> bool,
+{
+    ensure_cache_count(segments.len(), caches.len())?;
+    let mut out = Vec::new();
+    for (segment, cache) in segments.iter_mut().zip(caches.iter_mut()) {
+        extend_visible_doc_ids(
+            &mut out,
+            segment.phrase_match_strs_cached(phrase, cache)?,
+            &is_visible,
+        );
+    }
+    Ok(sort_dedup_doc_ids(out))
+}
+
 /// Pairwise NEAR match across immutable file-backed positional segments.
 pub fn near_match_segment_files(
     segments: &mut [&mut RawPositionalSegmentFile],
@@ -1101,6 +1147,18 @@ pub fn near_match_segment_files(
     window: u32,
 ) -> Result<Vec<DocId>, RawPositionalSegmentFileError> {
     near_match_terms_strs_segment_files(segments, &[a, b], window, false)
+}
+
+/// Pairwise NEAR match across immutable file-backed positional segments, using
+/// one caller-owned decoded-term cache per segment.
+pub fn near_match_segment_files_cached(
+    segments: &mut [&mut RawPositionalSegmentFile],
+    a: &str,
+    b: &str,
+    window: u32,
+    caches: &mut [RawPositionalTermCache],
+) -> Result<Vec<DocId>, RawPositionalSegmentFileError> {
+    near_match_terms_strs_segment_files_cached(segments, &[a, b], window, false, caches)
 }
 
 /// Pairwise NEAR match across immutable file-backed positional segments with a
@@ -1118,6 +1176,29 @@ where
     near_match_terms_strs_segment_files_filtered(segments, &[a, b], window, false, is_visible)
 }
 
+/// Cached pairwise NEAR match across immutable file-backed positional segments
+/// with a caller-supplied visibility predicate.
+pub fn near_match_segment_files_filtered_cached<F>(
+    segments: &mut [&mut RawPositionalSegmentFile],
+    a: &str,
+    b: &str,
+    window: u32,
+    is_visible: F,
+    caches: &mut [RawPositionalTermCache],
+) -> Result<Vec<DocId>, RawPositionalSegmentFileError>
+where
+    F: Fn(DocId) -> bool,
+{
+    near_match_terms_strs_segment_files_filtered_cached(
+        segments,
+        &[a, b],
+        window,
+        false,
+        is_visible,
+        caches,
+    )
+}
+
 /// Multi-term NEAR match across immutable file-backed positional segments.
 pub fn near_match_terms_strs_segment_files(
     segments: &mut [&mut RawPositionalSegmentFile],
@@ -1128,6 +1209,23 @@ pub fn near_match_terms_strs_segment_files(
     let mut out = Vec::new();
     for segment in segments.iter_mut() {
         out.extend(segment.near_match_terms_strs(terms, window, ordered)?);
+    }
+    Ok(sort_dedup_doc_ids(out))
+}
+
+/// Multi-term NEAR match across immutable file-backed positional segments,
+/// using one caller-owned decoded-term cache per segment.
+pub fn near_match_terms_strs_segment_files_cached(
+    segments: &mut [&mut RawPositionalSegmentFile],
+    terms: &[&str],
+    window: u32,
+    ordered: bool,
+    caches: &mut [RawPositionalTermCache],
+) -> Result<Vec<DocId>, RawPositionalSegmentFileError> {
+    ensure_cache_count(segments.len(), caches.len())?;
+    let mut out = Vec::new();
+    for (segment, cache) in segments.iter_mut().zip(caches.iter_mut()) {
+        out.extend(segment.near_match_terms_strs_cached(terms, window, ordered, cache)?);
     }
     Ok(sort_dedup_doc_ids(out))
 }
@@ -1153,6 +1251,39 @@ where
         );
     }
     Ok(sort_dedup_doc_ids(out))
+}
+
+/// Cached multi-term NEAR match across immutable file-backed positional
+/// segments with a caller-supplied visibility predicate.
+pub fn near_match_terms_strs_segment_files_filtered_cached<F>(
+    segments: &mut [&mut RawPositionalSegmentFile],
+    terms: &[&str],
+    window: u32,
+    ordered: bool,
+    is_visible: F,
+    caches: &mut [RawPositionalTermCache],
+) -> Result<Vec<DocId>, RawPositionalSegmentFileError>
+where
+    F: Fn(DocId) -> bool,
+{
+    ensure_cache_count(segments.len(), caches.len())?;
+    let mut out = Vec::new();
+    for (segment, cache) in segments.iter_mut().zip(caches.iter_mut()) {
+        extend_visible_doc_ids(
+            &mut out,
+            segment.near_match_terms_strs_cached(terms, window, ordered, cache)?,
+            &is_visible,
+        );
+    }
+    Ok(sort_dedup_doc_ids(out))
+}
+
+fn ensure_cache_count(segments: usize, caches: usize) -> Result<(), RawPositionalSegmentFileError> {
+    if segments == caches {
+        Ok(())
+    } else {
+        Err(RawPositionalSegmentFileError::CacheSegmentCountMismatch { segments, caches })
+    }
 }
 
 fn extend_visible_doc_ids<F>(out: &mut Vec<DocId>, doc_ids: Vec<DocId>, is_visible: &F)
@@ -2498,6 +2629,79 @@ mod tests {
                 combined.near_match_terms_strs(&["a", "a", "b"], 10, true)
             );
         }
+        {
+            let mut segments = [&mut first_segment, &mut second_segment];
+            let mut caches = [RawPositionalTermCache::new(), RawPositionalTermCache::new()];
+            assert_eq!(
+                phrase_match_strs_segment_files_cached(
+                    &mut segments,
+                    &["new", "york"],
+                    &mut caches
+                )
+                .unwrap(),
+                combined.phrase_match_strs(&["new", "york"])
+            );
+            let cached_after_phrase = caches
+                .iter()
+                .map(|cache| (cache.len(), cache.posting_count(), cache.position_count()))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                phrase_match_strs_segment_files_cached(
+                    &mut segments,
+                    &["new", "york"],
+                    &mut caches
+                )
+                .unwrap(),
+                combined.phrase_match_strs(&["new", "york"])
+            );
+            assert_eq!(
+                caches
+                    .iter()
+                    .map(|cache| (cache.len(), cache.posting_count(), cache.position_count()))
+                    .collect::<Vec<_>>(),
+                cached_after_phrase
+            );
+            assert_eq!(
+                near_match_segment_files_cached(&mut segments, "new", "york", 2, &mut caches)
+                    .unwrap(),
+                combined.near_match("new", "york", 2)
+            );
+            assert_eq!(
+                near_match_terms_strs_segment_files_cached(
+                    &mut segments,
+                    &["new", "york", "search"],
+                    4,
+                    false,
+                    &mut caches
+                )
+                .unwrap(),
+                combined.near_match_terms_strs(&["new", "york", "search"], 4, false)
+            );
+            assert_eq!(
+                near_match_terms_strs_segment_files_cached(
+                    &mut segments,
+                    &["a", "a", "b"],
+                    10,
+                    true,
+                    &mut caches
+                )
+                .unwrap(),
+                combined.near_match_terms_strs(&["a", "a", "b"], 10, true)
+            );
+        }
+        {
+            let mut segments = [&mut first_segment, &mut second_segment];
+            let mut caches = [RawPositionalTermCache::new()];
+            let err = phrase_match_strs_segment_files_cached(&mut segments, &["new"], &mut caches)
+                .unwrap_err();
+            assert!(matches!(
+                err,
+                RawPositionalSegmentFileError::CacheSegmentCountMismatch {
+                    segments: 2,
+                    caches: 1
+                }
+            ));
+        }
     }
 
     #[test]
@@ -2538,6 +2742,44 @@ mod tests {
                     4,
                     false,
                     visible
+                )
+                .unwrap(),
+                combined.near_match_terms_strs(&["new", "york", "search"], 4, false)
+            );
+        }
+        {
+            let mut segments = [&mut first_segment, &mut second_segment];
+            let mut caches = [RawPositionalTermCache::new(), RawPositionalTermCache::new()];
+            assert_eq!(
+                phrase_match_strs_segment_files_filtered_cached(
+                    &mut segments,
+                    &["new", "york"],
+                    visible,
+                    &mut caches
+                )
+                .unwrap(),
+                combined.phrase_match_strs(&["new", "york"])
+            );
+            assert_eq!(
+                near_match_segment_files_filtered_cached(
+                    &mut segments,
+                    "new",
+                    "york",
+                    2,
+                    visible,
+                    &mut caches
+                )
+                .unwrap(),
+                combined.near_match("new", "york", 2)
+            );
+            assert_eq!(
+                near_match_terms_strs_segment_files_filtered_cached(
+                    &mut segments,
+                    &["new", "york", "search"],
+                    4,
+                    false,
+                    visible,
+                    &mut caches
                 )
                 .unwrap(),
                 combined.near_match_terms_strs(&["new", "york", "search"], 4, false)
