@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.2.13] - 2026-07-05
+
 ### Added
 
 - Added Criterion coverage for large single-term filtered raw-file top-k search.
