@@ -173,7 +173,9 @@ and `near_match_terms_strs_segment_files` union exact results across sealed
 positional files. Use the `_filtered` segment-set helpers when a lifecycle
 layer supplies tombstones or newer-version masks.
 `RawPositionalTermCache` lets serving paths reuse decoded term lists across
-file-backed queries without forcing one-shot scans to retain them.
+file-backed queries without forcing one-shot scans to retain them. It exposes
+cached-term iteration and single-term removal so callers can enforce their own
+entry, posting, or position budgets.
 
 `cnk-compression` is a helper for sorted candidate doc-id sets produced by
 positional workflows. It is not a storage backend, postings codec, or lifecycle

@@ -181,18 +181,35 @@ impl RawPositionalTermCache {
         self.position_count
     }
 
-    fn contains(&self, term: &str) -> bool {
+    /// Return true when a term already has a cached entry.
+    pub fn contains_term(&self, term: &str) -> bool {
         self.terms.contains_key(term)
     }
 
+    /// Iterate cached terms in sorted term order.
+    ///
+    /// This exposes enough state for callers to enforce their own entry,
+    /// posting, or position budgets without making this cache own an eviction
+    /// policy.
+    pub fn cached_terms(&self) -> impl Iterator<Item = &str> + '_ {
+        self.terms.keys().map(String::as_str)
+    }
+
+    /// Remove one cached term entry, returning whether it was present.
+    pub fn remove_term(&mut self, term: &str) -> bool {
+        let Some(previous) = self.terms.remove(term) else {
+            return false;
+        };
+        self.posting_count -= previous.len();
+        self.position_count -= previous
+            .iter()
+            .map(|posting| posting.positions.len())
+            .sum::<usize>();
+        true
+    }
+
     fn insert(&mut self, term: &str, postings: Vec<RawPositionalPosting>) {
-        if let Some(previous) = self.terms.remove(term) {
-            self.posting_count -= previous.len();
-            self.position_count -= previous
-                .iter()
-                .map(|posting| posting.positions.len())
-                .sum::<usize>();
-        }
+        self.remove_term(term);
         self.posting_count += postings.len();
         self.position_count += postings
             .iter()
@@ -920,7 +937,7 @@ impl RawPositionalSegmentFile {
         term: &str,
         cache: &mut RawPositionalTermCache,
     ) -> Result<(), RawPositionalSegmentFileError> {
-        if !cache.contains(term) {
+        if !cache.contains_term(term) {
             let postings = self.term_postings(term)?;
             cache.insert(term, postings);
         }
@@ -2292,6 +2309,8 @@ mod tests {
             ]
         );
         assert_eq!(cache.len(), 1);
+        assert!(cache.contains_term("a"));
+        assert_eq!(cache.cached_terms().collect::<Vec<_>>(), vec!["a"]);
         assert_eq!(cache.posting_count(), 2);
         assert_eq!(cache.position_count(), 3);
         assert_eq!(
@@ -2303,8 +2322,18 @@ mod tests {
             .unwrap()
             .is_empty());
         assert_eq!(cache.len(), 2);
+        assert_eq!(
+            cache.cached_terms().collect::<Vec<_>>(),
+            vec!["a", "missing"]
+        );
         assert_eq!(cache.posting_count(), 2);
         assert_eq!(cache.position_count(), 3);
+        assert!(!cache.remove_term("absent"));
+        assert!(cache.remove_term("a"));
+        assert_eq!(cache.len(), 1);
+        assert!(!cache.contains_term("a"));
+        assert_eq!(cache.posting_count(), 0);
+        assert_eq!(cache.position_count(), 0);
 
         cache.clear();
         assert!(cache.is_empty());

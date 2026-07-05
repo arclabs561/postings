@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `RawPositionalTermCache` inspection and single-term removal helpers so
+  callers can enforce decoded-term cache budgets without clearing the whole
+  cache or delegating eviction policy to `postings`.
+
 ## [0.2.13] - 2026-07-05
 
 ### Added
