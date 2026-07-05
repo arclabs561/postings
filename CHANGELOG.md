@@ -7,6 +7,9 @@
 - Added Criterion coverage for large single-term filtered raw-file top-k search.
 - Added checked Elias-Fano constructors for codec ids and positional candidate
   doc-id sets.
+- Added filtered byte-backed and file-backed raw positional segment-set helpers
+  so lifecycle layers can apply tombstone or newer-version masks to phrase and
+  NEAR candidate generation.
 
 ### Changed
 

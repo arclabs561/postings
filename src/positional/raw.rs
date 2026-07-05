@@ -957,6 +957,27 @@ pub fn phrase_match_strs_segments(
     Ok(sort_dedup_doc_ids(out))
 }
 
+/// Exact phrase match across immutable byte-backed positional segments with a
+/// caller-supplied visibility predicate.
+///
+/// Positional helpers return unbounded candidate sets, not truncated rankings,
+/// so visibility can be applied after each exact segment match and before the
+/// final sorted union.
+pub fn phrase_match_strs_segments_filtered<F>(
+    segments: &[RawPositionalSegment<'_>],
+    phrase: &[&str],
+    is_visible: F,
+) -> Result<Vec<DocId>, Error>
+where
+    F: Fn(DocId) -> bool,
+{
+    let mut out = Vec::new();
+    for segment in segments {
+        extend_visible_doc_ids(&mut out, segment.phrase_match_strs(phrase)?, &is_visible);
+    }
+    Ok(sort_dedup_doc_ids(out))
+}
+
 /// Pairwise NEAR match across immutable byte-backed positional segments.
 pub fn near_match_segments(
     segments: &[RawPositionalSegment<'_>],
@@ -965,6 +986,21 @@ pub fn near_match_segments(
     window: u32,
 ) -> Result<Vec<DocId>, Error> {
     near_match_terms_strs_segments(segments, &[a, b], window, false)
+}
+
+/// Pairwise NEAR match across immutable byte-backed positional segments with a
+/// caller-supplied visibility predicate.
+pub fn near_match_segments_filtered<F>(
+    segments: &[RawPositionalSegment<'_>],
+    a: &str,
+    b: &str,
+    window: u32,
+    is_visible: F,
+) -> Result<Vec<DocId>, Error>
+where
+    F: Fn(DocId) -> bool,
+{
+    near_match_terms_strs_segments_filtered(segments, &[a, b], window, false, is_visible)
 }
 
 /// Multi-term NEAR match across immutable byte-backed positional segments.
@@ -977,6 +1013,29 @@ pub fn near_match_terms_strs_segments(
     let mut out = Vec::new();
     for segment in segments {
         out.extend(segment.near_match_terms_strs(terms, window, ordered)?);
+    }
+    Ok(sort_dedup_doc_ids(out))
+}
+
+/// Multi-term NEAR match across immutable byte-backed positional segments with
+/// a caller-supplied visibility predicate.
+pub fn near_match_terms_strs_segments_filtered<F>(
+    segments: &[RawPositionalSegment<'_>],
+    terms: &[&str],
+    window: u32,
+    ordered: bool,
+    is_visible: F,
+) -> Result<Vec<DocId>, Error>
+where
+    F: Fn(DocId) -> bool,
+{
+    let mut out = Vec::new();
+    for segment in segments {
+        extend_visible_doc_ids(
+            &mut out,
+            segment.near_match_terms_strs(terms, window, ordered)?,
+            &is_visible,
+        );
     }
     Ok(sort_dedup_doc_ids(out))
 }
@@ -996,6 +1055,27 @@ pub fn phrase_match_strs_segment_files(
     Ok(sort_dedup_doc_ids(out))
 }
 
+/// Exact phrase match across immutable file-backed positional segments with a
+/// caller-supplied visibility predicate.
+///
+/// Positional helpers return unbounded candidate sets, not truncated rankings,
+/// so visibility can be applied after each exact segment match and before the
+/// final sorted union.
+pub fn phrase_match_strs_segment_files_filtered<F>(
+    segments: &mut [&mut RawPositionalSegmentFile],
+    phrase: &[&str],
+    is_visible: F,
+) -> Result<Vec<DocId>, RawPositionalSegmentFileError>
+where
+    F: Fn(DocId) -> bool,
+{
+    let mut out = Vec::new();
+    for segment in segments.iter_mut() {
+        extend_visible_doc_ids(&mut out, segment.phrase_match_strs(phrase)?, &is_visible);
+    }
+    Ok(sort_dedup_doc_ids(out))
+}
+
 /// Pairwise NEAR match across immutable file-backed positional segments.
 pub fn near_match_segment_files(
     segments: &mut [&mut RawPositionalSegmentFile],
@@ -1004,6 +1084,21 @@ pub fn near_match_segment_files(
     window: u32,
 ) -> Result<Vec<DocId>, RawPositionalSegmentFileError> {
     near_match_terms_strs_segment_files(segments, &[a, b], window, false)
+}
+
+/// Pairwise NEAR match across immutable file-backed positional segments with a
+/// caller-supplied visibility predicate.
+pub fn near_match_segment_files_filtered<F>(
+    segments: &mut [&mut RawPositionalSegmentFile],
+    a: &str,
+    b: &str,
+    window: u32,
+    is_visible: F,
+) -> Result<Vec<DocId>, RawPositionalSegmentFileError>
+where
+    F: Fn(DocId) -> bool,
+{
+    near_match_terms_strs_segment_files_filtered(segments, &[a, b], window, false, is_visible)
 }
 
 /// Multi-term NEAR match across immutable file-backed positional segments.
@@ -1018,6 +1113,36 @@ pub fn near_match_terms_strs_segment_files(
         out.extend(segment.near_match_terms_strs(terms, window, ordered)?);
     }
     Ok(sort_dedup_doc_ids(out))
+}
+
+/// Multi-term NEAR match across immutable file-backed positional segments with
+/// a caller-supplied visibility predicate.
+pub fn near_match_terms_strs_segment_files_filtered<F>(
+    segments: &mut [&mut RawPositionalSegmentFile],
+    terms: &[&str],
+    window: u32,
+    ordered: bool,
+    is_visible: F,
+) -> Result<Vec<DocId>, RawPositionalSegmentFileError>
+where
+    F: Fn(DocId) -> bool,
+{
+    let mut out = Vec::new();
+    for segment in segments.iter_mut() {
+        extend_visible_doc_ids(
+            &mut out,
+            segment.near_match_terms_strs(terms, window, ordered)?,
+            &is_visible,
+        );
+    }
+    Ok(sort_dedup_doc_ids(out))
+}
+
+fn extend_visible_doc_ids<F>(out: &mut Vec<DocId>, doc_ids: Vec<DocId>, is_visible: &F)
+where
+    F: Fn(DocId) -> bool,
+{
+    out.extend(doc_ids.into_iter().filter(|doc_id| is_visible(*doc_id)));
 }
 
 fn decode_postings_bytes(
@@ -2266,6 +2391,40 @@ mod tests {
     }
 
     #[test]
+    fn raw_positional_segments_filtered_match_deleted_in_memory_index() {
+        let (first, second, mut combined) = split_phrase_indexes();
+        assert!(combined.delete_document(2));
+        assert!(combined.delete_document(10));
+        let visible = |doc_id| doc_id != 2 && doc_id != 10;
+        let first_bytes = write_positional_segment_from_index(&first).unwrap();
+        let second_bytes = write_positional_segment_from_index(&second).unwrap();
+        let segments = vec![
+            RawPositionalSegment::open(&first_bytes).unwrap(),
+            RawPositionalSegment::open(&second_bytes).unwrap(),
+        ];
+
+        assert_eq!(
+            phrase_match_strs_segments_filtered(&segments, &["new", "york"], visible).unwrap(),
+            combined.phrase_match_strs(&["new", "york"])
+        );
+        assert_eq!(
+            near_match_segments_filtered(&segments, "new", "york", 2, visible).unwrap(),
+            combined.near_match("new", "york", 2)
+        );
+        assert_eq!(
+            near_match_terms_strs_segments_filtered(
+                &segments,
+                &["new", "york", "search"],
+                4,
+                false,
+                visible
+            )
+            .unwrap(),
+            combined.near_match_terms_strs(&["new", "york", "search"], 4, false)
+        );
+    }
+
+    #[test]
     fn raw_positional_segment_files_match_combined_in_memory_index() {
         let (first, second, combined) = split_phrase_indexes();
         let first_bytes = write_positional_segment_from_index(&first).unwrap();
@@ -2308,6 +2467,51 @@ mod tests {
                 near_match_terms_strs_segment_files(&mut segments, &["a", "a", "b"], 10, true)
                     .unwrap(),
                 combined.near_match_terms_strs(&["a", "a", "b"], 10, true)
+            );
+        }
+    }
+
+    #[test]
+    fn raw_positional_segment_files_filtered_match_deleted_in_memory_index() {
+        let (first, second, mut combined) = split_phrase_indexes();
+        assert!(combined.delete_document(1));
+        assert!(combined.delete_document(11));
+        let visible = |doc_id| doc_id != 1 && doc_id != 11;
+        let first_bytes = write_positional_segment_from_index(&first).unwrap();
+        let second_bytes = write_positional_segment_from_index(&second).unwrap();
+        let first_file = write_temp_segment(&first_bytes);
+        let second_file = write_temp_segment(&second_bytes);
+        let mut first_segment = RawPositionalSegmentFile::open(first_file.path()).unwrap();
+        let mut second_segment = RawPositionalSegmentFile::open(second_file.path()).unwrap();
+
+        {
+            let mut segments = [&mut first_segment, &mut second_segment];
+            assert_eq!(
+                phrase_match_strs_segment_files_filtered(&mut segments, &["new", "york"], visible)
+                    .unwrap(),
+                combined.phrase_match_strs(&["new", "york"])
+            );
+        }
+        {
+            let mut segments = [&mut first_segment, &mut second_segment];
+            assert_eq!(
+                near_match_segment_files_filtered(&mut segments, "new", "york", 2, visible)
+                    .unwrap(),
+                combined.near_match("new", "york", 2)
+            );
+        }
+        {
+            let mut segments = [&mut first_segment, &mut second_segment];
+            assert_eq!(
+                near_match_terms_strs_segment_files_filtered(
+                    &mut segments,
+                    &["new", "york", "search"],
+                    4,
+                    false,
+                    visible
+                )
+                .unwrap(),
+                combined.near_match_terms_strs(&["new", "york", "search"], 4, false)
             );
         }
     }
