@@ -172,6 +172,23 @@ conjunctive queries. If it does not, the raw format should shrink.
 - If `segstore` pinning cannot keep raw segment files and sidecars alive across
   a reader view, implement pinning before exposing concurrent raw readers.
 
+## Future Vector-List Consumers
+
+Vector IVF indexes have a related storage shape: a list id, usually a centroid
+or partition id, maps to a contiguous payload of entries. The payload is not a
+text posting list, though. It usually needs doc ids plus PQ, AVQ, RaBitQ, or
+other vector codes, and it may need offsets to full vectors for reranking. Its
+query loop probes a bounded set of lists and accumulates approximate distances;
+it does not run Boolean, BM25, phrase, or learned-sparse scoring.
+
+That makes raw postings a useful reference design for immutable list storage,
+not a drop-in vector-IVF backend. The pieces likely to transfer are the resident
+directory plus range-readable payload split, checksums, resident-vs-payload byte
+accounting, segment pruning diagnostics, and lifecycle separation from deletes,
+compaction, and manifests. A shared lower layer should only be extracted after a
+vector-list reader and the postings raw reader both prove they want the same
+directory, payload, checksum, and cache contracts.
+
 ## Open Questions
 
 - Should the first raw writer live in `postings` only, or behind a narrow
