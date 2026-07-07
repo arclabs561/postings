@@ -131,6 +131,12 @@ counts for profiling. Segment pruning is layout-sensitive, so measure it against
 representative segment construction before treating it as a storage win.
 Use `lexir::raw` for BM25 over one or more raw files.
 
+The same list-contiguous storage shape can inform vector-search posting lists
+such as IVF list ids and codes: keep fixed directories resident, range-read only
+the candidate lists a query probes, and report resident metadata separately from
+payload bytes. Vector-specific distance kernels and quantizer state should stay
+in the ANN crate; `postings` should remain a lexical/sparse postings library.
+
 This is not a full index lifecycle by itself: callers still own term-id mapping,
 commit publication, deletes, compaction, and crash-safety policy. Pair raw files
 with `durability`, `segstore` sidecars, or an application manifest when those
