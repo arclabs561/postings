@@ -53,6 +53,22 @@ Use `RawSegmentFile::top_k_weighted_u32_filtered` or
 `top_k_weighted_u32_files_filtered` when a lifecycle layer supplies tombstones
 or newer-version masks. The predicate runs before local top-k truncation.
 
+## Segstore Sidecars
+
+`postings::raw` is the byte format a `segstore` consumer can place under
+`segstore.idx.<segment-id>.<kind>`. The `segstore` segment remains the durable
+source payload; the raw postings bytes are rebuildable derived data keyed by the
+stable segment id. Use `segstore::SidecarEnvelope` for the repeated
+magic/version/segment-id/recipe/CRC framing, then put the raw segment bytes in
+the envelope payload.
+
+Release ordering matters for crates that depend on both `postings` and
+`durability`: publish `postings` with the new `durability` version before
+consumers such as `lexir` bump their direct `durability` dependency. Otherwise
+Cargo links two `durability` versions, and `durability::Directory` arguments
+from the consumer do not satisfy the trait expected by the published `postings`
+crate.
+
 ## Positional Segments
 
 `sorted_document_lengths` and `sorted_term_posting_lists` expose stable,

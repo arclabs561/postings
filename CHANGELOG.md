@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Updated `durability` to 0.7.1, keeping the optional persistence feature on
+  the bounded length-prefixed read path.
+- Documented the `postings::raw` sidecar boundary for `segstore` consumers and
+  the required bottom-up release order for downstream crates that also depend on
+  `durability`.
+
 ## [0.3.0] - 2026-07-05
 
 ### Added
