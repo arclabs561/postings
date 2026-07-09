@@ -16,6 +16,12 @@ full term-id list.
 stream document frequency, maximum weight, and total weight from the same
 directory pass.
 
+Raw segments use separate id domains. Document ids remain `u32`, matching
+`postings::DocId` and the current consumer crates. Numeric term ids are `u64`,
+matching `postings::raw::RawTermId` and leaving room for learned-sparse
+vocabulary dimensions. A `segstore` segment id is a separate `u64` lifecycle id
+used only to name and validate sidecars.
+
 ## Writers
 
 Raw segments can be encoded from a slice, document iterator, sorted document
