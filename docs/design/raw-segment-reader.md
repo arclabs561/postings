@@ -47,6 +47,11 @@ source-of-truth bytes.
   the first raw reader.
 - Do not make `segstore` parse posting blocks, positions, weights, or term
   dictionaries.
+- Do not treat raw postings sidecars as correctness source data. Until segstore
+  has a raw manifest and pinned file views, sidecars remain rebuildable derived
+  files.
+- Do not add a direct `segstore` dependency to `postings` solely for sidecar
+  naming or envelope helpers.
 - Do not support arbitrary serde `Term` values in the first byte-native format.
   Numeric term ids come first; higher layers can own text dictionaries.
 - Do not solve global optimize/merge across every postings format variant in
@@ -120,6 +125,36 @@ or a small buffered file abstraction. Mmap can come after the format and tests
 are stable. `MemoryDirectory` remains a correctness backend only; performance
 claims must use a filesystem directory.
 
+## Segstore Integration Path
+
+Current code has enough pieces for a sidecar bridge, not enough for raw postings
+to be the segstore source segment:
+
+- `postings::raw` writes checked, byte-native raw segments to a `Write` or
+  `Write + Seek` sink, and `RawSegmentFile` opens local files while keeping only
+  directories and checksum metadata resident.
+- `segstore::SegmentCatalog` reads the checkpoint manifest and stable segment
+  ids without deserializing every segment, but current `segstore.seg.<id>` files
+  are still checkpoint-wrapped postcard encodings of `Store::Segment`.
+- `segstore::SidecarEnvelope` gives consumers a checked wrapper for
+  rebuildable per-segment derived bytes named by stable segment id.
+
+That makes the staged integration:
+
+1. **Sidecar bridge now.** Consumers may write raw postings bytes under a
+   `segstore.idx.<segment-id>.<kind>` sidecar, wrapped in
+   `segstore::SidecarEnvelope`. The segstore segment remains the correctness
+   source of truth, and the raw file is a rebuildable query accelerator.
+2. **Raw source segment later.** Promoting postings raw bytes to source-of-truth
+   segment files should wait for segstore's raw-segment manifest extension:
+   stable segment id plus consumer-owned `SegmentMeta`, raw bytes, and pinned
+   file views so GC cannot remove a queried file.
+
+Do not make `postings` depend on `segstore` only to wrap sidecars. The raw
+writer should stay lifecycle-agnostic; segstore-aware sidecar publication
+belongs in consumers or in a narrow adapter after a real consumer shows the API
+shape.
+
 ## Tradeoffs
 
 Numeric term ids make the first format less ergonomic for users who only have
@@ -191,12 +226,11 @@ directory, payload, checksum, and cache contracts.
 
 ## Open Questions
 
-- Should the first raw writer live in `postings` only, or behind a narrow
-  `segstore` integration feature that writes raw bytes directly into segment
-  files?
 - Should the checksum cover the whole raw segment or each section independently
   so a reader can verify only the ranges it touches?
 - Should doc lengths live in every postings raw segment or in a shared corpus
   metadata segment owned by `lexir`?
 - What is the first public term-id type: `u64`, `u32`, or a newtype that leaves
   room for field ids?
+- What exact `SegmentMeta` does segstore need to store before raw postings bytes
+  can become source segment files rather than rebuildable sidecars?
