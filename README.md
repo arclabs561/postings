@@ -23,7 +23,7 @@ sparse retrieval.
 
 ```toml
 [dependencies]
-postings = "0.3"
+postings = "0.4"
 ```
 
 Example (index + candidates):
@@ -117,7 +117,7 @@ Enable positional postings behind a feature flag:
 
 ```toml
 [dependencies]
-postings = { version = "0.3", features = ["positional"] }
+postings = { version = "0.4", features = ["positional"] }
 ```
 
 Then use `postings::positional::PositionalIndex` for phrase/proximity

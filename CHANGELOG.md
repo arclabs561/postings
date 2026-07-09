@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-09
+
 ### Changed
 
 - Updated `durability` to 0.7.1, keeping the optional persistence feature on
