@@ -59,6 +59,15 @@ Use `RawSegmentFile::top_k_weighted_u32_filtered` or
 `top_k_weighted_u32_files_filtered` when a lifecycle layer supplies tombstones
 or newer-version masks. The predicate runs before local top-k truncation.
 
+## Embedded Files
+
+Use `RawSegmentFile::from_file_range` when a raw segment is embedded inside a
+container file, such as a lifecycle-owned sidecar envelope. The containing layer
+validates its header, recipe, and segment id, then passes the raw payload byte
+range to `RawSegmentFile`. Raw-format offsets remain relative to the payload
+start; posting range reads still hit the original file without copying the whole
+payload into memory.
+
 ## Segstore Sidecars
 
 `postings::raw` is the byte format a `segstore` consumer can place under

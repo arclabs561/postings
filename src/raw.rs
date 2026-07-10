@@ -1544,6 +1544,7 @@ impl<'a> RawSegment<'a> {
 #[derive(Debug)]
 pub struct RawSegmentFile {
     file: File,
+    data_offset: u64,
     file_len: usize,
     meta: RawSegmentMeta,
     term_dir: Vec<u8>,
@@ -1592,17 +1593,43 @@ impl RawSegmentFile {
     }
 
     /// Open a raw segment from an already-open file handle.
-    pub fn from_file(mut file: File) -> Result<Self, RawSegmentFileError> {
+    pub fn from_file(file: File) -> Result<Self, RawSegmentFileError> {
         let file_len_u64 = file.metadata()?.len();
+        Self::from_file_range(file, 0, file_len_u64)
+    }
+
+    /// Open a raw segment from a byte range inside an already-open file handle.
+    ///
+    /// `offset` and `len` delimit exactly one raw segment in the containing
+    /// file. Raw-format offsets in the segment header stay relative to that
+    /// range; this reader adds `offset` only when issuing file reads.
+    pub fn from_file_range(
+        mut file: File,
+        offset: u64,
+        len: u64,
+    ) -> Result<Self, RawSegmentFileError> {
+        let file_end = offset.checked_add(len).ok_or(Error::SegmentTooLarge)?;
+        if file_end > file.metadata()?.len() {
+            return Err(Error::Truncated {
+                section: "file range",
+            }
+            .into());
+        }
+
+        let file_len_u64 = len;
         let file_len = usize::try_from(file_len_u64).map_err(|_| Error::SegmentTooLarge)?;
         if file_len < HEADER_LEN {
             return Err(Error::Truncated { section: "header" }.into());
         }
-        let header = read_exact_at(&mut file, 0, HEADER_LEN as u64)?;
+        let header = read_exact_at(&mut file, offset, HEADER_LEN as u64)?;
         let meta = parse_header(&header)?;
         validate_layout_len(meta, file_len)?;
 
-        let footer = read_exact_at(&mut file, meta.footer_offset, FOOTER_LEN as u64)?;
+        let footer = read_exact_at(
+            &mut file,
+            segment_file_offset(offset, meta.footer_offset)?,
+            FOOTER_LEN as u64,
+        )?;
         if &footer[..FOOTER_MAGIC.len()] != FOOTER_MAGIC {
             return Err(Error::BadFooter.into());
         }
@@ -1632,15 +1659,31 @@ impl RawSegmentFile {
                     reason: "block directory must follow doc metadata",
                 })?;
 
-        let term_dir = read_exact_at(&mut file, meta.term_dir_offset, term_dir_len)?;
-        let doc_meta = read_exact_at(&mut file, meta.doc_meta_offset, doc_meta_len)?;
-        let block_dir = read_exact_at(&mut file, block_dir_start, block_dir_len)?;
+        let term_dir = read_exact_at(
+            &mut file,
+            segment_file_offset(offset, meta.term_dir_offset)?,
+            term_dir_len,
+        )?;
+        let doc_meta = read_exact_at(
+            &mut file,
+            segment_file_offset(offset, meta.doc_meta_offset)?,
+            doc_meta_len,
+        )?;
+        let block_dir = read_exact_at(
+            &mut file,
+            segment_file_offset(offset, block_dir_start)?,
+            block_dir_len,
+        )?;
 
         // Directories are resident, so verify them at open; posting blocks
         // verify lazily per range read via the checksum map.
         let block_checksums = if meta.has_checksums() {
             let (integrity_offset, block_count, integrity_len) = integrity_layout(meta)?;
-            let integrity = read_exact_at(&mut file, integrity_offset, integrity_len)?;
+            let integrity = read_exact_at(
+                &mut file,
+                segment_file_offset(offset, integrity_offset)?,
+                integrity_len,
+            )?;
             verify_directory_checksums(&term_dir, &doc_meta, &block_dir, &integrity)?;
             let block_count = usize::try_from(block_count).map_err(|_| Error::SegmentTooLarge)?;
             if integrity.len() != INTEGRITY_HEADER_LEN + block_count * 4 {
@@ -1656,6 +1699,7 @@ impl RawSegmentFile {
 
         Ok(Self {
             file,
+            data_offset: offset,
             file_len,
             meta,
             term_dir,
@@ -2641,7 +2685,11 @@ impl RawSegmentFile {
         len: u64,
     ) -> Result<Vec<u8>, RawSegmentFileError> {
         checked_range(offset, len, self.file_len, "postings")?;
-        let bytes = read_exact_at_positional(&mut self.file, offset, len)?;
+        let bytes = read_exact_at_positional(
+            &mut self.file,
+            segment_file_offset(self.data_offset, offset)?,
+            len,
+        )?;
         if let Some(checksums) = self.decoded_block_checksums()? {
             verify_span_blocks(checksums, offset, &bytes)?;
         }
@@ -2668,7 +2716,11 @@ impl RawSegmentFile {
         let len = usize::try_from(len).map_err(|_| Error::SegmentTooLarge)?;
         bytes.clear();
         bytes.resize(len, 0);
-        read_exact_at_positional_into(&mut self.file, offset, bytes)?;
+        read_exact_at_positional_into(
+            &mut self.file,
+            segment_file_offset(self.data_offset, offset)?,
+            bytes,
+        )?;
         if let Some(checksums) = self.decoded_block_checksums()? {
             verify_block_slice(checksums, offset, bytes)?;
         }
@@ -2833,6 +2885,7 @@ impl RawSegmentFile {
         }
 
         let file_len = self.file_len;
+        let data_offset = self.data_offset;
         let file = &mut self.file;
         let block_checksums = match &mut self.block_checksums {
             Some(checksums) => Some(checksums.get(&self.block_dir)?),
@@ -2851,7 +2904,11 @@ impl RawSegmentFile {
             let len = usize::try_from(block.postings_len).map_err(|_| Error::SegmentTooLarge)?;
             block_bytes.clear();
             block_bytes.resize(len, 0);
-            read_exact_at_positional_into(file, block.postings_offset, &mut block_bytes)?;
+            read_exact_at_positional_into(
+                file,
+                segment_file_offset(data_offset, block.postings_offset)?,
+                &mut block_bytes,
+            )?;
             if let Some(checksums) = block_checksums {
                 verify_block_slice(checksums, block.postings_offset, &block_bytes)?;
             }
@@ -3273,6 +3330,10 @@ fn read_exact_at(file: &mut File, offset: u64, len: u64) -> Result<Vec<u8>, RawS
     file.seek(SeekFrom::Start(offset))?;
     file.read_exact(&mut bytes)?;
     Ok(bytes)
+}
+
+fn segment_file_offset(base: u64, offset: u64) -> Result<u64, Error> {
+    base.checked_add(offset).ok_or(Error::SegmentTooLarge)
 }
 
 fn read_exact_at_positional(
@@ -6241,6 +6302,44 @@ mod tests {
             segment.resident_metadata_len(),
             expected_resident_metadata_len,
             "range reads must not promote posting payloads into resident metadata"
+        );
+    }
+
+    #[test]
+    fn raw_segment_file_opens_embedded_segment_range() {
+        let doc_a = vec![(10, 4), (20, 2)];
+        let doc_b = vec![(10, 1)];
+        let doc_c = vec![(20, 1)];
+        let docs = vec![
+            RawDocument::new(5, &doc_a),
+            RawDocument::new(2, &doc_b),
+            RawDocument::new(9, &doc_c),
+        ];
+        let bytes = write_u64_u32_segment(&docs).unwrap();
+        let mut wrapped = b"sidecar envelope header".to_vec();
+        let offset = wrapped.len() as u64;
+        wrapped.extend_from_slice(&bytes);
+        wrapped.extend_from_slice(b"trailing bytes");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wrapped.sidecar");
+        std::fs::write(&path, &wrapped).unwrap();
+        let mut segment =
+            RawSegmentFile::from_file_range(File::open(&path).unwrap(), offset, bytes.len() as u64)
+                .unwrap();
+
+        assert_eq!(segment.num_docs(), 3);
+        assert_eq!(segment.doc_id_range().unwrap(), Some((2, 9)));
+        assert_eq!(segment.postings(10).unwrap(), vec![(2, 1), (5, 4)]);
+        assert_eq!(
+            segment.candidates_any_terms(&[10, 20]).unwrap(),
+            vec![2, 5, 9]
+        );
+        assert_eq!(
+            segment
+                .top_k_weighted_u32(&[(10, 1.0), (20, 0.5)], 2)
+                .unwrap(),
+            vec![(5, 5.0), (2, 1.0)]
         );
     }
 
