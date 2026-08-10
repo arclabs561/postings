@@ -9,7 +9,7 @@ Inverted-index postings lists and codecs.
 Supports `u32` term frequencies for classical IR and `f32` weights for learned
 sparse retrieval.
 
-## Data Model & Invariants
+## Data model and invariants
 
 - **Doc IDs**: `u32`. Sparse ids are supported; smaller gaps compress better
   and dense ids keep dense scratch paths cheap.
@@ -99,6 +99,28 @@ publication, deletes, compaction, and crash-safety policy. Pair raw files with
 `durability`, `segstore` sidecars, or an application manifest when those
 guarantees are needed.
 
+A minimal seal-and-open cycle is:
+
+```rust
+use std::fs::File;
+
+use postings::PostingsIndex;
+use postings::raw::{write_u64_u32_segment_from_index_seekable_to, RawSegmentFile};
+
+let mut live = PostingsIndex::<u64, u32>::new();
+live.add_weighted_document(7, &[(10, 2), (20, 1)]).unwrap();
+
+let path = "segment.raw";
+let mut output = File::create(path).unwrap();
+write_u64_u32_segment_from_index_seekable_to(&live, &mut output).unwrap();
+output.sync_all().unwrap();
+drop(output); // The application can now publish the path in its manifest.
+
+let mut sealed = RawSegmentFile::open(path).unwrap();
+let hits = sealed.top_k_weighted_u32(&[(10, 1.0)], 10).unwrap();
+assert_eq!(hits[0].0, 7);
+```
+
 See [docs/raw-segments.md](docs/raw-segments.md) for writer shapes, segment-set
 search, filtering, diagnostics, and lifecycle notes.
 
@@ -122,8 +144,7 @@ postings = { version = "0.4", features = ["positional"] }
 
 Then use `postings::positional::PositionalIndex` for phrase/proximity
 evaluation. `phrase_match_strs` and `near_match_terms_strs` accept borrowed
-query terms when a parser already holds `&str`s. `PosingsIndex` remains as the
-historical name from the older `posings` crate.
+query terms when a parser already holds `&str`s.
 With `raw-segment` also enabled, `postings::positional::raw` can write and open
 checked byte-backed or file-backed positional segments. See
 [docs/raw-segments.md](docs/raw-segments.md) for the serving details.
@@ -131,6 +152,9 @@ checked byte-backed or file-backed positional segments. See
 `cnk-compression` is a helper for sorted candidate doc-id sets produced by
 positional workflows. It is not a storage backend, postings codec, or lifecycle
 layer.
+
+`PosingsIndex` remains available for compatibility with the older `posings`
+crate name.
 
 ## Development
 
