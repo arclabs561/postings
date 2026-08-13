@@ -55,6 +55,11 @@ harness = false
 required-features = ["raw-segment"]
 
 [[bench]]
+name = "raw_file_bmw_matrix"
+harness = false
+required-features = ["raw-segment"]
+
+[[bench]]
 name = "raw_file_single_large"
 harness = false
 required-features = ["raw-segment"]
