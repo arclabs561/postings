@@ -79,7 +79,9 @@ assert_eq!(ranking[0].0, 1);
 
 Runnable examples live in [`examples/`](examples/):
 
-- `durable_roundtrip` pairs `postings` with `durability` to build a crash-recoverable inverted index: update events go to a record log, snapshots to a checkpoint, and the index rebuilds from both, the persistence pattern a search engine needs to survive restarts.
+- `durable_roundtrip` pairs `postings` with `durability`: update events go to a
+  record log, snapshots to a checkpoint, and the example rebuilds the index
+  from both after a clean restart.
 - `raw_segment_file` writes immutable raw impact files and queries them with
   file-backed top-k search. Run with `--features raw-segment`.
 - `splade_weighted` scores a small learned-sparse collection with `f32` weights
@@ -92,8 +94,8 @@ with a byte-backed reader and a file-backed reader. The file reader keeps the
 fixed directories in memory and range-reads posting payloads for the query terms.
 New raw files carry directory and posting-block checksums; legacy unchecked raw
 files remain readable.
-Use this path for larger lexical and learned-sparse indexes whose posting
-payloads should not be rebuilt into a full `PostingsIndex` on every open.
+Use this path when posting payloads should not be rebuilt into a full
+`PostingsIndex` on every open.
 Lifecycle concerns stay above this crate: callers own term-id mapping, commit
 publication, deletes, compaction, and crash-safety policy. Pair raw files with
 `durability`, `segstore` sidecars, or an application manifest when those
