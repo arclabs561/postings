@@ -468,6 +468,19 @@ struct RawBlockScoringList {
     full_postings: Option<Vec<u8>>,
 }
 
+struct RawBlockWandCursor {
+    list_index: usize,
+    block_index: usize,
+    postings: Vec<(DocId, u32)>,
+    posting_index: usize,
+}
+
+struct RawBlockWandResult {
+    hits: Vec<(DocId, f32)>,
+    #[cfg_attr(not(test), allow(dead_code))]
+    decoded_postings: usize,
+}
+
 struct RawTopKThreshold {
     ranked: Vec<(DocId, f32)>,
     k: usize,
@@ -2310,6 +2323,16 @@ impl RawSegmentFile {
         k: usize,
     ) -> Result<Vec<(DocId, f32)>, RawSegmentFileError> {
         let scoring_lists = self.prepare_raw_block_scoring_lists(lists)?;
+        // Long learned-sparse queries benefit from document-at-a-time pivoting.
+        // Keep the established accumulation path for short queries, where the
+        // cursor setup has no opportunity to pay for itself.
+        if should_use_block_wand(&scoring_lists) {
+            let RawBlockWandResult {
+                hits,
+                decoded_postings: _,
+            } = self.top_k_weighted_u32_block_wand(&scoring_lists, k)?;
+            return Ok(hits);
+        }
         if let Some((dense_base, dense_slots)) = dense_range {
             return self.top_k_weighted_u32_pruned_blocks_dense(
                 &scoring_lists,
@@ -2321,6 +2344,185 @@ impl RawSegmentFile {
         }
 
         self.top_k_weighted_u32_pruned_blocks_sparse(&scoring_lists, total_postings, k)
+    }
+
+    fn top_k_weighted_u32_block_wand(
+        &mut self,
+        lists: &[RawBlockScoringList],
+        k: usize,
+    ) -> Result<RawBlockWandResult, RawSegmentFileError> {
+        let mut cursors = Vec::with_capacity(lists.len());
+        let mut decoded_postings = 0usize;
+        for (list_index, list) in lists.iter().enumerate() {
+            let postings = self.decode_scoring_block(list, 0)?;
+            decoded_postings = decoded_postings.saturating_add(postings.len());
+            cursors.push(RawBlockWandCursor {
+                list_index,
+                block_index: 0,
+                postings,
+                posting_index: 0,
+            });
+        }
+
+        let mut top_k = RawTopKThreshold::new(k);
+        loop {
+            cursors.retain(|cursor| cursor.posting_index < cursor.postings.len());
+            if cursors.is_empty() {
+                break;
+            }
+            cursors.sort_unstable_by_key(|cursor| cursor.postings[cursor.posting_index].0);
+
+            let threshold = top_k.threshold();
+            let pivot = if let Some(threshold) = threshold {
+                let mut pivot = None;
+                for cursor in &cursors {
+                    let candidate = cursor.postings[cursor.posting_index].0;
+                    let upper_bound: f32 = cursors
+                        .iter()
+                        .filter(|other| other.postings[other.posting_index].0 <= candidate)
+                        .map(|other| {
+                            let list = &lists[other.list_index];
+                            list.query_weight
+                                * raw_cursor_block_max_at(list, other, candidate) as f32
+                        })
+                        .sum();
+                    // Equality cannot be discarded: the smaller document id
+                    // wins score ties in the crate's public ordering.
+                    if upper_bound >= threshold {
+                        pivot = Some(candidate);
+                        break;
+                    }
+                }
+                if let Some(pivot) = pivot {
+                    pivot
+                } else {
+                    // Block-local bounds cannot by themselves prove that all
+                    // future blocks are also below threshold. Terminate only
+                    // when the maximum over every remaining block is too low;
+                    // otherwise consume the next candidate and revisit the
+                    // tighter bounds after the cursor advances.
+                    let remaining_upper_bound: f32 = cursors
+                        .iter()
+                        .map(|cursor| {
+                            let list = &lists[cursor.list_index];
+                            let suffix_max = list.blocks[cursor.block_index..]
+                                .iter()
+                                .map(|block| block.max_weight)
+                                .max()
+                                .unwrap_or(0);
+                            list.query_weight * suffix_max as f32
+                        })
+                        .sum();
+                    if remaining_upper_bound < threshold {
+                        break;
+                    }
+                    cursors[0].postings[cursors[0].posting_index].0
+                }
+            } else {
+                cursors[0].postings[cursors[0].posting_index].0
+            };
+
+            let mut moved = false;
+            for cursor in &mut cursors {
+                if cursor.postings[cursor.posting_index].0 < pivot {
+                    decoded_postings = decoded_postings
+                        .saturating_add(self.advance_wand_cursor_to(lists, cursor, pivot)?);
+                    moved = true;
+                }
+            }
+            if moved {
+                continue;
+            }
+
+            let mut score = 0.0f32;
+            for cursor in &cursors {
+                let (doc_id, doc_weight) = cursor.postings[cursor.posting_index];
+                if doc_id == pivot {
+                    score += lists[cursor.list_index].query_weight * doc_weight as f32;
+                }
+            }
+            top_k.update(pivot, score);
+
+            for cursor in &mut cursors {
+                if cursor.postings[cursor.posting_index].0 == pivot {
+                    cursor.posting_index += 1;
+                    if cursor.posting_index == cursor.postings.len() {
+                        decoded_postings = decoded_postings
+                            .saturating_add(self.load_next_wand_block(lists, cursor)?);
+                    }
+                }
+            }
+        }
+
+        top_k.sort_if_needed();
+        Ok(RawBlockWandResult {
+            hits: top_k.ranked,
+            decoded_postings,
+        })
+    }
+
+    fn advance_wand_cursor_to(
+        &mut self,
+        lists: &[RawBlockScoringList],
+        cursor: &mut RawBlockWandCursor,
+        target: DocId,
+    ) -> Result<usize, RawSegmentFileError> {
+        let list = &lists[cursor.list_index];
+        let mut decoded = 0usize;
+        while list.blocks[cursor.block_index].last_doc_id < target {
+            cursor.block_index += 1;
+            if cursor.block_index == list.blocks.len() {
+                cursor.postings.clear();
+                cursor.posting_index = 0;
+                return Ok(decoded);
+            }
+            if list.blocks[cursor.block_index].last_doc_id >= target {
+                cursor.postings = self.decode_scoring_block(list, cursor.block_index)?;
+                decoded = decoded.saturating_add(cursor.postings.len());
+                cursor.posting_index = 0;
+                break;
+            }
+        }
+        cursor.posting_index = cursor
+            .postings
+            .partition_point(|(doc_id, _)| *doc_id < target);
+        if cursor.posting_index == cursor.postings.len() {
+            decoded = decoded.saturating_add(self.load_next_wand_block(lists, cursor)?);
+        }
+        Ok(decoded)
+    }
+
+    fn load_next_wand_block(
+        &mut self,
+        lists: &[RawBlockScoringList],
+        cursor: &mut RawBlockWandCursor,
+    ) -> Result<usize, RawSegmentFileError> {
+        let list = &lists[cursor.list_index];
+        cursor.block_index += 1;
+        if cursor.block_index == list.blocks.len() {
+            cursor.postings.clear();
+            cursor.posting_index = 0;
+            return Ok(0);
+        }
+        cursor.postings = self.decode_scoring_block(list, cursor.block_index)?;
+        cursor.posting_index = 0;
+        Ok(cursor.postings.len())
+    }
+
+    fn decode_scoring_block(
+        &mut self,
+        list: &RawBlockScoringList,
+        block_index: usize,
+    ) -> Result<Vec<(DocId, u32)>, RawSegmentFileError> {
+        let mut postings = Vec::new();
+        let mut block_bytes = Vec::new();
+        self.for_each_scoring_block_posting(
+            list,
+            list.blocks[block_index],
+            &mut block_bytes,
+            |doc_id, weight| postings.push((doc_id, weight)),
+        )?;
+        Ok(postings)
     }
 
     fn prepare_raw_block_scoring_lists(
@@ -3609,6 +3811,22 @@ fn raw_block_range_upper_bound(block: RawPostingBlockMeta, lists: &[RawBlockScor
             list.query_weight * max_overlapping_raw_block_weight(&list.blocks, block) as f32
         })
         .sum()
+}
+
+fn should_use_block_wand(lists: &[RawBlockScoringList]) -> bool {
+    lists.len() >= 8
+}
+
+fn raw_cursor_block_max_at(
+    list: &RawBlockScoringList,
+    cursor: &RawBlockWandCursor,
+    doc_id: DocId,
+) -> u32 {
+    list.blocks[cursor.block_index..]
+        .iter()
+        .find(|block| block.last_doc_id >= doc_id)
+        .filter(|block| block.base_doc_id <= doc_id)
+        .map_or(0, |block| block.max_weight)
 }
 
 fn max_overlapping_raw_block_weight(
@@ -6690,6 +6908,159 @@ mod tests {
         assert_eq!(
             file_segment.top_k_weighted_u32(&query, k).unwrap(),
             expected
+        );
+    }
+
+    #[test]
+    fn block_wand_matches_exhaustive_randomized_top_k_and_ties() {
+        let mut state = 0x8f3d_27a1_49c5_b6e7u64;
+        let mut next_u32 = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u32
+        };
+        let weighted_docs: Vec<_> = (0..2_048u32)
+            .map(|_| {
+                (0..16u64)
+                    .filter_map(|term_id| {
+                        let sample = next_u32();
+                        (sample % 5 != 0).then_some((term_id, 1 + sample % 7))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let docs: Vec<_> = weighted_docs
+            .iter()
+            .enumerate()
+            .map(|(doc_id, terms)| RawDocument::new(doc_id as u32, terms))
+            .collect();
+        let bytes = write_u64_u32_segment(&docs).unwrap();
+        let segment = RawSegment::open(&bytes).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wand-random.raw");
+        std::fs::write(&path, &bytes).unwrap();
+        let mut file = RawSegmentFile::open(&path).unwrap();
+
+        for query_index in 0..32 {
+            let query: Vec<_> = (0..12u64)
+                .map(|offset| ((offset + query_index) % 16, 1.0 + (offset % 3) as f32))
+                .collect();
+            let mut raw_lists = Vec::new();
+            for &(term_id, query_weight) in &query {
+                let (entry, blocks) = file.term_entry_with_blocks(term_id).unwrap().unwrap();
+                raw_lists.push((entry, blocks, query_weight));
+            }
+            let lists = file.prepare_raw_block_scoring_lists(raw_lists).unwrap();
+            for &k in &[1, 7, 32, 2_048] {
+                assert_eq!(
+                    file.top_k_weighted_u32_block_wand(&lists, k).unwrap().hits,
+                    segment.top_k_weighted_u32(&query, k).unwrap(),
+                    "query {query_index}, k {k}"
+                );
+            }
+        }
+
+        // Uniform weights force score ties; document id must remain the
+        // deterministic secondary key.
+        let tied_query: Vec<_> = (0..12).map(|term_id| (term_id, 1.0)).collect();
+        assert_eq!(
+            file.top_k_weighted_u32(&tied_query, 64).unwrap(),
+            segment.top_k_weighted_u32(&tied_query, 64).unwrap()
+        );
+    }
+
+    #[test]
+    fn block_wand_decodes_less_than_half_of_prunable_long_query() {
+        let weighted_docs: Vec<_> = (0..600_000u32)
+            .map(|doc_id| {
+                let weight = if doc_id < 10 { 1_000_000 } else { 1 };
+                (0..16u64)
+                    .map(|term_id| (term_id, weight))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let docs: Vec<_> = weighted_docs
+            .iter()
+            .enumerate()
+            .map(|(doc_id, terms)| RawDocument::new(doc_id as u32, terms))
+            .collect();
+        let bytes = write_u64_u32_segment(&docs).unwrap();
+        let segment = RawSegment::open(&bytes).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wand-prunable.raw");
+        std::fs::write(&path, &bytes).unwrap();
+        let mut file = RawSegmentFile::open(&path).unwrap();
+        let query: Vec<_> = (0..16u64).map(|term_id| (term_id, 1.0)).collect();
+        let mut raw_lists = Vec::new();
+        let mut exhaustive_postings = 0usize;
+        for &(term_id, query_weight) in &query {
+            let (entry, blocks) = file.term_entry_with_blocks(term_id).unwrap().unwrap();
+            assert!(
+                entry.postings_len as u64 > FILE_FULL_POSTINGS_READ_LIMIT,
+                "the public dispatcher requires a list larger than its full-read threshold"
+            );
+            exhaustive_postings += entry.df as usize;
+            raw_lists.push((entry, blocks, query_weight));
+        }
+        let lists = file.prepare_raw_block_scoring_lists(raw_lists).unwrap();
+        assert!(
+            should_use_block_wand(&lists),
+            "the public dispatcher must select Block-Max WAND for this fixture"
+        );
+        let result = file.top_k_weighted_u32_block_wand(&lists, 10).unwrap();
+
+        assert_eq!(result.hits, segment.top_k_weighted_u32(&query, 10).unwrap());
+        assert!(
+            result.decoded_postings * 2 < exhaustive_postings,
+            "decoded {} of {exhaustive_postings} postings",
+            result.decoded_postings
+        );
+        assert_eq!(
+            file.top_k_weighted_u32(&query, 10).unwrap(),
+            segment.top_k_weighted_u32(&query, 10).unwrap(),
+            "the public path must select the same exact result"
+        );
+    }
+
+    #[test]
+    fn block_wand_does_not_treat_current_block_bounds_as_suffix_bounds() {
+        let weighted_docs: Vec<_> = (0..384u32)
+            .map(|doc_id| {
+                let weight = if doc_id < 10 {
+                    1_000
+                } else if doc_id == 300 {
+                    2_000
+                } else {
+                    1
+                };
+                (0..16u64)
+                    .map(|term_id| (term_id, weight))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let docs: Vec<_> = weighted_docs
+            .iter()
+            .enumerate()
+            .map(|(doc_id, terms)| RawDocument::new(doc_id as u32, terms))
+            .collect();
+        let bytes = write_u64_u32_segment(&docs).unwrap();
+        let segment = RawSegment::open(&bytes).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wand-future-max.raw");
+        std::fs::write(&path, &bytes).unwrap();
+        let mut file = RawSegmentFile::open(&path).unwrap();
+        let query: Vec<_> = (0..16u64).map(|term_id| (term_id, 1.0)).collect();
+        let mut raw_lists = Vec::new();
+        for &(term_id, query_weight) in &query {
+            let (entry, blocks) = file.term_entry_with_blocks(term_id).unwrap().unwrap();
+            raw_lists.push((entry, blocks, query_weight));
+        }
+        let lists = file.prepare_raw_block_scoring_lists(raw_lists).unwrap();
+
+        assert_eq!(
+            file.top_k_weighted_u32_block_wand(&lists, 10).unwrap().hits,
+            segment.top_k_weighted_u32(&query, 10).unwrap()
         );
     }
 
