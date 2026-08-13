@@ -7018,6 +7018,51 @@ mod tests {
     }
 
     #[test]
+    fn block_wand_matches_exhaustive_for_staggered_wide_queries() {
+        for strong_pruning in [false, true] {
+            let weighted_docs: Vec<_> = (0..2_048u32)
+                .map(|doc_id| {
+                    (0..32u64)
+                        .filter_map(|term_id| {
+                            let present =
+                                (doc_id + term_id as u32 * 37) % (97 + term_id as u32 % 11) != 0;
+                            let high_region = if strong_pruning { 10 } else { 512 };
+                            present.then_some((
+                                term_id,
+                                if doc_id < high_region {
+                                    10_000 + doc_id % 17
+                                } else {
+                                    1
+                                },
+                            ))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            let docs: Vec<_> = weighted_docs
+                .iter()
+                .enumerate()
+                .map(|(doc_id, terms)| RawDocument::new(doc_id as u32, terms))
+                .collect();
+            let bytes = write_u64_u32_segment(&docs).unwrap();
+            let exhaustive = RawSegment::open(&bytes).unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("wand-wide-staggered.raw");
+            std::fs::write(&path, &bytes).unwrap();
+            let mut file = RawSegmentFile::open(path).unwrap();
+            let query: Vec<_> = (0..32u64).map(|term_id| (term_id, 1.0)).collect();
+
+            for k in [10, 100] {
+                assert_eq!(
+                    file.top_k_weighted_u32(&query, k).unwrap(),
+                    exhaustive.top_k_weighted_u32(&query, k).unwrap(),
+                    "strong pruning {strong_pruning}, k {k}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn block_wand_decodes_less_than_half_of_prunable_long_query() {
         let weighted_docs: Vec<_> = (0..600_000u32)
             .map(|doc_id| {
