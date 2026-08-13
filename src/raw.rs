@@ -6971,6 +6971,47 @@ mod tests {
     }
 
     #[test]
+    fn block_wand_dispatch_boundary_matches_exhaustive_low_pruning_oracle() {
+        let weighted_docs: Vec<_> = (0..2_048u32)
+            .map(|doc_id| {
+                (0..8u64)
+                    .map(|term_id| (term_id, 1 + ((doc_id as u64 + term_id) % 7) as u32))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let docs: Vec<_> = weighted_docs
+            .iter()
+            .enumerate()
+            .map(|(doc_id, terms)| RawDocument::new(doc_id as u32, terms))
+            .collect();
+        let bytes = write_u64_u32_segment(&docs).unwrap();
+        let segment = RawSegment::open(&bytes).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wand-dispatch-boundary.raw");
+        std::fs::write(&path, &bytes).unwrap();
+        let mut file = RawSegmentFile::open(&path).unwrap();
+
+        for width in [7usize, 8] {
+            let query: Vec<_> = (0..width as u64).map(|term_id| (term_id, 1.0)).collect();
+            let mut raw_lists = Vec::new();
+            for &(term_id, query_weight) in &query {
+                let (entry, blocks) = file.term_entry_with_blocks(term_id).unwrap().unwrap();
+                raw_lists.push((entry, blocks, query_weight));
+            }
+            let lists = file.prepare_raw_block_scoring_lists(raw_lists).unwrap();
+            assert_eq!(should_use_block_wand(&lists), width == 8);
+
+            for &k in &[1, 10, 2_048] {
+                assert_eq!(
+                    file.top_k_weighted_u32(&query, k).unwrap(),
+                    segment.top_k_weighted_u32(&query, k).unwrap(),
+                    "width {width}, k {k}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn block_wand_decodes_less_than_half_of_prunable_long_query() {
         let weighted_docs: Vec<_> = (0..600_000u32)
             .map(|doc_id| {

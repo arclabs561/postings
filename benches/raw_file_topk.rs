@@ -23,6 +23,7 @@ const LIVE_PRUNE_DOCS_PER_SEGMENT: usize = 256;
 const LIVE_PRUNE_DOC_BASE: u32 = 1_000_000;
 const BLOCK_WAND_DOCS: usize = 600_000;
 const BLOCK_WAND_TERMS: usize = 16;
+const BLOCK_WAND_LOW_PRUNING_DOCS: usize = 100_000;
 
 type WeightedDocs = Vec<Vec<(RawTermId, u32)>>;
 type LivePruneFixture = (
@@ -181,6 +182,24 @@ fn build_block_wand_fixture() -> (tempfile::TempDir, RawSegmentFile, Vec<(RawTer
     (dir, RawSegmentFile::open(path).unwrap(), query)
 }
 
+fn build_block_wand_low_pruning_fixture(
+) -> (tempfile::TempDir, RawSegmentFile, Vec<(RawTermId, f32)>) {
+    let docs: WeightedDocs = (0..BLOCK_WAND_LOW_PRUNING_DOCS)
+        .map(|doc_id| {
+            (0..BLOCK_WAND_TERMS)
+                .map(|term_id| (term_id as RawTermId, 1 + ((doc_id + term_id) % 7) as u32))
+                .collect()
+        })
+        .collect();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("block-wand-low-pruning.raw");
+    std::fs::write(&path, raw_segment_bytes_from_docs(&docs, 0)).unwrap();
+    let query = (0..BLOCK_WAND_TERMS)
+        .map(|term_id| (term_id as RawTermId, 1.0))
+        .collect();
+    (dir, RawSegmentFile::open(path).unwrap(), query)
+}
+
 fn bench_multi_file_top_k(c: &mut Criterion) {
     let (_dir, mut segments, weighted_terms) = build_fixture();
     let (_partitioned_dir, mut partitioned_segments, partitioned_weighted_terms) =
@@ -188,6 +207,11 @@ fn bench_multi_file_top_k(c: &mut Criterion) {
     let (_live_prune_dir, mut live_prune_segments, live_prune_index, live_prune_terms) =
         build_live_prune_fixture();
     let (_block_wand_dir, mut block_wand_segment, block_wand_terms) = build_block_wand_fixture();
+    let (
+        _block_wand_low_pruning_dir,
+        mut block_wand_low_pruning_segment,
+        block_wand_low_pruning_terms,
+    ) = build_block_wand_low_pruning_fixture();
 
     {
         let mut segment_refs: Vec<_> = partitioned_segments.iter_mut().collect();
@@ -298,6 +322,18 @@ fn bench_multi_file_top_k(c: &mut Criterion) {
             black_box(
                 block_wand_segment
                     .top_k_weighted_u32(black_box(&block_wand_terms[..2]), black_box(10))
+                    .unwrap(),
+            );
+        });
+    });
+    group.bench_function("block_wand_low_pruning_16", |b| {
+        b.iter(|| {
+            black_box(
+                block_wand_low_pruning_segment
+                    .top_k_weighted_u32(
+                        black_box(block_wand_low_pruning_terms.as_slice()),
+                        black_box(10),
+                    )
                     .unwrap(),
             );
         });
