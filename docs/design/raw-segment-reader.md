@@ -3,7 +3,7 @@ status: proposed
 date: 2026-07-02
 scope: postings raw segment format, filesystem-backed readers, segstore raw consumer
 grounded-in:
-  - /Users/arc/Documents/dev/segstore/docs/design/out-of-core-segment-reader.md
+  - "Segstore out-of-core reader contract, summarized in Context below"
 ---
 
 # Design: Postings Raw Segment Reader
