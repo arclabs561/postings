@@ -8,11 +8,12 @@ authors = ["Arc <attobop@gmail.com>"]
 description = "Inverted-index postings lists and codecs."
 repository = "https://github.com/arclabs561/postings"
 homepage = "https://github.com/arclabs561/postings"
-documentation = "https://github.com/arclabs561/postings#readme"
+documentation = "https://docs.rs/postings"
 publish = true
 readme = "README.md"
 keywords = ["search", "postings", "inverted-index", "codec"]
 categories = ["text-processing", "algorithms"]
+include = ["/src", "/tests", "/examples", "/benches", "/README.md", "/CHANGELOG.md", "/LICENSE*"]
 
 [workspace]
 
