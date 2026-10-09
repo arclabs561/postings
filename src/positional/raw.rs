@@ -1302,7 +1302,9 @@ fn decode_postings_bytes(
 ) -> Result<Vec<RawPositionalPosting>, Error> {
     let mut consumed = 0usize;
     let mut previous_doc = 0u32;
-    let mut out = Vec::with_capacity(doc_freq as usize);
+    // A posting is at least three varint bytes (doc gap, position count, one
+    // position), so a file-supplied doc_freq cannot reserve more than that.
+    let mut out = Vec::with_capacity((doc_freq as usize).min(bytes.len() / 3));
 
     for posting_index in 0..doc_freq as usize {
         let (doc_gap, doc_gap_len) = decode_varint(bytes, consumed, "postings", posting_index)?;
@@ -1331,7 +1333,9 @@ fn decode_postings_bytes(
         }
 
         let mut previous_position = 0u32;
-        let mut positions = Vec::with_capacity(position_count as usize);
+        // Each position is at least one varint byte.
+        let mut positions =
+            Vec::with_capacity((position_count as usize).min(bytes.len().saturating_sub(consumed)));
         for position_index in 0..position_count as usize {
             let field_index = posting_index
                 .checked_add(position_index)

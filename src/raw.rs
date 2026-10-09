@@ -225,7 +225,6 @@ pub enum RawSegmentWriteError {
     #[error(transparent)]
     Segment {
         /// Source raw segment error.
-        #[from]
         source: Error,
     },
     /// Underlying writer I/O failed.
@@ -240,6 +239,14 @@ pub enum RawSegmentWriteError {
 impl From<std::io::Error> for RawSegmentWriteError {
     fn from(source: std::io::Error) -> Self {
         Self::Io { source }
+    }
+}
+
+// Written out instead of `#[from]`: clippy 1.99 flags the `source: source`
+// field init that thiserror's generated `From` impl contains.
+impl From<Error> for RawSegmentWriteError {
+    fn from(source: Error) -> Self {
+        Self::Segment { source }
     }
 }
 
@@ -258,7 +265,6 @@ pub enum RawSegmentFileError {
     #[error(transparent)]
     Segment {
         /// Source raw segment error.
-        #[from]
         source: Error,
     },
 }
@@ -266,6 +272,14 @@ pub enum RawSegmentFileError {
 impl From<std::io::Error> for RawSegmentFileError {
     fn from(source: std::io::Error) -> Self {
         Self::Io { source }
+    }
+}
+
+// Written out instead of `#[from]`: clippy 1.99 flags the `source: source`
+// field init that thiserror's generated `From` impl contains.
+impl From<Error> for RawSegmentFileError {
+    fn from(source: Error) -> Self {
+        Self::Segment { source }
     }
 }
 
@@ -401,6 +415,17 @@ struct TermEntry {
     total_weight: u64,
     postings_offset: u64,
     postings_len: u32,
+}
+
+impl TermEntry {
+    /// Capacity to reserve for this term's decoded postings.
+    ///
+    /// `df` comes from the file, so it cannot size an allocation on its own.
+    /// Every posting is a doc-gap varint plus a weight varint, at least two
+    /// bytes, so the postings bytes bound how many can really be there.
+    fn posting_capacity(self) -> usize {
+        (self.df as usize).min(self.postings_len as usize / 2)
+    }
 }
 
 /// Query-planning metadata for one term in a raw segment.
@@ -1444,7 +1469,7 @@ impl<'a> RawSegment<'a> {
     }
 
     fn posting_doc_ids(&self, entry: TermEntry) -> Result<Vec<DocId>, Error> {
-        let mut docs = Vec::with_capacity(entry.df as usize);
+        let mut docs = Vec::with_capacity(entry.posting_capacity());
         self.posting_doc_ids_into(entry, &mut docs)?;
         Ok(docs)
     }
@@ -1853,7 +1878,7 @@ impl RawSegmentFile {
             return Ok(Vec::new());
         };
         if entry.postings_len as u64 > FILE_FULL_POSTINGS_READ_LIMIT {
-            let mut out = Vec::with_capacity(entry.df as usize);
+            let mut out = Vec::with_capacity(entry.posting_capacity());
             self.for_each_posting_in_entry_blocks(entry, |doc_id, weight| {
                 out.push((doc_id, weight));
             })?;
@@ -1861,7 +1886,7 @@ impl RawSegmentFile {
         }
 
         let bytes = self.read_postings_range(entry.postings_offset, entry.postings_len as u64)?;
-        let mut out = Vec::with_capacity(entry.df as usize);
+        let mut out = Vec::with_capacity(entry.posting_capacity());
         let postings = RawPostings {
             term_id,
             bytes: &bytes,
@@ -2971,7 +2996,7 @@ impl RawSegmentFile {
     }
 
     fn posting_doc_ids(&mut self, entry: TermEntry) -> Result<Vec<DocId>, RawSegmentFileError> {
-        let mut docs = Vec::with_capacity(entry.df as usize);
+        let mut docs = Vec::with_capacity(entry.posting_capacity());
         self.posting_doc_ids_into(entry, &mut docs)?;
         Ok(docs)
     }
