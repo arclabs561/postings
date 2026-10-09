@@ -13,7 +13,13 @@ use std::path::Path;
 
 const MAGIC: &[u8; 8] = b"PSTRW001";
 const FOOTER_MAGIC: &[u8; 8] = b"PSTRF001";
-const VERSION: u32 = 3;
+/// Current format. Version 4 adds a CRC32 of the 72-byte header to the
+/// integrity section, since the header holds the checksum flag, the offsets,
+/// and the length totals that no section CRC covers.
+const VERSION: u32 = 4;
+/// Last version without a header CRC. Still readable; a bit flip in the
+/// header of such a segment can go undetected.
+const VERSION_WITHOUT_HEADER_CRC: u32 = 3;
 const HEADER_LEN: usize = 72;
 const TERM_ENTRY_LEN: usize = 48;
 const DOC_ENTRY_LEN: usize = 8;
@@ -25,9 +31,11 @@ const DEFAULT_BLOCK_SIZE: u32 = 128;
 /// footer. Readers that predate this flag reject it via `UnsupportedFlags`,
 /// so they can never silently misread a checksummed segment.
 const FLAG_CHECKSUMS: u32 = 1;
-/// Fixed prefix of the integrity section: term-dir, doc-meta, and block-dir
-/// CRC32s, in that order, followed by one CRC32 per block in directory order.
-const INTEGRITY_HEADER_LEN: usize = 12;
+/// Fixed prefix of the integrity section: term-dir, doc-meta, block-dir, and
+/// header CRC32s, in that order, followed by one CRC32 per block in directory
+/// order. Version 3 segments have the same prefix without the header CRC.
+const INTEGRITY_HEADER_LEN: usize = 16;
+const INTEGRITY_HEADER_LEN_V3: usize = 12;
 // Keep normal local-file queries on one read, but cap pathological high-DF term
 // payloads so file-backed traversal cannot allocate an entire huge posting list.
 const FILE_FULL_POSTINGS_READ_LIMIT: u64 = 1024 * 1024;
@@ -329,11 +337,24 @@ pub struct RawSegmentMeta {
     postings_offset: u64,
     footer_offset: u64,
     flags: u32,
+    version: u32,
 }
 
 impl RawSegmentMeta {
     fn has_checksums(self) -> bool {
         self.flags & FLAG_CHECKSUMS != 0
+    }
+
+    fn has_header_crc(self) -> bool {
+        self.version > VERSION_WITHOUT_HEADER_CRC
+    }
+
+    fn integrity_header_len(self) -> usize {
+        if self.has_header_crc() {
+            INTEGRITY_HEADER_LEN
+        } else {
+            INTEGRITY_HEADER_LEN_V3
+        }
     }
 }
 
@@ -619,7 +640,7 @@ impl<'a> RawSegment<'a> {
             return Err(Error::BadFooter);
         }
         let footer_version = read_u32_at(bytes, footer.start + FOOTER_MAGIC.len(), "footer")?;
-        if footer_version != VERSION {
+        if footer_version != meta.version {
             return Err(Error::UnsupportedVersion {
                 version: footer_version,
             });
@@ -660,7 +681,14 @@ impl<'a> RawSegment<'a> {
                 bytes.len(),
                 "block directory",
             )?];
-            verify_directory_checksums(term_dir, doc_meta, block_dir, integrity)?;
+            verify_directory_checksums(
+                meta,
+                &bytes[..HEADER_LEN],
+                term_dir,
+                doc_meta,
+                block_dir,
+                integrity,
+            )?;
         }
 
         Ok(Self { bytes, meta })
@@ -1353,7 +1381,7 @@ impl<'a> RawSegment<'a> {
             });
         }
         let offset = integrity_offset
-            .checked_add(INTEGRITY_HEADER_LEN as u64)
+            .checked_add(self.meta.integrity_header_len() as u64)
             .and_then(|offset| offset.checked_add(global_index.checked_mul(4)?))
             .ok_or(Error::SegmentTooLarge)?;
         let offset = usize::try_from(offset).map_err(|_| Error::SegmentTooLarge)?;
@@ -1573,9 +1601,9 @@ struct BlockChecksums {
 }
 
 impl BlockChecksums {
-    fn new(integrity: &[u8]) -> Self {
+    fn new(integrity: &[u8], prefix_len: usize) -> Self {
         Self {
-            encoded: integrity[INTEGRITY_HEADER_LEN..].to_vec(),
+            encoded: integrity[prefix_len..].to_vec(),
             decoded: None,
         }
     }
@@ -1647,7 +1675,7 @@ impl RawSegmentFile {
             return Err(Error::BadFooter.into());
         }
         let footer_version = read_u32_at(&footer, FOOTER_MAGIC.len(), "footer")?;
-        if footer_version != VERSION {
+        if footer_version != meta.version {
             return Err(Error::UnsupportedVersion {
                 version: footer_version,
             }
@@ -1697,15 +1725,17 @@ impl RawSegmentFile {
                 segment_file_offset(offset, integrity_offset)?,
                 integrity_len,
             )?;
-            verify_directory_checksums(&term_dir, &doc_meta, &block_dir, &integrity)?;
+            verify_directory_checksums(
+                meta, &header, &term_dir, &doc_meta, &block_dir, &integrity,
+            )?;
             let block_count = usize::try_from(block_count).map_err(|_| Error::SegmentTooLarge)?;
-            if integrity.len() != INTEGRITY_HEADER_LEN + block_count * 4 {
+            if integrity.len() != meta.integrity_header_len() + block_count * 4 {
                 return Err(Error::InvalidLayout {
                     reason: "integrity section length mismatch",
                 }
                 .into());
             }
-            Some(BlockChecksums::new(&integrity))
+            Some(BlockChecksums::new(&integrity, meta.integrity_header_len()))
         } else {
             None
         };
@@ -4189,6 +4219,7 @@ fn raw_segment_sections_to_vec(sections: &RawSegmentSections) -> Vec<u8> {
         term_dir_crc,
         doc_meta_crc,
         block_dir_crc,
+        header_crc(sections.meta),
         &sections.block_crcs,
     );
     out.extend_from_slice(FOOTER_MAGIC);
@@ -4558,6 +4589,7 @@ fn write_raw_segment_term_postings_seekable_to<W: Write + Seek + ?Sized>(
         postings_offset,
         footer_offset,
         flags: FLAG_CHECKSUMS,
+        version: VERSION,
     };
 
     debug_assert_eq!(writer.stream_position()? - segment_start, integrity_offset);
@@ -4580,6 +4612,7 @@ fn write_raw_segment_term_postings_seekable_to<W: Write + Seek + ?Sized>(
         term_dir_crc,
         doc_meta_crc,
         block_dir_crc,
+        header_crc(meta),
         &block_crcs,
     );
     writer.write_all(&integrity)?;
@@ -4910,6 +4943,7 @@ fn build_u64_u32_segment_stream_plan_from_posting_lists(
             postings_offset,
             footer_offset,
             flags: FLAG_CHECKSUMS,
+            version: VERSION,
         },
         term_entries,
         term_block_directories,
@@ -5044,6 +5078,7 @@ where
             postings_offset,
             footer_offset,
             flags: FLAG_CHECKSUMS,
+            version: VERSION,
         },
         term_entries,
         term_block_directories,
@@ -5213,12 +5248,14 @@ fn put_integrity_section(
     term_dir_crc: u32,
     doc_meta_crc: u32,
     block_dir_crc: u32,
+    header_crc: u32,
     block_crcs: &[u32],
 ) {
     let start = out.len();
     put_u32(out, term_dir_crc);
     put_u32(out, doc_meta_crc);
     put_u32(out, block_dir_crc);
+    put_u32(out, header_crc);
     for &crc in block_crcs {
         put_u32(out, crc);
     }
@@ -5248,6 +5285,7 @@ fn write_raw_segment_sections_to<W: Write + ?Sized>(
         term_dir_crc,
         doc_meta_crc,
         block_dir_crc,
+        header_crc(sections.meta),
         &sections.block_crcs,
     );
     writer.write_all(&integrity)?;
@@ -5278,6 +5316,7 @@ fn write_raw_segment_stream_plan_to<W: Write + ?Sized>(
         term_dir_crc,
         doc_meta_crc,
         block_dir_crc,
+        header_crc(plan.meta),
         &block_crcs,
     );
     writer.write_all(&integrity)?;
@@ -5392,6 +5431,13 @@ fn write_term_posting_payloads_to<W: Write + ?Sized>(
     Ok(block_crcs)
 }
 
+/// CRC32 of the encoded header, stored in the integrity section.
+fn header_crc(meta: RawSegmentMeta) -> u32 {
+    let mut header = Vec::with_capacity(HEADER_LEN);
+    put_header(&mut header, meta);
+    crc32fast::hash(&header)
+}
+
 fn put_header(out: &mut Vec<u8>, meta: RawSegmentMeta) {
     out.extend_from_slice(MAGIC);
     put_u32(out, VERSION);
@@ -5417,12 +5463,19 @@ fn parse_header(bytes: &[u8]) -> Result<RawSegmentMeta, Error> {
     }
 
     let version = read_u32_at(bytes, 8, "header")?;
-    if version != VERSION {
+    if version != VERSION && version != VERSION_WITHOUT_HEADER_CRC {
         return Err(Error::UnsupportedVersion { version });
     }
     let flags = read_u32_at(bytes, 12, "header")?;
     if flags & !FLAG_CHECKSUMS != 0 {
         return Err(Error::UnsupportedFlags { flags });
+    }
+    if version > VERSION_WITHOUT_HEADER_CRC && flags & FLAG_CHECKSUMS == 0 {
+        // The header CRC lives in the integrity section, so a clear checksum
+        // flag on a current-format segment can only be corruption.
+        return Err(Error::InvalidLayout {
+            reason: "current-format segment is missing its checksum flag",
+        });
     }
 
     Ok(RawSegmentMeta {
@@ -5436,6 +5489,7 @@ fn parse_header(bytes: &[u8]) -> Result<RawSegmentMeta, Error> {
         postings_offset: read_u64_at(bytes, 56, "header")?,
         footer_offset: read_u64_at(bytes, 64, "header")?,
         flags,
+        version,
     })
 }
 
@@ -5467,7 +5521,7 @@ fn integrity_layout(meta: RawSegmentMeta) -> Result<(u64, u64, u64), Error> {
     let block_count = block_dir_len / BLOCK_ENTRY_LEN as u64;
     let integrity_len = block_count
         .checked_mul(4)
-        .and_then(|crcs| crcs.checked_add(INTEGRITY_HEADER_LEN as u64))
+        .and_then(|crcs| crcs.checked_add(meta.integrity_header_len() as u64))
         .ok_or(Error::SegmentTooLarge)?;
     let integrity_offset =
         meta.footer_offset
@@ -5498,6 +5552,8 @@ fn posting_payload_len(meta: RawSegmentMeta) -> Result<u64, Error> {
 }
 
 fn verify_directory_checksums(
+    meta: RawSegmentMeta,
+    header: &[u8],
     term_dir: &[u8],
     doc_meta: &[u8],
     block_dir: &[u8],
@@ -5512,6 +5568,12 @@ fn verify_directory_checksums(
         let want = read_u32_at(integrity, at, "integrity")?;
         if crc32fast::hash(bytes) != want {
             return Err(Error::ChecksumMismatch { section });
+        }
+    }
+    if meta.has_header_crc() {
+        let want = read_u32_at(integrity, 12, "integrity")?;
+        if crc32fast::hash(&header[..HEADER_LEN]) != want {
+            return Err(Error::ChecksumMismatch { section: "header" });
         }
     }
     Ok(())
@@ -5839,6 +5901,25 @@ mod tests {
         out
     }
 
+    /// Rewrite a current segment as a version-3 checksummed segment (no header
+    /// CRC word in the integrity prefix), the layout older writers produced.
+    fn downgrade_to_v3_checksummed_for_test(bytes: &[u8]) -> Vec<u8> {
+        let meta = parse_header(bytes).unwrap();
+        let (integrity_offset, _, _) = integrity_layout(meta).unwrap();
+        let integrity_offset = usize::try_from(integrity_offset).unwrap();
+        let footer_offset = usize::try_from(meta.footer_offset).unwrap();
+
+        let mut v3 = Vec::with_capacity(bytes.len() - 4);
+        v3.extend_from_slice(&bytes[..integrity_offset + 12]);
+        v3.extend_from_slice(&bytes[integrity_offset + 16..footer_offset]);
+        v3.extend_from_slice(&bytes[footer_offset..]);
+        let footer_start = v3.len() - FOOTER_LEN;
+        v3[8..12].copy_from_slice(&3u32.to_le_bytes());
+        v3[footer_start + 8..].copy_from_slice(&3u32.to_le_bytes());
+        v3[64..72].copy_from_slice(&((footer_offset - 4) as u64).to_le_bytes());
+        v3
+    }
+
     fn strip_checksums_for_test(bytes: &[u8]) -> Vec<u8> {
         let meta = parse_header(bytes).unwrap();
         assert!(meta.has_checksums());
@@ -5849,7 +5930,10 @@ mod tests {
         let mut legacy = Vec::with_capacity(integrity_offset + FOOTER_LEN);
         legacy.extend_from_slice(&bytes[..integrity_offset]);
         legacy.extend_from_slice(&bytes[footer_offset..footer_offset + FOOTER_LEN]);
+        legacy[8..12].copy_from_slice(&3u32.to_le_bytes());
         legacy[12..16].copy_from_slice(&0u32.to_le_bytes());
+        let footer_start = legacy.len() - FOOTER_LEN;
+        legacy[footer_start + 8..].copy_from_slice(&3u32.to_le_bytes());
         legacy[64..72].copy_from_slice(&(integrity_offset as u64).to_le_bytes());
         RawSegment::open(&legacy).unwrap();
         legacy
@@ -7780,6 +7864,83 @@ mod tests {
         bytes[0] = b'X';
 
         assert_eq!(RawSegment::open(&bytes).unwrap_err(), Error::BadMagic);
+    }
+
+    #[test]
+    fn every_single_bit_header_flip_is_rejected() {
+        // The header carries the checksum flag, the offsets, and the lengths
+        // used for BM25 normalization, so no one-bit change may open cleanly.
+        let doc_a = vec![(10, 1), (20, 2)];
+        let doc_b = vec![(10, 3)];
+        let docs = vec![RawDocument::new(5, &doc_a), RawDocument::new(2, &doc_b)];
+        let good = write_u64_u32_segment(&docs).unwrap();
+        RawSegment::open(&good).unwrap();
+
+        let mut silent = Vec::new();
+        for byte in 0..HEADER_LEN {
+            for bit in 0..8 {
+                let mut bytes = good.clone();
+                bytes[byte] ^= 1 << bit;
+                if RawSegment::open(&bytes).is_ok() {
+                    silent.push((byte, bit));
+                }
+            }
+        }
+        assert!(
+            silent.is_empty(),
+            "silently accepted header flips: {silent:?}"
+        );
+    }
+
+    #[test]
+    fn header_bit_flips_are_rejected_by_file_reader() {
+        let doc_a = vec![(10, 1), (20, 2)];
+        let docs = vec![RawDocument::new(5, &doc_a)];
+        let good = write_u64_u32_segment(&docs).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("flip.segment");
+        let mut silent = Vec::new();
+        for byte in 0..HEADER_LEN {
+            for bit in 0..8 {
+                let mut bytes = good.clone();
+                bytes[byte] ^= 1 << bit;
+                std::fs::write(&path, &bytes).unwrap();
+                if RawSegmentFile::open(&path).is_ok() {
+                    silent.push((byte, bit));
+                }
+            }
+        }
+        assert!(
+            silent.is_empty(),
+            "silently accepted header flips: {silent:?}"
+        );
+    }
+
+    #[test]
+    fn version_3_checksummed_segments_still_open_and_read() {
+        let doc_a = vec![(10, 1), (20, 2), (10, 3)];
+        let doc_b = vec![(10, 1), (30, 1)];
+        let docs = vec![RawDocument::new(5, &doc_a), RawDocument::new(2, &doc_b)];
+        let v3 = downgrade_to_v3_checksummed_for_test(&write_u64_u32_segment(&docs).unwrap());
+        let segment = RawSegment::open(&v3).unwrap();
+        assert!(segment.meta().has_checksums());
+        assert_eq!(segment.num_docs(), 2);
+        assert_eq!(collect_postings(&segment, 10), vec![(2, 1), (5, 4)]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v3_checksummed.segment");
+        std::fs::write(&path, &v3).unwrap();
+        let mut file_segment = RawSegmentFile::open(&path).unwrap();
+        assert_eq!(file_segment.postings(10).unwrap(), vec![(2, 1), (5, 4)]);
+    }
+
+    #[test]
+    fn version_4_segment_without_checksum_flag_is_rejected() {
+        let terms = vec![(1, 1)];
+        let docs = vec![RawDocument::new(1, &terms)];
+        let mut bytes = write_u64_u32_segment(&docs).unwrap();
+        bytes[12..16].copy_from_slice(&0u32.to_le_bytes());
+        assert!(RawSegment::open(&bytes).is_err());
     }
 
     #[test]
