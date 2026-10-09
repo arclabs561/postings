@@ -9,6 +9,10 @@ Inverted-index postings lists and codecs.
 Supports `u32` term frequencies for classical IR and `f32` weights for learned
 sparse retrieval.
 
+For a complete search engine (tokenizers, query parser, segment management),
+use tantivy; use `postings` when you own tokenization, storage and scoring and
+only need the postings lists and their codecs.
+
 ## Data model and invariants
 
 - **Doc IDs**: `u32`. Sparse ids are supported; smaller gaps compress better
@@ -44,7 +48,7 @@ assert_eq!(
 );
 
 let cfg = PlannerConfig::default();
-let plan = idx.plan_candidates(&["quick".to_string()], cfg);
+let plan = idx.plan_candidates(&["fox".to_string()], cfg);
 assert!(matches!(plan, postings::CandidatePlan::Candidates(_)));
 ```
 
@@ -103,7 +107,7 @@ guarantees are needed.
 
 A minimal seal-and-open cycle is:
 
-```rust
+```rust,ignore
 use std::fs::File;
 
 use postings::PostingsIndex;

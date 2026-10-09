@@ -1,3 +1,4 @@
+#![doc = include_str!("../README.md")]
 //! # postings
 //!
 //! A small inverted-index core built around postings lists.
