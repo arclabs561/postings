@@ -2,6 +2,27 @@
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-09
+
+### Changed
+
+- Updated `durability` to 0.8. With the `persistence` feature, `save`,
+  `save_durable` and `load` take a `durability::Directory`, which now comes
+  from durability 0.8, so callers of those functions must move to it too.
+- Raw segments are written as format v4, which stores a CRC of the 72-byte
+  header and requires checksums. Before, a flipped bit in the header (for
+  example in `total_doc_len`) could open silently and change BM25
+  normalization. v3 segments stay readable.
+- Long top-k queries prune with per-block score maxima (block WAND).
+
+### Fixed
+
+- Readers no longer reserve memory from a file-supplied posting, position or
+  document count before decoding. The reservation is capped by the bytes that
+  can hold those entries, so a corrupt or hostile header cannot force a huge
+  allocation (a positional segment claiming `u32::MAX` documents reserved
+  32 GiB and aborted on Linux).
+
 ## [0.4.0] - 2026-07-09
 
 ### Changed
