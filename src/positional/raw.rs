@@ -1911,7 +1911,9 @@ fn document_len(document_lengths: &[(DocId, u32)], doc_id: DocId) -> Option<u32>
 fn decode_document_lengths(bytes: &[u8], count: usize) -> Result<Vec<(DocId, u32)>, Error> {
     let mut consumed = 0usize;
     let mut previous_doc = 0u32;
-    let mut out = Vec::with_capacity(count);
+    // Each document needs at least two varint bytes; a header-supplied count
+    // must not size the allocation beyond what the bytes could hold.
+    let mut out = Vec::with_capacity(count.min(bytes.len() / 2));
     for index in 0..count {
         let (gap, gap_len) = decode_varint(bytes, consumed, "document metadata", index)?;
         consumed += gap_len;
@@ -2210,6 +2212,20 @@ fn read_exact_at_file_into(file: &mut File, offset: u64, bytes: &mut [u8]) -> st
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn open_rejects_header_only_segment_claiming_u32_max_documents() {
+        // A document costs at least two varint bytes, so a header-only segment
+        // cannot hold u32::MAX documents; open must error, not reserve ~32 GiB.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(&VERSION.to_le_bytes());
+        bytes.extend_from_slice(&FLAGS.to_le_bytes());
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes()); // doc_count
+        bytes.extend_from_slice(&[0u8; HEADER_LEN - 20]); // everything else empty, CRC(empty) = 0
+        assert_eq!(bytes.len(), HEADER_LEN);
+        assert!(RawPositionalSegment::open(&bytes).is_err());
+    }
 
     fn strings(terms: &[&str]) -> Vec<String> {
         terms.iter().map(|term| (*term).to_string()).collect()
