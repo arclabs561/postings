@@ -27,7 +27,7 @@ only need the postings lists and their codecs.
 
 ```toml
 [dependencies]
-postings = "0.4"
+postings = "0.6"
 ```
 
 Example (index + candidates):
@@ -132,6 +132,9 @@ search, filtering, diagnostics, and lifecycle notes.
 
 ## Features
 
+The default build supports Rust 1.80. The optional `sbits` feature requires
+Rust 1.87 with the current dependency release; CI checks all features on 1.87.
+
 - `serde`: enable serde for the in-memory structures.
 - `persistence`: enable save/load helpers via `durability` + `postcard`.
 - `sbits`: enable succinct monotone sequences (Elias-Fano) under `postings::codec::ef`.
@@ -145,7 +148,7 @@ Enable positional postings behind a feature flag:
 
 ```toml
 [dependencies]
-postings = { version = "0.4", features = ["positional"] }
+postings = { version = "0.6", features = ["positional"] }
 ```
 
 Then use `postings::positional::PositionalIndex` for phrase/proximity

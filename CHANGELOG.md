@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Documented the existing Rust 1.87 requirement of the optional `sbits`
+  dependency and added CI checks for Rust 1.80 default and 1.87 all-feature
+  library builds. The default Rust floor remains 1.80.
+
+- Updated the optional persistence and development dependencies to `durability`
+  0.9, which includes the empty-v3-WAL-frame recovery fix. The public `save`,
+  `save_durable` and `load` APIs now use `durability::Directory` from 0.9;
+  callers must align their direct durability dependency with that series.
+  This public dependency identity change requires postings 0.6. No postings
+  disk format or indexing/scoring algorithm changes are included.
+
 ## [0.5.0] - 2026-10-09
 
 ### Changed
