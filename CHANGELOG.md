@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-12
+
 ### Changed
 
 - Documented the existing Rust 1.87 requirement of the optional `sbits`
@@ -526,3 +528,6 @@
 ### Changed
 
 - Documentation and CI polish; no API changes.
+
+[Unreleased]: https://github.com/arclabs561/postings/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/arclabs561/postings/compare/v0.5.0...v0.6.0
