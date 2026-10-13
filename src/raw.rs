@@ -716,6 +716,13 @@ impl<'a> RawSegment<'a> {
             )?;
         }
 
+        let doc_meta = &bytes[checked_range(
+            meta.doc_meta_offset,
+            meta.doc_count as u64 * DOC_ENTRY_LEN as u64,
+            bytes.len(),
+            "doc metadata",
+        )?];
+        validate_doc_id_bounds(doc_meta, meta.doc_count, meta.max_doc_id)?;
         Ok(Self { bytes, meta })
     }
 
@@ -823,6 +830,7 @@ impl<'a> RawSegment<'a> {
             term_id,
             bytes,
             remaining: entry.df,
+            max_doc_id: self.meta.max_doc_id,
             consumed: 0,
             prev_doc_id: 0,
             index: 0,
@@ -1023,7 +1031,7 @@ impl<'a> RawSegment<'a> {
         if let Some((dense_base, dense_slots)) = dense_range {
             let mut seen = vec![false; dense_slots];
             for entry in entries {
-                for posting in RawPostings::from_entry(self.bytes, entry)? {
+                for posting in RawPostings::from_entry(self.bytes, entry, self.meta.max_doc_id)? {
                     let (doc_id, _) = posting?;
                     let slot = dense_doc_slot(doc_id, dense_base, dense_slots);
                     seen[slot] = true;
@@ -1316,6 +1324,11 @@ impl<'a> RawSegment<'a> {
                 reason: "block last doc precedes base doc",
             });
         }
+        if block.last_doc_id > self.meta.max_doc_id {
+            return Err(Error::InvalidLayout {
+                reason: "block doc id exceeds header maximum",
+            });
+        }
         Ok(block)
     }
 
@@ -1527,6 +1540,11 @@ impl<'a> RawSegment<'a> {
                     index,
                 })?
             };
+            if doc_id > self.meta.max_doc_id {
+                return Err(Error::InvalidLayout {
+                    reason: "posting doc id exceeds header maximum",
+                });
+            }
             if weight == 0 {
                 return Err(Error::ZeroWeight {
                     doc_id,
@@ -1765,6 +1783,7 @@ impl RawSegmentFile {
             None
         };
 
+        validate_doc_id_bounds(&doc_meta, meta.doc_count, meta.max_doc_id)?;
         Ok(Self {
             file,
             data_offset: offset,
@@ -1891,6 +1910,7 @@ impl RawSegmentFile {
             term_id,
             bytes: &bytes,
             remaining: entry.df,
+            max_doc_id: self.meta.max_doc_id,
             consumed: 0,
             prev_doc_id: 0,
             index: 0,
@@ -2923,6 +2943,11 @@ impl RawSegmentFile {
                 reason: "block last doc precedes base doc",
             });
         }
+        if block.last_doc_id > self.meta.max_doc_id {
+            return Err(Error::InvalidLayout {
+                reason: "block doc id exceeds header maximum",
+            });
+        }
         Ok(block)
     }
 
@@ -3027,6 +3052,7 @@ impl RawSegmentFile {
             term_id: entry.term_id,
             bytes: &bytes,
             remaining: entry.df,
+            max_doc_id: self.meta.max_doc_id,
             consumed: 0,
             prev_doc_id: 0,
             index: 0,
@@ -3102,6 +3128,7 @@ impl RawSegmentFile {
             term_id: entry.term_id,
             bytes: &bytes,
             remaining: entry.df,
+            max_doc_id: self.meta.max_doc_id,
             consumed: 0,
             prev_doc_id: 0,
             index: 0,
@@ -3748,6 +3775,18 @@ fn dense_doc_slot(doc_id: DocId, dense_base: DocId, dense_slots: usize) -> usize
     slot
 }
 
+fn validate_doc_id_bounds(doc_meta: &[u8], doc_count: u32, max_doc_id: DocId) -> Result<(), Error> {
+    for index in 0..doc_count {
+        let doc_id = read_u32_at(doc_meta, doc_meta_offset(index)?, "doc metadata")?;
+        if doc_id > max_doc_id {
+            return Err(Error::InvalidLayout {
+                reason: "metadata doc id exceeds header maximum",
+            });
+        }
+    }
+    Ok(())
+}
+
 fn for_each_document_len_in_doc_meta(
     doc_meta: &[u8],
     doc_count: u32,
@@ -3956,6 +3995,7 @@ pub struct RawPostings<'a> {
     term_id: RawTermId,
     bytes: &'a [u8],
     remaining: u32,
+    max_doc_id: DocId,
     consumed: usize,
     prev_doc_id: DocId,
     index: u32,
@@ -3968,6 +4008,7 @@ impl<'a> RawPostings<'a> {
             term_id,
             bytes: &[],
             remaining: 0,
+            max_doc_id: 0,
             consumed: 0,
             prev_doc_id: 0,
             index: 0,
@@ -3975,7 +4016,7 @@ impl<'a> RawPostings<'a> {
         }
     }
 
-    fn from_entry(bytes: &'a [u8], entry: TermEntry) -> Result<Self, Error> {
+    fn from_entry(bytes: &'a [u8], entry: TermEntry, max_doc_id: DocId) -> Result<Self, Error> {
         let range = checked_range(
             entry.postings_offset,
             entry.postings_len as u64,
@@ -3986,6 +4027,7 @@ impl<'a> RawPostings<'a> {
             term_id: entry.term_id,
             bytes: &bytes[range],
             remaining: entry.df,
+            max_doc_id,
             consumed: 0,
             prev_doc_id: 0,
             index: 0,
@@ -4049,6 +4091,12 @@ impl Iterator for RawPostings<'_> {
                 }
             }
         };
+        if doc_id > self.max_doc_id {
+            self.failed = true;
+            return Some(Err(Error::InvalidLayout {
+                reason: "posting doc id exceeds header maximum",
+            }));
+        }
         if weight == 0 {
             self.failed = true;
             return Some(Err(Error::ZeroWeight {
@@ -5962,6 +6010,129 @@ mod tests {
         legacy[64..72].copy_from_slice(&(integrity_offset as u64).to_le_bytes());
         RawSegment::open(&legacy).unwrap();
         legacy
+    }
+
+    #[test]
+    fn raw_max_doc_id_rejects_metadata_outside_header() {
+        let terms = [(7, 1)];
+        let bytes =
+            write_u64_u32_segment(&[RawDocument::new(0, &terms), RawDocument::new(2, &terms)])
+                .unwrap();
+        for mut legacy in [
+            downgrade_to_v3_checksummed_for_test(&bytes),
+            strip_checksums_for_test(&bytes),
+        ] {
+            legacy[24..28].copy_from_slice(&1u32.to_le_bytes());
+            assert!(matches!(
+                RawSegment::open(&legacy),
+                Err(Error::InvalidLayout { .. })
+            ));
+            let mut file = tempfile::tempfile().unwrap();
+            file.write_all(&legacy).unwrap();
+            assert!(matches!(
+                RawSegmentFile::from_file(file),
+                Err(RawSegmentFileError::Segment {
+                    source: Error::InvalidLayout { .. }
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn raw_max_doc_id_rejects_lazy_postings_before_visit() {
+        let terms = [(7, 1)];
+        let bytes = write_u64_u32_segment(&[RawDocument::new(0, &terms)]).unwrap();
+        let mut legacy = strip_checksums_for_test(&bytes);
+        let meta = parse_header(&legacy).unwrap();
+        // Keep metadata within bounds, but encode an out-of-range posting.
+        legacy[meta.postings_offset as usize] = 1;
+        let segment = RawSegment::open(&legacy).unwrap();
+        assert!(matches!(
+            segment.postings(7).unwrap().next(),
+            Some(Err(Error::InvalidLayout { .. }))
+        ));
+        let mut visited = Vec::new();
+        assert!(matches!(
+            segment.for_each_posting(7, |id, _| visited.push(id)),
+            Err(Error::InvalidLayout { .. })
+        ));
+        assert!(visited.is_empty());
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&legacy).unwrap();
+        let mut segment = RawSegmentFile::from_file(file).unwrap();
+        assert!(matches!(
+            segment.for_each_posting(7, |id, _| visited.push(id)),
+            Err(RawSegmentFileError::Segment {
+                source: Error::InvalidLayout { .. }
+            })
+        ));
+        assert!(visited.is_empty());
+    }
+
+    #[test]
+    fn raw_max_doc_id_rejects_block_bounds_before_visit() {
+        let terms = [(7, 1)];
+        let bytes = write_u64_u32_segment(&[RawDocument::new(0, &terms)]).unwrap();
+        let mut legacy = strip_checksums_for_test(&bytes);
+        let meta = parse_header(&legacy).unwrap();
+        let block_start = doc_meta_end(meta).unwrap() as usize;
+        legacy[block_start + 4..block_start + 8].copy_from_slice(&1u32.to_le_bytes());
+        legacy[meta.postings_offset as usize] = 1;
+        let segment = RawSegment::open(&legacy).unwrap();
+        assert!(matches!(
+            segment.posting_blocks(7),
+            Err(Error::InvalidLayout { .. })
+        ));
+        assert!(matches!(
+            segment.posting_block_postings(7, 0),
+            Err(Error::InvalidLayout { .. })
+        ));
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&legacy).unwrap();
+        let mut segment = RawSegmentFile::from_file(file).unwrap();
+        assert!(matches!(
+            segment.posting_blocks(7),
+            Err(Error::InvalidLayout { .. })
+        ));
+        assert!(matches!(
+            segment.posting_block_postings(7, 0),
+            Err(RawSegmentFileError::Segment {
+                source: Error::InvalidLayout { .. }
+            })
+        ));
+        let mut visited = Vec::new();
+        assert!(matches!(
+            segment.for_each_posting_block_with_document_len(7, 0, |id, _, _| visited.push(id)),
+            Err(RawSegmentFileError::Segment {
+                source: Error::InvalidLayout { .. }
+            })
+        ));
+        assert!(visited.is_empty());
+    }
+
+    #[test]
+    fn raw_max_doc_id_preserves_sparse_and_unreferenced_metadata() {
+        let postings = [(4, 1)];
+        let bytes = write_u64_u32_segment_from_term_postings(
+            &[(4, 1), (100, 0)],
+            &[RawTermPostingList::new(7, &postings)],
+        )
+        .unwrap();
+        for bytes in [
+            bytes.clone(),
+            downgrade_to_v3_checksummed_for_test(&bytes),
+            strip_checksums_for_test(&bytes),
+        ] {
+            let segment = RawSegment::open(&bytes).unwrap();
+            assert_eq!(segment.meta().max_doc_id(), 100);
+            assert_eq!(segment.document_len(100).unwrap(), Some(0));
+            assert_eq!(collect_postings(&segment, 7), vec![(4, 1)]);
+            let mut file = tempfile::tempfile().unwrap();
+            file.write_all(&bytes).unwrap();
+            let mut segment = RawSegmentFile::from_file(file).unwrap();
+            assert_eq!(segment.document_len(100).unwrap(), Some(0));
+            assert_eq!(segment.postings(7).unwrap(), vec![(4, 1)]);
+        }
     }
 
     #[test]
