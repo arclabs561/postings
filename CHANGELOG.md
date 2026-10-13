@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-10-13
+
+### Fixed
+
+- Rejected raw document metadata and decoded posting IDs above the segment
+  header's maximum before exposing them to callers. Both byte-backed and
+  file-backed readers preserve valid sparse IDs and supported legacy formats.
+
 ## [0.6.0] - 2026-10-12
 
 ### Changed
@@ -529,5 +537,6 @@
 
 - Documentation and CI polish; no API changes.
 
-[Unreleased]: https://github.com/arclabs561/postings/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/arclabs561/postings/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/arclabs561/postings/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/arclabs561/postings/compare/v0.5.0...v0.6.0
