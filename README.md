@@ -9,9 +9,8 @@ Inverted-index postings lists and codecs.
 Supports `u32` term frequencies for classical IR and `f32` weights for learned
 sparse retrieval.
 
-For a complete search engine (tokenizers, query parser, segment management),
-use tantivy; use `postings` when you own tokenization, storage and scoring and
-only need the postings lists and their codecs.
+You supply tokenization, document storage and scoring; this crate stores and
+queries the postings.
 
 ## Data model and invariants
 
@@ -19,7 +18,7 @@ only need the postings lists and their codecs.
   and dense ids keep dense scratch paths cheap.
 - **Ordering**: Postings lists are always sorted by Doc ID.
 - **Updates**: `PostingsIndex` supports in-memory add/delete. Raw file segments
-  are immutable; a store or application manifest owns deletes and compaction.
+  are immutable; the application handles deletes and compaction.
 - **Storage**: In-memory by default; optional persistence and raw file-backed
   segment readers.
 
