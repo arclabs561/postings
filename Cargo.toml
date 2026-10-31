@@ -1,6 +1,6 @@
 [package]
 name = "postings"
-version = "0.6.1"
+version = "0.7.0"
 edition = "2021"
 rust-version = "1.80"
 license = "MIT OR Apache-2.0"
@@ -29,7 +29,7 @@ crc32fast = { version = "1.4", optional = true }
 [features]
 default = []
 serde = ["dep:serde"]
-persistence = ["dep:durability", "dep:postcard", "serde"]
+persistence = ["dep:durability", "dep:postcard", "dep:crc32fast", "serde"]
 sbits = ["dep:sbits"]
 positional = []
 cnk-compression = ["dep:cnk", "positional"]
