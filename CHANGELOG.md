@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+### Changed (breaking)
+
+- `Error` gains `WeightOverflow` and `DocumentTooLong`. `add_weighted_document`
+  rejects a `u32` term weight whose duplicates sum past `u32::MAX` (it
+  panicked in debug builds and wrapped in release), and both add methods
+  reject a document whose length does not fit the stored `u32` (it was
+  truncated while `total_doc_len` kept the full value). The index is
+  unchanged on error. `Weight` gains a provided `checked_accumulate` method.
+- `save` and `save_durable` write a versioned envelope with the payload
+  length and a CRC-32, so a corrupted file fails to load. Releases before
+  0.7.0 cannot read these files. `load` still reads unframed files from
+  0.2.0 onward. For every file it now checks the invariants queries rely on
+  and returns an `InvalidData` error instead of loading an index that later
+  panicked. The `persistence` feature now depends on `crc32fast`.
+
 ### Fixed
 
 - Raw multi-term queries (`candidates_any_terms`, `top_k_weighted_u32` and

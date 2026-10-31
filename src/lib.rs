@@ -67,6 +67,13 @@ pub trait Weight: Copy + Default + std::fmt::Debug + 'static {
     fn zero() -> Self;
     /// Accumulate (add) a weight into self.
     fn accumulate(&mut self, other: Self);
+    /// Accumulate `other` into self, returning `false` and leaving self
+    /// unchanged when the sum does not fit. The default calls
+    /// [`accumulate`](Weight::accumulate) and returns `true`.
+    fn checked_accumulate(&mut self, other: Self) -> bool {
+        self.accumulate(other);
+        true
+    }
     /// Convert to f32 for scoring.
     fn to_f32(self) -> f32;
     /// Convert to u64 for total doc length accumulation.
@@ -83,6 +90,16 @@ impl Weight for u32 {
     #[inline]
     fn accumulate(&mut self, other: Self) {
         *self += other;
+    }
+    #[inline]
+    fn checked_accumulate(&mut self, other: Self) -> bool {
+        match self.checked_add(other) {
+            Some(sum) => {
+                *self = sum;
+                true
+            }
+            None => false,
+        }
     }
     #[inline]
     fn to_f32(self) -> f32 {
@@ -121,6 +138,21 @@ pub enum Error {
     /// The caller attempted to add an already-present document id.
     #[error("document already exists: {0}")]
     DuplicateDocId(DocId),
+    /// A term's accumulated weight in one document does not fit the weight
+    /// type (`u32` term frequencies summed past `u32::MAX`).
+    #[error("term weight overflows in document {doc_id}")]
+    WeightOverflow {
+        /// The document being added.
+        doc_id: DocId,
+    },
+    /// A document's length does not fit the `u32` stored per document.
+    #[error("document {doc_id} is too long: length {len} exceeds u32::MAX")]
+    DocumentTooLong {
+        /// The document being added.
+        doc_id: DocId,
+        /// The document's length.
+        len: u64,
+    },
 }
 
 /// Planner output for candidate generation.
@@ -341,8 +373,13 @@ where
     ///
     /// Duplicate terms are accumulated (weights summed).
     ///
-    /// If `doc_id` already exists, return an error. Call `delete_document` first
-    /// to model updates as delete+add (segment-style).
+    /// # Errors
+    ///
+    /// Returns [`Error::DuplicateDocId`] if `doc_id` already exists; call
+    /// `delete_document` first to model updates as delete+add
+    /// (segment-style). Returns [`Error::WeightOverflow`] when a term's
+    /// summed weight does not fit `W`, and [`Error::DocumentTooLong`] when the
+    /// document length does not fit `u32`. The index is unchanged on error.
     pub fn add_weighted_document(
         &mut self,
         doc_id: DocId,
@@ -355,13 +392,20 @@ where
         let mut term_weights: HashMap<Term, W> = HashMap::new();
         let mut doc_length: u64 = 0;
         for (t, w) in weighted_terms {
-            term_weights
-                .entry(t.clone())
-                .and_modify(|existing| existing.accumulate(*w))
-                .or_insert(*w);
-            doc_length += w.to_doc_len();
+            match term_weights.entry(t.clone()) {
+                std::collections::hash_map::Entry::Occupied(mut existing) => {
+                    if !existing.get_mut().checked_accumulate(*w) {
+                        return Err(Error::WeightOverflow { doc_id });
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(*w);
+                }
+            }
+            doc_length = doc_length.saturating_add(w.to_doc_len());
         }
 
+        let doc_length = checked_doc_len(doc_id, doc_length)?;
         self.index_document_inner(doc_id, term_weights, doc_length);
         Ok(())
     }
@@ -373,7 +417,7 @@ where
         &mut self,
         doc_id: DocId,
         term_weights: HashMap<Term, W>,
-        doc_length: u64,
+        doc_length: u32,
     ) {
         let mut doc_terms: Vec<Term> = term_weights.keys().cloned().collect();
         doc_terms.sort_unstable();
@@ -408,9 +452,14 @@ where
         let seg_idx = self.segments.len();
         self.segments.push(seg);
         self.doc_segment.insert(doc_id, seg_idx);
-        self.doc_len.insert(doc_id, doc_length as u32);
-        self.total_doc_len += doc_length;
+        self.doc_len.insert(doc_id, doc_length);
+        self.total_doc_len += u64::from(doc_length);
     }
+}
+
+/// A document length as the `u32` stored per document.
+fn checked_doc_len(doc_id: DocId, len: u64) -> Result<u32, Error> {
+    u32::try_from(len).map_err(|_| Error::DocumentTooLong { doc_id, len })
 }
 
 /// Backward-compatible methods for integer-weighted (classical) postings.
@@ -422,15 +471,21 @@ where
     ///
     /// Terms are counted to produce integer term frequencies.
     /// For weighted terms (SPLADE), use [`add_weighted_document`](PostingsIndex::add_weighted_document).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::DuplicateDocId`] if `doc_id` already exists and
+    /// [`Error::DocumentTooLong`] when `terms.len()` does not fit `u32`.
     pub fn add_document(&mut self, doc_id: DocId, terms: &[Term]) -> Result<(), Error> {
         if self.doc_segment.contains_key(&doc_id) {
             return Err(Error::DuplicateDocId(doc_id));
         }
+        // Checked first, so no term count below can pass u32::MAX.
+        let doc_length = checked_doc_len(doc_id, terms.len() as u64)?;
         let mut term_counts: HashMap<Term, u32> = HashMap::new();
         for t in terms {
             *term_counts.entry(t.clone()).or_insert(0) += 1;
         }
-        let doc_length = terms.len() as u64;
         self.index_document_inner(doc_id, term_counts, doc_length);
         Ok(())
     }
@@ -944,9 +999,13 @@ where
 
     /// Save the index to a directory using `durability`.
     ///
+    /// The file is a versioned envelope: an 8-byte magic, a format version,
+    /// the payload length and its CRC-32, then the postcard-encoded index.
+    ///
     /// **Format note**: the on-disk layout changed in 0.2.0 when the internal
     /// `global_postings` field was added for query performance.  Data written
-    /// by 0.1.x cannot be read by 0.2.0+ and vice-versa.
+    /// by 0.1.x cannot be read by 0.2.0+ and vice-versa. 0.7.0 added the
+    /// envelope; [`load`](Self::load) still reads unframed 0.2.0+ files.
     #[cfg(feature = "persistence")]
     pub fn save<D: durability::Directory + ?Sized>(
         &self,
@@ -957,7 +1016,7 @@ where
         Term: serde::Serialize,
         W: serde::Serialize,
     {
-        let bytes = postcard::to_allocvec(self)?;
+        let bytes = frame_saved_index(&postcard::to_allocvec(self)?);
         dir.atomic_write(path, &bytes)?;
         Ok(())
     }
@@ -978,12 +1037,20 @@ where
         Term: serde::Serialize,
         W: serde::Serialize,
     {
-        let bytes = postcard::to_allocvec(self)?;
+        let bytes = frame_saved_index(&postcard::to_allocvec(self)?);
         dir.atomic_write_durable(path, &bytes)?;
         Ok(())
     }
 
     /// Load the index from a directory using `durability`.
+    ///
+    /// A file written by [`save`](Self::save) must carry a supported format
+    /// version and a matching length and CRC-32. An unframed file from an
+    /// earlier release is read as a bare postcard payload. Either way the
+    /// decoded index must satisfy the in-memory invariants queries rely on
+    /// (sorted live postings, consistent document frequencies, lengths and
+    /// per-document terms); otherwise this returns an
+    /// [`std::io::ErrorKind::InvalidData`] error.
     #[cfg(feature = "persistence")]
     pub fn load<D: durability::Directory + ?Sized>(
         dir: &D,
@@ -998,9 +1065,136 @@ where
         let mut f = dir.open_file(path)?;
         let mut bytes = Vec::new();
         f.read_to_end(&mut bytes)?;
-        let idx: Self = postcard::from_bytes(&bytes)?;
+        let idx: Self = postcard::from_bytes(unframe_saved_index(&bytes)?)?;
+        idx.check_invariants()
+            .map_err(|reason| std::io::Error::new(std::io::ErrorKind::InvalidData, reason))?;
         Ok(idx)
     }
+
+    /// Checks the private invariants that query paths rely on, for an index
+    /// decoded from untrusted bytes.
+    #[cfg(feature = "persistence")]
+    fn check_invariants(&self) -> Result<(), &'static str> {
+        if self.doc_segment.len() != self.doc_len.len() {
+            return Err("saved index live-document maps disagree");
+        }
+        let mut total_doc_len = 0u64;
+        let mut doc_term_count = 0usize;
+        for (doc_id, len) in &self.doc_len {
+            total_doc_len += u64::from(*len);
+            let terms = self
+                .doc_segment
+                .get(doc_id)
+                .and_then(|segment| self.segments.get(*segment))
+                .and_then(|segment| segment.doc_terms.get(doc_id))
+                .ok_or("saved index live document has no segment terms")?;
+            if !terms.windows(2).all(|pair| pair[0] < pair[1]) {
+                return Err("saved index document terms are not sorted and unique");
+            }
+            for term in terms {
+                let has_posting = self.global_postings.get(term).is_some_and(|postings| {
+                    postings.binary_search_by_key(doc_id, |(id, _)| *id).is_ok()
+                });
+                if !has_posting {
+                    return Err("saved index document term has no posting");
+                }
+            }
+            doc_term_count += terms.len();
+        }
+        if total_doc_len != self.total_doc_len {
+            return Err("saved index total document length disagrees");
+        }
+        if self.df.len() != self.global_postings.len() {
+            return Err("saved index document frequencies disagree with postings");
+        }
+        let mut posting_count = 0usize;
+        for (term, postings) in &self.global_postings {
+            if postings.is_empty()
+                || u32::try_from(postings.len()).ok() != self.df.get(term).copied()
+            {
+                return Err("saved index document frequencies disagree with postings");
+            }
+            if !postings.windows(2).all(|pair| pair[0].0 < pair[1].0) {
+                return Err("saved index postings are not strictly sorted");
+            }
+            if postings
+                .iter()
+                .any(|(doc_id, _)| !self.doc_len.contains_key(doc_id))
+            {
+                return Err("saved index posting names a document that is not live");
+            }
+            if let Some(bounds) = self.term_weight_bounds.get(term) {
+                let covered = postings.iter().all(|(_, weight)| {
+                    let weight = weight.to_f32();
+                    if weight.is_finite() {
+                        bounds.min <= weight && weight <= bounds.max
+                    } else {
+                        !bounds.all_finite
+                    }
+                });
+                if !covered {
+                    return Err("saved index term weight bounds do not cover postings");
+                }
+            }
+            posting_count += postings.len();
+        }
+        if posting_count != doc_term_count {
+            return Err("saved index postings disagree with document terms");
+        }
+        Ok(())
+    }
+}
+
+/// Leading bytes of an index written by [`PostingsIndex::save`].
+#[cfg(feature = "persistence")]
+const SAVED_INDEX_MAGIC: &[u8; 8] = b"POSTIDX\0";
+/// Envelope format version written after [`SAVED_INDEX_MAGIC`].
+#[cfg(feature = "persistence")]
+const SAVED_INDEX_VERSION: u32 = 1;
+/// Magic, version (u32), payload length (u64) and payload CRC-32 (u32).
+#[cfg(feature = "persistence")]
+const SAVED_INDEX_HEADER_LEN: usize = 8 + 4 + 8 + 4;
+
+/// Wraps a postcard payload in the versioned, checksummed envelope.
+#[cfg(feature = "persistence")]
+fn frame_saved_index(payload: &[u8]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(SAVED_INDEX_HEADER_LEN + payload.len());
+    bytes.extend_from_slice(SAVED_INDEX_MAGIC);
+    bytes.extend_from_slice(&SAVED_INDEX_VERSION.to_le_bytes());
+    bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(&crc32fast::hash(payload).to_le_bytes());
+    bytes.extend_from_slice(payload);
+    bytes
+}
+
+/// The postcard payload of a saved index: the checked body of an envelope,
+/// or the whole file for an unframed index written before 0.7.0.
+#[cfg(feature = "persistence")]
+fn unframe_saved_index(bytes: &[u8]) -> Result<&[u8], std::io::Error> {
+    let invalid = |reason| std::io::Error::new(std::io::ErrorKind::InvalidData, reason);
+    let Some(rest) = bytes.strip_prefix(SAVED_INDEX_MAGIC.as_slice()) else {
+        return Ok(bytes);
+    };
+    if bytes.len() < SAVED_INDEX_HEADER_LEN {
+        return Err(invalid("saved index header is truncated"));
+    }
+    let (version, rest) = rest.split_at(4);
+    let (len, rest) = rest.split_at(8);
+    let (crc, payload) = rest.split_at(4);
+    let version = u32::from_le_bytes(version.try_into().expect("4-byte field"));
+    if version != SAVED_INDEX_VERSION {
+        return Err(invalid("saved index format version is not supported"));
+    }
+    let len = u64::from_le_bytes(len.try_into().expect("8-byte field"));
+    if u64::try_from(payload.len()).ok() != Some(len) {
+        return Err(invalid(
+            "saved index payload length disagrees with its header",
+        ));
+    }
+    if crc32fast::hash(payload) != u32::from_le_bytes(crc.try_into().expect("4-byte field")) {
+        return Err(invalid("saved index checksum mismatch"));
+    }
+    Ok(payload)
 }
 
 fn union_sorted_postings<W>(a: &[DocId], b: &[(DocId, W)]) -> Vec<DocId> {
@@ -1243,6 +1437,40 @@ fn top_k_single_postings<W: Weight>(
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    /// Duplicate `u32` weights that sum past `u32::MAX` are rejected, and
+    /// the index is left as it was.
+    #[test]
+    fn u32_weight_overflow_is_rejected_at_add_time() {
+        let mut idx: PostingsIndex<String, u32> = PostingsIndex::new();
+        let result =
+            idx.add_weighted_document(0, &[("a".to_string(), u32::MAX), ("a".to_string(), 1)]);
+        assert!(matches!(result, Err(Error::WeightOverflow { doc_id: 0 })));
+        assert_eq!(idx.num_docs(), 0);
+        assert_eq!(idx.df("a"), 0);
+        idx.add_weighted_document(0, &[("a".to_string(), u32::MAX)])
+            .unwrap();
+        assert_eq!(idx.term_frequency(0, "a"), u32::MAX);
+    }
+
+    /// A document length past `u32::MAX` is rejected instead of being
+    /// truncated while `total_doc_len` keeps the full value.
+    #[test]
+    fn document_length_past_u32_is_rejected_at_add_time() {
+        let mut idx: PostingsIndex<String, u32> = PostingsIndex::new();
+        let result =
+            idx.add_weighted_document(0, &[("a".to_string(), u32::MAX), ("b".to_string(), 1)]);
+        assert!(matches!(
+            result,
+            Err(Error::DocumentTooLong {
+                doc_id: 0,
+                len: 4_294_967_296
+            })
+        ));
+        assert_eq!(idx.num_docs(), 0);
+        idx.add_document(1, &["x".to_string()]).unwrap();
+        assert_eq!(idx.avg_doc_len(), 1.0);
+    }
 
     #[test]
     fn add_and_lookup_basic() {
