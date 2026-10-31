@@ -1033,7 +1033,8 @@ impl<'a> RawSegment<'a> {
             for entry in entries {
                 for posting in RawPostings::from_entry(self.bytes, entry, self.meta.max_doc_id)? {
                     let (doc_id, _) = posting?;
-                    let slot = dense_doc_slot(doc_id, dense_base, dense_slots);
+                    let slot = dense_doc_slot(doc_id, dense_base, dense_slots)
+                        .ok_or_else(posting_without_doc_metadata)?;
                     seen[slot] = true;
                 }
             }
@@ -1136,6 +1137,7 @@ impl<'a> RawSegment<'a> {
         if let Some((dense_base, dense_slots)) = dense_range {
             let mut scores = vec![0.0; dense_slots];
             let mut touched = Vec::with_capacity(total_postings.min(self.meta.doc_count as usize));
+            let mut missing_metadata = false;
             let contributions_are_nonnegative = lists
                 .iter()
                 .all(|(_, _, query_weight)| *query_weight >= 0.0 && query_weight.is_finite());
@@ -1147,7 +1149,10 @@ impl<'a> RawSegment<'a> {
                         if contribution == 0.0 {
                             return;
                         }
-                        let slot = dense_doc_slot(doc_id, dense_base, dense_slots);
+                        let Some(slot) = dense_doc_slot(doc_id, dense_base, dense_slots) else {
+                            missing_metadata = true;
+                            return;
+                        };
                         if scores[slot] == 0.0 {
                             touched.push((doc_id, slot));
                         }
@@ -1162,7 +1167,10 @@ impl<'a> RawSegment<'a> {
                         if contribution == 0.0 {
                             return;
                         }
-                        let slot = dense_doc_slot(doc_id, dense_base, dense_slots);
+                        let Some(slot) = dense_doc_slot(doc_id, dense_base, dense_slots) else {
+                            missing_metadata = true;
+                            return;
+                        };
                         if !seen[slot] {
                             seen[slot] = true;
                             touched.push((doc_id, slot));
@@ -1172,6 +1180,9 @@ impl<'a> RawSegment<'a> {
                 }
             }
 
+            if missing_metadata {
+                return Err(posting_without_doc_metadata());
+            }
             return Ok(crate::top_k_scored_docs(
                 touched
                     .into_iter()
@@ -2092,11 +2103,18 @@ impl RawSegmentFile {
             .filter(|(_, dense_slots)| *dense_slots <= dense_limit);
         if let Some((dense_base, dense_slots)) = dense_range {
             let mut seen = vec![false; dense_slots];
+            let mut missing_metadata = false;
             for entry in entries {
                 self.for_each_posting_in_entry(entry, |doc_id, _| {
-                    let slot = dense_doc_slot(doc_id, dense_base, dense_slots);
+                    let Some(slot) = dense_doc_slot(doc_id, dense_base, dense_slots) else {
+                        missing_metadata = true;
+                        return;
+                    };
                     seen[slot] = true;
                 })?;
+            }
+            if missing_metadata {
+                return Err(posting_without_doc_metadata().into());
             }
             return Ok(seen
                 .into_iter()
@@ -2210,6 +2228,7 @@ impl RawSegmentFile {
         if let Some((dense_base, dense_slots)) = dense_range {
             let mut scores = vec![0.0; dense_slots];
             let mut touched = Vec::with_capacity(total_postings.min(self.meta.doc_count as usize));
+            let mut missing_metadata = false;
             let contributions_are_nonnegative = lists
                 .iter()
                 .all(|(_, _, query_weight)| *query_weight >= 0.0 && query_weight.is_finite());
@@ -2221,7 +2240,10 @@ impl RawSegmentFile {
                         if contribution == 0.0 {
                             return;
                         }
-                        let slot = dense_doc_slot(doc_id, dense_base, dense_slots);
+                        let Some(slot) = dense_doc_slot(doc_id, dense_base, dense_slots) else {
+                            missing_metadata = true;
+                            return;
+                        };
                         if scores[slot] == 0.0 {
                             touched.push((doc_id, slot));
                         }
@@ -2236,7 +2258,10 @@ impl RawSegmentFile {
                         if contribution == 0.0 {
                             return;
                         }
-                        let slot = dense_doc_slot(doc_id, dense_base, dense_slots);
+                        let Some(slot) = dense_doc_slot(doc_id, dense_base, dense_slots) else {
+                            missing_metadata = true;
+                            return;
+                        };
                         if !seen[slot] {
                             seen[slot] = true;
                             touched.push((doc_id, slot));
@@ -2246,6 +2271,9 @@ impl RawSegmentFile {
                 }
             }
 
+            if missing_metadata {
+                return Err(posting_without_doc_metadata().into());
+            }
             return Ok(crate::top_k_scored_docs(
                 touched
                     .into_iter()
@@ -2323,6 +2351,7 @@ impl RawSegmentFile {
         if let Some((dense_base, dense_slots)) = dense_range {
             let mut scores = vec![0.0; dense_slots];
             let mut touched = Vec::with_capacity(total_postings.min(self.meta.doc_count as usize));
+            let mut missing_metadata = false;
             let contributions_are_nonnegative = lists
                 .iter()
                 .all(|(_, query_weight)| *query_weight >= 0.0 && query_weight.is_finite());
@@ -2337,7 +2366,10 @@ impl RawSegmentFile {
                         if contribution == 0.0 {
                             return;
                         }
-                        let slot = dense_doc_slot(doc_id, dense_base, dense_slots);
+                        let Some(slot) = dense_doc_slot(doc_id, dense_base, dense_slots) else {
+                            missing_metadata = true;
+                            return;
+                        };
                         if scores[slot] == 0.0 {
                             touched.push((doc_id, slot));
                         }
@@ -2355,7 +2387,10 @@ impl RawSegmentFile {
                         if contribution == 0.0 {
                             return;
                         }
-                        let slot = dense_doc_slot(doc_id, dense_base, dense_slots);
+                        let Some(slot) = dense_doc_slot(doc_id, dense_base, dense_slots) else {
+                            missing_metadata = true;
+                            return;
+                        };
                         if !seen[slot] {
                             seen[slot] = true;
                             touched.push((doc_id, slot));
@@ -2365,6 +2400,9 @@ impl RawSegmentFile {
                 }
             }
 
+            if missing_metadata {
+                return Err(posting_without_doc_metadata().into());
+            }
             return Ok(crate::top_k_scored_docs(
                 touched
                     .into_iter()
@@ -2644,6 +2682,7 @@ impl RawSegmentFile {
     ) -> Result<Vec<(DocId, f32)>, RawSegmentFileError> {
         let mut scores = vec![0.0; dense_slots];
         let mut touched = Vec::with_capacity(total_postings.min(self.meta.doc_count as usize));
+        let mut missing_metadata = false;
         let mut threshold = RawTopKThreshold::new(k);
         let mut block_bytes = Vec::new();
 
@@ -2666,7 +2705,10 @@ impl RawSegmentFile {
                         if contribution == 0.0 {
                             return;
                         }
-                        let slot = dense_doc_slot(doc_id, dense_base, dense_slots);
+                        let Some(slot) = dense_doc_slot(doc_id, dense_base, dense_slots) else {
+                            missing_metadata = true;
+                            return;
+                        };
                         if scores[slot] == 0.0 {
                             touched.push((doc_id, slot));
                         }
@@ -2677,6 +2719,9 @@ impl RawSegmentFile {
             }
         }
 
+        if missing_metadata {
+            return Err(posting_without_doc_metadata().into());
+        }
         Ok(crate::top_k_scored_docs(
             touched
                 .into_iter()
@@ -3768,11 +3813,20 @@ fn doc_id_range_in_doc_meta(
     Ok(Some((min_doc_id, max_doc_id)))
 }
 
+/// Slot of `doc_id` in a dense scratch array starting at `dense_base`.
+///
+/// `None` means the posting names a doc id outside the document-metadata
+/// range, i.e. a document with no metadata row.
 #[inline]
-fn dense_doc_slot(doc_id: DocId, dense_base: DocId, dense_slots: usize) -> usize {
-    let slot = doc_id.wrapping_sub(dense_base) as usize;
-    debug_assert!(slot < dense_slots);
-    slot
+fn dense_doc_slot(doc_id: DocId, dense_base: DocId, dense_slots: usize) -> Option<usize> {
+    let slot = usize::try_from(doc_id.checked_sub(dense_base)?).ok()?;
+    (slot < dense_slots).then_some(slot)
+}
+
+fn posting_without_doc_metadata() -> Error {
+    Error::InvalidLayout {
+        reason: "posting doc id has no document metadata",
+    }
 }
 
 fn validate_doc_id_bounds(doc_meta: &[u8], doc_count: u32, max_doc_id: DocId) -> Result<(), Error> {

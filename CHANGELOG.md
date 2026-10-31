@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Raw multi-term queries (`candidates_any_terms`, `top_k_weighted_u32` and
+  `top_k_weighted_u32_filtered`, byte-backed and file-backed) return
+  `InvalidLayout` when a posting names a doc id below the first document
+  metadata entry, instead of panicking on an out-of-range scratch slot. The
+  per-term path already reported this case as an error.
+
 ## [0.6.1] - 2026-10-13
 
 ### Fixed
