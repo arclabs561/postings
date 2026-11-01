@@ -90,6 +90,20 @@ Runnable examples live in [`examples/`](examples/):
 - `splade_weighted` scores a small learned-sparse collection with `f32` weights
   and verifies top-k sparse inner-product search.
 
+```bash
+cargo run --example splade_weighted
+```
+
+```text
+indexed 4 documents
+candidates for query: [0, 2, 3]
+
+ranking (sparse inner product):
+  doc 2: score 8.45
+  doc 3: score 4.80
+  doc 0: score 2.70
+```
+
 ## File-backed segments
 
 The `raw-segment` feature exposes `postings::raw`, a numeric-term segment format
