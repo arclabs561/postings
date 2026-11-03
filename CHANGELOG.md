@@ -24,6 +24,16 @@
   `InvalidLayout` when a posting names a doc id below the first document
   metadata entry, instead of panicking on an out-of-range scratch slot. The
   per-term path already reported this case as an error.
+- `PostingsIndex<_, f32>` document length is the count of non-zero terms, as
+  documented on `Weight for f32`. `add_weighted_document` counted every input
+  pair, so duplicate pairs for one term and zero weights inflated
+  `document_len` and `avg_doc_len`. Indexes saved by earlier releases keep
+  the lengths they were saved with.
+- `PlannerConfig::max_candidates` bails out only when the candidate upper
+  bound exceeds it, as documented and as `max_candidate_ratio` already did.
+  A bound equal to `max_candidates` returned `ScanAll`. This applies to
+  `PostingsIndex::plan_candidates`, `PosingsIndex::plan_candidates_near` and
+  the raw segment `plan_candidates` methods.
 
 ## [0.6.1] - 2026-10-13
 

@@ -1076,7 +1076,7 @@ impl<'a> RawSegment<'a> {
         let mut df_sum = 0u64;
         for term_id in terms {
             df_sum = df_sum.saturating_add(self.df(term_id)? as u64);
-            if df_sum >= cfg.max_candidates as u64 {
+            if df_sum > cfg.max_candidates as u64 {
                 return Ok(CandidatePlan::ScanAll);
             }
         }
@@ -2155,7 +2155,7 @@ impl RawSegmentFile {
         let mut df_sum = 0u64;
         for term_id in terms {
             df_sum = df_sum.saturating_add(self.df(term_id)? as u64);
-            if df_sum >= cfg.max_candidates as u64 {
+            if df_sum > cfg.max_candidates as u64 {
                 return Ok(CandidatePlan::ScanAll);
             }
         }

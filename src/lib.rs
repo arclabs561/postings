@@ -128,7 +128,7 @@ impl Weight for f32 {
     fn to_doc_len(self) -> u64 {
         // For float weights, doc length is the count of non-zero terms
         // (not the sum of weights), keeping avg_doc_len meaningful for BM25
-        1
+        u64::from(self != 0.0)
     }
 }
 
@@ -390,7 +390,6 @@ where
         }
 
         let mut term_weights: HashMap<Term, W> = HashMap::new();
-        let mut doc_length: u64 = 0;
         for (t, w) in weighted_terms {
             match term_weights.entry(t.clone()) {
                 std::collections::hash_map::Entry::Occupied(mut existing) => {
@@ -402,9 +401,13 @@ where
                     slot.insert(*w);
                 }
             }
-            doc_length = doc_length.saturating_add(w.to_doc_len());
         }
 
+        // Length is taken over the accumulated per-term weights, so duplicate
+        // pairs for one term count once for `f32` and sum for `u32`.
+        let doc_length = term_weights
+            .values()
+            .fold(0u64, |len, w| len.saturating_add(w.to_doc_len()));
         let doc_length = checked_doc_len(doc_id, doc_length)?;
         self.index_document_inner(doc_id, term_weights, doc_length);
         Ok(())
@@ -761,7 +764,7 @@ where
                 }
                 seen_terms.push(term);
                 df_sum = df_sum.saturating_add(self.df(term) as u64);
-                if df_sum >= cfg.max_candidates as u64 {
+                if df_sum > cfg.max_candidates as u64 {
                     return CandidatePlan::ScanAll;
                 }
             }
@@ -772,7 +775,7 @@ where
                     continue;
                 }
                 df_sum = df_sum.saturating_add(self.df(t) as u64);
-                if df_sum >= cfg.max_candidates as u64 {
+                if df_sum > cfg.max_candidates as u64 {
                     return CandidatePlan::ScanAll;
                 }
             }
@@ -1780,8 +1783,8 @@ mod tests {
 
             let plan = idx.plan_candidates(&q_terms, cfg);
             if let CandidatePlan::Candidates(_cands) = plan {
-                // If we didn't bail out, then our computed df upper-bound must be below
-                // BOTH bailout thresholds (by construction).
+                // If we didn't bail out, then our computed df upper-bound must not
+                // exceed EITHER bailout threshold (by construction).
                 let n = idx.num_docs();
                 if n == 0 || q_terms.is_empty() {
                     return Ok(());
@@ -1794,7 +1797,7 @@ mod tests {
                     df_sum = df_sum.saturating_add(idx.df(t) as u64);
                 }
 
-                prop_assert!(df_sum < (cfg.max_candidates as u64));
+                prop_assert!(df_sum <= (cfg.max_candidates as u64));
                 prop_assert!((df_sum as f32) / (n as f32) <= cfg.max_candidate_ratio);
             }
         }
