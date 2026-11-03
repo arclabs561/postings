@@ -358,7 +358,7 @@ impl PosingsIndex {
                 continue;
             }
             df_sum = df_sum.saturating_add(self.df(t) as u64);
-            if df_sum >= cfg.max_candidates as u64 {
+            if df_sum > cfg.max_candidates as u64 {
                 return CandidatePlan::ScanAll;
             }
         }
