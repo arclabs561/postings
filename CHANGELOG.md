@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-03
+
 ### Changed (breaking)
 
 - `Error` gains `WeightOverflow` and `DocumentTooLong`. `add_weighted_document`
