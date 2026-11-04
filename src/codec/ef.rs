@@ -2,6 +2,11 @@
 //!
 //! This module is feature-gated behind `postings/sbits`.
 //! It provides a compact representation for sorted `u32` ids.
+//!
+//! `universe_size` is a `u32` and an exclusive bound, so the largest id these
+//! helpers can encode is `u32::MAX - 1`; the checked constructor rejects
+//! `u32::MAX` with `Error::IdOutOfUniverse`. The underlying `sbits` structure
+//! takes a `u64` universe if you need the full range.
 
 /// Re-export the underlying succinct structure.
 pub type EliasFano = sbits::EliasFano;
