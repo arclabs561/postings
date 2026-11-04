@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Documentation
+
+- The Elias-Fano helpers state that `universe_size` is an exclusive `u32`
+  bound, so `u32::MAX` cannot be encoded through them.
+
 ## [0.7.0] - 2026-11-03
 
 ### Changed (breaking)
