@@ -2477,6 +2477,18 @@ impl RawSegmentFile {
             });
         }
 
+        // For each list, the largest block maximum from each block to the end.
+        let suffix_max: Vec<Vec<u32>> = lists
+            .iter()
+            .map(|list| {
+                let mut maxima: Vec<u32> = list.blocks.iter().map(|b| b.max_weight).collect();
+                for index in (0..maxima.len().saturating_sub(1)).rev() {
+                    maxima[index] = maxima[index].max(maxima[index + 1]);
+                }
+                maxima
+            })
+            .collect();
+
         let mut top_k = RawTopKThreshold::new(k);
         loop {
             cursors.retain(|cursor| cursor.posting_index < cursor.postings.len());
@@ -2487,49 +2499,78 @@ impl RawSegmentFile {
 
             let threshold = top_k.threshold();
             let pivot = if let Some(threshold) = threshold {
-                let mut pivot = None;
-                for cursor in &cursors {
-                    let candidate = cursor.postings[cursor.posting_index].0;
-                    let upper_bound: f32 = cursors
-                        .iter()
-                        .filter(|other| other.postings[other.posting_index].0 <= candidate)
-                        .map(|other| {
-                            let list = &lists[other.list_index];
-                            list.query_weight
-                                * raw_cursor_block_max_at(list, other, candidate) as f32
-                        })
-                        .sum();
+                // Step 1, WAND pivot. Use bounds that hold for every remaining
+                // document of a list (the maximum over its remaining blocks).
+                // Cursors are sorted by current document; the pivot is the
+                // first one at which the accumulated bound reaches the
+                // threshold. A document before it can only occur in the lists
+                // ahead of it, whose bounds sum to less than the threshold.
+                //
+                // Block maxima must not be used for this step. A document that
+                // lies between two cursor positions can sit in a later, heavier
+                // block of an earlier list than the block at the candidate, and
+                // was skipped although it beat the threshold.
+                let mut accumulated = 0.0f32;
+                let mut pivot_index = None;
+                for (index, cursor) in cursors.iter().enumerate() {
+                    let list = &lists[cursor.list_index];
+                    accumulated += list.query_weight
+                        * suffix_max[cursor.list_index][cursor.block_index] as f32;
                     // Equality cannot be discarded: the smaller document id
                     // wins score ties in the crate's public ordering.
-                    if upper_bound >= threshold {
-                        pivot = Some(candidate);
+                    if accumulated >= threshold {
+                        pivot_index = Some(index);
                         break;
                     }
                 }
-                if let Some(pivot) = pivot {
-                    pivot
-                } else {
-                    // Block-local bounds cannot by themselves prove that all
-                    // future blocks are also below threshold. Terminate only
-                    // when the maximum over every remaining block is too low;
-                    // otherwise consume the next candidate and revisit the
-                    // tighter bounds after the cursor advances.
-                    let remaining_upper_bound: f32 = cursors
-                        .iter()
-                        .map(|cursor| {
-                            let list = &lists[cursor.list_index];
-                            let suffix_max = list.blocks[cursor.block_index..]
-                                .iter()
-                                .map(|block| block.max_weight)
-                                .max()
-                                .unwrap_or(0);
-                            list.query_weight * suffix_max as f32
-                        })
-                        .sum();
-                    if remaining_upper_bound < threshold {
+                let Some(pivot_index) = pivot_index else {
+                    // No remaining document can reach the threshold.
+                    break;
+                };
+                let pivot = cursors[pivot_index].postings[cursors[pivot_index].posting_index].0;
+
+                // Step 2, block-max check at the pivot. `next` is the first
+                // document at which one of these block bounds stops applying.
+                let mut block_bound = 0.0f32;
+                let mut next = DocId::MAX;
+                for cursor in &cursors {
+                    if cursor.postings[cursor.posting_index].0 > pivot {
+                        next = next.min(cursor.postings[cursor.posting_index].0);
                         break;
                     }
-                    cursors[0].postings[cursors[0].posting_index].0
+                    let list = &lists[cursor.list_index];
+                    let block = list.blocks[cursor.block_index..]
+                        .iter()
+                        .find(|block| block.last_doc_id >= pivot);
+                    match block {
+                        Some(block) if block.base_doc_id <= pivot => {
+                            block_bound += list.query_weight * block.max_weight as f32;
+                            next = next.min(block.last_doc_id.saturating_add(1));
+                        }
+                        // The pivot falls in a gap before this block.
+                        Some(block) => next = next.min(block.base_doc_id),
+                        // The list has nothing at or after the pivot.
+                        None => {}
+                    }
+                }
+                if block_bound >= threshold {
+                    pivot
+                } else {
+                    // Every document in [pivot, next) is covered by the same
+                    // blocks, so none can reach the threshold. Move the
+                    // cursors at or before the pivot to `next`.
+                    if next <= pivot {
+                        break;
+                    }
+                    for cursor in &mut cursors {
+                        if !cursor.postings.is_empty()
+                            && cursor.postings[cursor.posting_index].0 <= pivot
+                        {
+                            decoded_postings = decoded_postings
+                                .saturating_add(self.advance_wand_cursor_to(lists, cursor, next)?);
+                        }
+                    }
+                    continue;
                 }
             } else {
                 cursors[0].postings[cursors[0].posting_index].0
@@ -3963,18 +4004,6 @@ fn raw_block_range_upper_bound(block: RawPostingBlockMeta, lists: &[RawBlockScor
 
 fn should_use_block_wand(lists: &[RawBlockScoringList]) -> bool {
     lists.len() >= 8
-}
-
-fn raw_cursor_block_max_at(
-    list: &RawBlockScoringList,
-    cursor: &RawBlockWandCursor,
-    doc_id: DocId,
-) -> u32 {
-    list.blocks[cursor.block_index..]
-        .iter()
-        .find(|block| block.last_doc_id >= doc_id)
-        .filter(|block| block.base_doc_id <= doc_id)
-        .map_or(0, |block| block.max_weight)
 }
 
 fn max_overlapping_raw_block_weight(
