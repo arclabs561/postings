@@ -26,7 +26,7 @@ queries the postings.
 
 ```toml
 [dependencies]
-postings = "0.6"
+postings = "0.7"
 ```
 
 Example (index + candidates):
@@ -161,7 +161,7 @@ Enable positional postings behind a feature flag:
 
 ```toml
 [dependencies]
-postings = { version = "0.6", features = ["positional"] }
+postings = { version = "0.7", features = ["positional"] }
 ```
 
 Then use `postings::positional::PositionalIndex` for phrase/proximity
