@@ -20,7 +20,7 @@ include = ["/src", "/tests", "/examples", "/benches", "/README.md", "/CHANGELOG.
 [dependencies]
 thiserror = "2.0"
 serde = { version = "1.0", features = ["derive"], optional = true }
-durability = { version = "0.9", optional = true }
+durability = { version = "0.10", optional = true }
 # postcard 1.2 requires Rust 1.88; persistence supports 1.87.
 postcard = { version = ">=1.0, <1.2", optional = true }
 sbits = { version = "0.2", optional = true }
@@ -38,7 +38,7 @@ raw-segment = ["dep:crc32fast"]
 
 [dev-dependencies]
 proptest = "1.9"
-durability = "0.9"
+durability = "0.10"
 serde = { version = "1.0", features = ["derive"] }
 tempfile = "3.10"
 criterion = { version = "0.5", features = ["html_reports"] }
