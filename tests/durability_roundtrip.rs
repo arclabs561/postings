@@ -226,3 +226,17 @@ fn load_rejects_corrupt_saved_index() {
 
     assert!(PostingsIndex::<String>::load(&dir, "index.bin").is_err());
 }
+
+#[cfg(feature = "persistence")]
+#[test]
+fn durable_save_rejects_memory_directory_before_publishing() {
+    let dir = MemoryDirectory::new();
+    let idx = PostingsIndex::<String>::new();
+    let error = idx.save_durable(&dir, "index.bin").unwrap_err();
+
+    assert!(matches!(
+        error.downcast_ref::<durability::PersistenceError>(),
+        Some(durability::PersistenceError::NotSupported(_))
+    ));
+    assert!(!dir.exists("index.bin"));
+}
