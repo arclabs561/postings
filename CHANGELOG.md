@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-11-22
+
+### Fixed
+
+- File-backed block-max WAND search retains documents in heavier blocks when
+  advancing to a pivot, matching in-memory top-k results.
+- Fresh persistence builds on Rust 1.87 resolve a compatible postcard release.
+
 ### Documentation
 
 - The Elias-Fano helpers state that `universe_size` is an exclusive `u32`
@@ -577,6 +585,7 @@
 
 - Documentation and CI polish; no API changes.
 
-[Unreleased]: https://github.com/arclabs561/postings/compare/v0.6.1...HEAD
+[Unreleased]: https://github.com/arclabs561/postings/compare/v0.7.1...HEAD
+[0.7.1]: https://github.com/arclabs561/postings/compare/v0.7.0...v0.7.1
 [0.6.1]: https://github.com/arclabs561/postings/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/arclabs561/postings/compare/v0.5.0...v0.6.0
